@@ -6,6 +6,7 @@
 
 # Test data
 priv/data/
+/test/tmp/
 
 # Mix lock (commit this in production, optional in OSS libs)
 # mix.lock
