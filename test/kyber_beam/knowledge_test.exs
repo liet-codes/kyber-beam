@@ -289,4 +289,118 @@ defmodule Kyber.KnowledgeTest do
       assert Knowledge.vault_path(pid) == vault_dir
     end
   end
+
+  # ── Async vault reload ────────────────────────────────────────────────────
+
+  describe "async vault reload" do
+    test "GenServer continues serving reads while reload runs", %{pid: pid} do
+      # Put a note so there's data to serve
+      :ok = Knowledge.put_note(pid, "preload.md", %{"type" => "concepts"}, "Preloaded content")
+
+      # Trigger a poll — this spawns a background Task, not a blocking call
+      send(pid, :poll_vault)
+
+      # The GenServer should respond to reads immediately (not blocked)
+      assert {:ok, note} = Knowledge.get_note(pid, "preload.md")
+      assert note.body == "Preloaded content"
+    end
+
+    test "external file changes are picked up after async reload", %{pid: pid, vault_dir: vault_dir} do
+      # Write a file directly to disk (bypassing GenServer)
+      external_path = Path.join(vault_dir, "external.md")
+      File.write!(external_path, "---\ntitle: External\n---\n\nExternal content.")
+
+      # Trigger a poll to pick up the change
+      send(pid, :poll_vault)
+
+      # Wait for the reload task to complete and message to be processed
+      Process.sleep(200)
+
+      # Note should now be in state
+      assert {:ok, note} = Knowledge.get_note(pid, "external.md")
+      assert note.frontmatter["title"] == "External"
+    end
+
+    test "reload_complete message atomically updates state", %{pid: pid} do
+      :ok = Knowledge.put_note(pid, "atom-test.md", %{}, "Original")
+
+      # Simulate a completed reload (as if the background task finished)
+      new_note = %{
+        path: "atom-test.md",
+        frontmatter: %{"updated" => "true"},
+        body: "Updated by reload",
+        wikilinks: []
+      }
+      send(pid, {:reload_complete, {%{"atom-test.md" => new_note}, %{}, %{}, []}})
+
+      # Allow message to be processed
+      Process.sleep(50)
+
+      assert {:ok, note} = Knowledge.get_note(pid, "atom-test.md")
+      assert note.body == "Updated by reload"
+    end
+
+    test "deleted files are removed from state after reload", %{pid: pid, vault_dir: vault_dir} do
+      # Write then delete a file externally
+      :ok = Knowledge.put_note(pid, "doomed.md", %{}, "Soon gone")
+      assert {:ok, _} = Knowledge.get_note(pid, "doomed.md")
+
+      # Delete from disk directly
+      File.rm!(Path.join(vault_dir, "doomed.md"))
+
+      # Trigger async reload
+      send(pid, :poll_vault)
+      Process.sleep(200)
+
+      assert {:error, :not_found} = Knowledge.get_note(pid, "doomed.md")
+    end
+  end
+
+  # ── mtime-based polling ───────────────────────────────────────────────────
+
+  describe "mtime-based incremental polling" do
+    test "unchanged files are not re-read on poll", %{pid: pid, vault_dir: vault_dir} do
+      :ok = Knowledge.put_note(pid, "stable.md", %{"type" => "tools"}, "Stable content")
+
+      # Track note count before and after a poll
+      count_before = Knowledge.note_count(pid)
+
+      # Write a new file directly to disk
+      new_file = Path.join(vault_dir, "new-from-disk.md")
+      File.write!(new_file, "---\ntitle: New\n---\n\nNew file.")
+
+      # Trigger incremental reload — only new-from-disk.md has a new mtime
+      send(pid, :poll_vault)
+      Process.sleep(200)
+
+      count_after = Knowledge.note_count(pid)
+
+      # We should have one more note now
+      assert count_after == count_before + 1
+      assert {:ok, _} = Knowledge.get_note(pid, "new-from-disk.md")
+      # The stable note is still there
+      assert {:ok, stable} = Knowledge.get_note(pid, "stable.md")
+      assert stable.body == "Stable content"
+    end
+
+    test "modified file is re-read after mtime changes", %{pid: pid, vault_dir: vault_dir} do
+      :ok = Knowledge.put_note(pid, "mtime-test.md", %{"title" => "V1"}, "Version 1")
+      assert {:ok, v1} = Knowledge.get_note(pid, "mtime-test.md")
+      assert v1.frontmatter["title"] == "V1"
+
+      # Wait a moment so mtime changes (filesystem has ~1s resolution on HFS+)
+      Process.sleep(1100)
+
+      # Overwrite the file directly with new content
+      abs_path = Path.join(vault_dir, "mtime-test.md")
+      File.write!(abs_path, "---\ntitle: V2\n---\n\nVersion 2.")
+
+      # Trigger reload
+      send(pid, :poll_vault)
+      Process.sleep(200)
+
+      assert {:ok, v2} = Knowledge.get_note(pid, "mtime-test.md")
+      assert v2.frontmatter["title"] == "V2"
+    end
+  end
 end

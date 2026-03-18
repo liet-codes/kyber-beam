@@ -113,6 +113,52 @@ defmodule Kyber.Plugin.VoiceTest do
     end
   end
 
+  # ── API key security ──────────────────────────────────────────────────────
+
+  describe "API key security" do
+    test "api key is NOT accessible via GenServer.call(:get_api_key)" do
+      {:ok, pid} = Voice.start_link(
+        name: nil,
+        core: nil,
+        api_key: "secret_key_xyz"
+      )
+
+      # Unlink from the GenServer so when it crashes (on the bad call),
+      # the EXIT signal doesn't kill this test process.
+      Process.unlink(pid)
+
+      # :get_api_key must NOT be a handled call — it should crash/exit.
+      result =
+        try do
+          GenServer.call(pid, :get_api_key, 500)
+          :got_reply
+        catch
+          :exit, _ -> :exited
+        end
+
+      assert result == :exited, "GenServer should not handle :get_api_key calls — got: #{inspect(result)}"
+    end
+
+    test "get_config does NOT return api_key" do
+      {:ok, pid} = Voice.start_link(
+        name: nil,
+        core: nil,
+        api_key: "should_not_appear",
+        default_voice_id: "v1",
+        default_model: "m1"
+      )
+
+      config = Voice.get_config(pid)
+
+      refute Map.has_key?(config, :api_key)
+      refute Map.has_key?(config, "api_key")
+      assert config.default_voice_id == "v1"
+      assert config.default_model == "m1"
+
+      GenServer.stop(pid)
+    end
+  end
+
   # ── Audio tag passthrough ─────────────────────────────────────────────────
 
   describe "audio tag passthrough" do

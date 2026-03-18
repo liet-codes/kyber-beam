@@ -248,4 +248,229 @@ defmodule Kyber.CronTest do
       GenServer.stop(pid)
     end
   end
+
+  # ── Missed job detection ──────────────────────────────────────────────────
+
+  describe "missed job detection" do
+    test "job that fires late gets missed: true in delta" do
+      {:ok, core} = Kyber.Core.start_link(name: :"TestMissedCore#{:rand.uniform(99999)}")
+
+      {:ok, pid} = Cron.start_link(
+        name: nil,
+        core: core,
+        check_interval: 50
+      )
+
+      # Schedule a one-shot job that was due 10 seconds ago (definitely missed)
+      past = DateTime.add(DateTime.utc_now(), -10, :second)
+      Cron.add_job(pid, "missed-test", {:at, past})
+
+      # Let it fire
+      Process.sleep(200)
+
+      deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
+      delta = Enum.find(deltas, fn d -> d.payload["job_name"] == "missed-test" end)
+
+      assert delta != nil
+      assert delta.payload["missed"] == true
+
+      GenServer.stop(pid)
+      Supervisor.stop(core)
+    end
+
+    test "job that fires on time gets missed: false in delta" do
+      {:ok, core} = Kyber.Core.start_link(name: :"TestOnTimeCore#{:rand.uniform(99999)}")
+
+      {:ok, pid} = Cron.start_link(
+        name: nil,
+        core: core,
+        check_interval: 50
+      )
+
+      # Schedule an interval job that fires immediately (1ms)
+      Cron.add_job(pid, "ontime-test", {:every, 1})
+
+      Process.sleep(200)
+
+      deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
+      delta = Enum.find(deltas, fn d -> d.payload["job_name"] == "ontime-test" end)
+
+      assert delta != nil
+      # Job fired within 5 second threshold — should not be "missed"
+      assert delta.payload["missed"] == false
+
+      GenServer.stop(pid)
+      Supervisor.stop(core)
+    end
+  end
+
+  # ── Job persistence ───────────────────────────────────────────────────────
+
+  describe "job persistence" do
+    setup do
+      persist_file = Path.join(System.tmp_dir!(), "kyber_cron_test_#{:rand.uniform(999_999)}.jsonl")
+
+      on_exit(fn ->
+        File.rm(persist_file)
+      end)
+
+      %{persist_file: persist_file}
+    end
+
+    test "jobs are written to persist file on add", %{persist_file: path} do
+      {:ok, pid} = Cron.start_link(
+        name: nil,
+        core: nil,
+        check_interval: 100_000,
+        persist_path: path
+      )
+
+      Cron.add_job(pid, "persisted-job", {:every, 60_000})
+
+      # File should exist now
+      assert File.exists?(path)
+      content = File.read!(path)
+      assert content =~ "persisted-job"
+      assert content =~ "every"
+
+      GenServer.stop(pid)
+    end
+
+    test "jobs are removed from persist file on remove", %{persist_file: path} do
+      {:ok, pid} = Cron.start_link(
+        name: nil,
+        core: nil,
+        check_interval: 100_000,
+        persist_path: path
+      )
+
+      Cron.add_job(pid, "to-remove", {:every, 60_000})
+      Cron.add_job(pid, "stays", {:every, 60_000})
+      Cron.remove_job(pid, "to-remove")
+
+      content = File.read!(path)
+      refute content =~ "to-remove"
+      assert content =~ "stays"
+
+      GenServer.stop(pid)
+    end
+
+    test "jobs reload from persist file on restart", %{persist_file: path} do
+      # Start, add a job, stop
+      {:ok, pid1} = Cron.start_link(
+        name: nil,
+        core: nil,
+        check_interval: 100_000,
+        persist_path: path
+      )
+
+      future = DateTime.add(DateTime.utc_now(), 3600, :second)
+      Cron.add_job(pid1, "survive-restart", {:at, future})
+      GenServer.stop(pid1)
+
+      # Restart with same persist file — job should reload
+      {:ok, pid2} = Cron.start_link(
+        name: nil,
+        core: nil,
+        check_interval: 100_000,
+        persist_path: path
+      )
+
+      jobs = Cron.list_jobs(pid2)
+      assert Enum.any?(jobs, fn j -> j.name == "survive-restart" end)
+
+      GenServer.stop(pid2)
+    end
+
+    test "one-shot jobs in the past are fired immediately on reload", %{persist_file: path} do
+      test_pid = self()
+
+      # Start with a past one-shot job already in the persist file
+      past = DateTime.add(DateTime.utc_now(), -60, :second)
+
+      # Write a persisted past job directly to the file
+      job_map = %{
+        "name" => "past-reminder",
+        "schedule" => %{"type" => "at", "datetime" => DateTime.to_iso8601(past)},
+        "next_run" => DateTime.to_iso8601(past),
+        "fired_count" => 0,
+        "metadata" => %{"label" => "Do the thing"}
+      }
+      File.write!(path, Jason.encode!(job_map) <> "\n")
+
+      {:ok, core} = Kyber.Core.start_link(name: :"TestReloadCore#{:rand.uniform(99999)}")
+
+      {:ok, _pid} = Cron.start_link(
+        name: nil,
+        core: core,
+        check_interval: 50,
+        persist_path: path
+      )
+
+      # Job was in the past — should fire on the first check
+      Process.sleep(300)
+
+      deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
+      delta = Enum.find(deltas, fn d -> d.payload["job_name"] == "past-reminder" end)
+      assert delta != nil
+      # It was in the past, so it should be flagged as missed
+      assert delta.payload["missed"] == true
+
+      Supervisor.stop(core)
+    end
+
+    test "reminders include label in delta payload", %{persist_file: path} do
+      {:ok, core} = Kyber.Core.start_link(name: :"TestLabelCore#{:rand.uniform(99999)}")
+
+      {:ok, pid} = Cron.start_link(
+        name: nil,
+        core: core,
+        check_interval: 50,
+        persist_path: path
+      )
+
+      past = DateTime.add(DateTime.utc_now(), -1, :second)
+      Cron.add_reminder(pid, "Feed the cat", past)
+
+      Process.sleep(300)
+
+      deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
+      delta = Enum.find(deltas, fn d ->
+        String.starts_with?(d.payload["job_name"] || "", "reminder:")
+      end)
+
+      assert delta != nil
+      assert delta.payload["label"] == "Feed the cat"
+
+      GenServer.stop(pid)
+      Supervisor.stop(core)
+    end
+
+    test "persist_path/1 returns configured path", %{persist_file: path} do
+      {:ok, pid} = Cron.start_link(
+        name: nil,
+        core: nil,
+        check_interval: 100_000,
+        persist_path: path
+      )
+
+      assert Cron.persist_path(pid) == path
+      GenServer.stop(pid)
+    end
+
+    test "nil persist_path disables persistence" do
+      {:ok, pid} = Cron.start_link(
+        name: nil,
+        core: nil,
+        check_interval: 100_000,
+        persist_path: nil
+      )
+
+      # Should not crash when adding jobs without persistence
+      assert :ok = Cron.add_job(pid, "no-persist", {:every, 60_000})
+      assert Cron.persist_path(pid) == nil
+
+      GenServer.stop(pid)
+    end
+  end
 end

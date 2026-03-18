@@ -167,6 +167,79 @@ defmodule Kyber.FamiliardTest do
     end
   end
 
+  # ── Webhook HMAC signature validation ────────────────────────────────────
+
+  describe "verify_signature/3" do
+    test "returns :ok when signature matches" do
+      secret = "my_test_secret"
+      body = ~s({"level":"critical","message":"test"})
+
+      expected_sig =
+        :crypto.mac(:hmac, :sha256, secret, body)
+        |> Base.encode16(case: :lower)
+
+      {:ok, pid} = Familiard.start_link(name: nil, core: nil, webhook_secret: secret)
+
+      assert :ok = Familiard.verify_signature(pid, body, expected_sig)
+
+      GenServer.stop(pid)
+    end
+
+    test "returns {:error, :invalid_signature} when signature is wrong" do
+      {:ok, pid} = Familiard.start_link(name: nil, core: nil, webhook_secret: "correct_secret")
+
+      assert {:error, :invalid_signature} =
+               Familiard.verify_signature(pid, "body", "wrong_signature")
+
+      GenServer.stop(pid)
+    end
+
+    test "returns {:error, :no_secret} when no secret configured" do
+      {:ok, pid} = Familiard.start_link(name: nil, core: nil, webhook_secret: nil)
+
+      assert {:error, :no_secret} =
+               Familiard.verify_signature(pid, "body", "any_sig")
+
+      GenServer.stop(pid)
+    end
+
+    test "rejects empty signature" do
+      {:ok, pid} = Familiard.start_link(name: nil, core: nil, webhook_secret: "secret")
+
+      assert {:error, :invalid_signature} =
+               Familiard.verify_signature(pid, "body", "")
+
+      GenServer.stop(pid)
+    end
+
+    test "rejects nil signature" do
+      {:ok, pid} = Familiard.start_link(name: nil, core: nil, webhook_secret: "secret")
+
+      assert {:error, :invalid_signature} =
+               Familiard.verify_signature(pid, "body", nil)
+
+      GenServer.stop(pid)
+    end
+
+    test "different bodies produce different signatures" do
+      secret = "shared_secret"
+      body1 = ~s({"level":"warning"})
+      body2 = ~s({"level":"critical"})
+
+      sig1 =
+        :crypto.mac(:hmac, :sha256, secret, body1)
+        |> Base.encode16(case: :lower)
+
+      {:ok, pid} = Familiard.start_link(name: nil, core: nil, webhook_secret: secret)
+
+      # sig1 is valid for body1 but not body2
+      assert :ok = Familiard.verify_signature(pid, body1, sig1)
+      assert {:error, :invalid_signature} = Familiard.verify_signature(pid, body2, sig1)
+
+      GenServer.stop(pid)
+    end
+  end
+
   # ── Integration with reducer ──────────────────────────────────────────────
 
   describe "reducer integration" do

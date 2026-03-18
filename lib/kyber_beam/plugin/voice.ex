@@ -131,17 +131,18 @@ defmodule Kyber.Plugin.Voice do
     {:reply, Map.take(state, [:default_voice_id, :default_model]), state}
   end
 
-  def handle_call(:get_api_key, _from, state) do
-    {:reply, state.api_key, state}
-  end
+  # NOTE: :get_api_key is intentionally NOT exposed via handle_call.
+  # The API key is used internally only; it must not be retrievable by
+  # any external process via GenServer.call/2.
 
   # ── Private ───────────────────────────────────────────────────────────────
 
-  defp register_effect_handler(%{core: core}) do
+  defp register_effect_handler(%{core: core, api_key: api_key}) do
     plugin_pid = self()
 
+    # Capture api_key directly from state at registration time.
+    # It's set once at init and never changes, so this is safe.
     handler = fn effect ->
-      api_key = GenServer.call(plugin_pid, :get_api_key)
       config = GenServer.call(plugin_pid, :get_config)
       handle_speak_effect(effect, core, api_key, config)
     end

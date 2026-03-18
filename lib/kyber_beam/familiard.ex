@@ -16,7 +16,25 @@ defmodule Kyber.Familiard do
 
       config :kyber_beam, Kyber.Familiard,
         endpoint: "http://localhost:8765",  # familiard HTTP endpoint
-        enabled: true
+        enabled: true,
+        webhook_secret: "my_shared_secret" # optional HMAC-SHA256 signing key
+
+  ## Webhook Signature Validation
+
+  When `webhook_secret` is configured, incoming webhooks must include an
+  `x-familiard-signature` header containing the HMAC-SHA256 hex digest of the
+  raw request body, keyed with the shared secret.
+
+  If no secret is configured, all requests are accepted (dev mode) and a
+  warning is logged on startup.
+
+  Use `Kyber.Familiard.verify_signature/3` in your webhook controller:
+
+      case Kyber.Familiard.verify_signature(familiard_pid, raw_body, signature_header) do
+        :ok -> # proceed
+        {:error, :invalid_signature} -> # reject 401
+        {:error, :no_secret} -> :ok    # dev mode, pass through
+      end
 
   ## Webhook payload format
 
@@ -34,6 +52,23 @@ defmodule Kyber.Familiard do
   @default_endpoint "http://localhost:8765"
 
   # ── Public API ──────────────────────────────────────────────────────────────
+
+  @doc """
+  Verify a webhook request signature.
+
+  Computes HMAC-SHA256 of `raw_body` with the server's configured secret and
+  compares it (in constant time) against `signature` (a hex string).
+
+  Returns:
+  - `:ok` — signature valid
+  - `{:error, :invalid_signature}` — signature mismatch
+  - `{:error, :no_secret}` — no secret configured (dev mode)
+  """
+  @spec verify_signature(GenServer.server(), binary(), String.t() | nil) ::
+          :ok | {:error, :invalid_signature | :no_secret}
+  def verify_signature(server \\ __MODULE__, raw_body, signature) do
+    GenServer.call(server, {:verify_signature, raw_body, signature})
+  end
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -101,9 +136,21 @@ defmodule Kyber.Familiard do
       Keyword.get(opts, :endpoint) ||
       Keyword.get(app_config, :endpoint, @default_endpoint)
 
+    webhook_secret =
+      Keyword.get(opts, :webhook_secret) ||
+      Keyword.get(app_config, :webhook_secret, nil)
+
+    if is_nil(webhook_secret) do
+      Logger.warning(
+        "[Kyber.Familiard] no webhook_secret configured — " <>
+          "accepting all webhook requests without signature validation (dev mode)"
+      )
+    end
+
     state = %{
       core: core,
-      endpoint: endpoint_url
+      endpoint: endpoint_url,
+      webhook_secret: webhook_secret
     }
 
     Logger.info("[Kyber.Familiard] stub initialized (endpoint: #{endpoint_url})")
@@ -143,6 +190,26 @@ defmodule Kyber.Familiard do
     {:reply, state.endpoint, state}
   end
 
+  def handle_call({:verify_signature, _raw_body, _signature}, _from, %{webhook_secret: nil} = state) do
+    {:reply, {:error, :no_secret}, state}
+  end
+
+  def handle_call({:verify_signature, raw_body, signature}, _from, state) do
+    expected =
+      :crypto.mac(:hmac, :sha256, state.webhook_secret, raw_body)
+      |> Base.encode16(case: :lower)
+
+    # Constant-time comparison to prevent timing attacks
+    result =
+      if secure_compare(expected, to_string(signature || "")) do
+        :ok
+      else
+        {:error, :invalid_signature}
+      end
+
+    {:reply, result, state}
+  end
+
   @impl true
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -167,6 +234,13 @@ defmodule Kyber.Familiard do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # Constant-time string comparison to mitigate timing attacks on HMAC validation.
+  defp secure_compare(a, b) when byte_size(a) != byte_size(b), do: false
+
+  defp secure_compare(a, b) do
+    :crypto.hash_equals(a, b)
   end
 
   defp validate_level(level) when level in ["info", "warning", "critical"],

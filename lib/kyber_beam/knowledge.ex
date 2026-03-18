@@ -22,6 +22,13 @@ defmodule Kyber.Knowledge do
   ## Wikilinks
   - Parse `[[wikilinks]]` from note bodies
   - Build a link graph for backlink queries
+
+  ## Async reload + mtime-based polling
+
+  Vault reloads run in a background `Task` so the GenServer is never blocked
+  on file I/O. Reads always return from in-memory state (stale is fine during
+  a reload window). Only files whose mtime has changed since the last poll are
+  re-read, making polls O(changed) rather than O(all).
   """
 
   use GenServer
@@ -111,6 +118,12 @@ defmodule Kyber.Knowledge do
     GenServer.call(server, :vault_path)
   end
 
+  @doc "Return the number of notes currently loaded."
+  @spec note_count(GenServer.server()) :: non_neg_integer()
+  def note_count(server \\ __MODULE__) do
+    GenServer.call(server, :note_count)
+  end
+
   # ── GenServer callbacks ─────────────────────────────────────────────────────
 
   @impl true
@@ -122,11 +135,13 @@ defmodule Kyber.Knowledge do
       vault_path: vault_dir,
       poll_interval: poll_interval,
       notes: %{},        # path → note map
-      link_graph: %{}    # path → [linked paths]
+      link_graph: %{},   # path → [linked paths]
+      file_mtimes: %{},  # rel_path → mtime (for incremental reloads)
+      reload_task: nil   # Task ref of in-progress async reload
     }
 
-    # Initial load
-    state = load_vault(state)
+    # Initial load — synchronous on startup so we're ready to serve immediately
+    state = load_vault_sync(state)
 
     # Schedule polling
     if poll_interval > 0 do
@@ -159,7 +174,10 @@ defmodule Kyber.Knowledge do
       new_notes = Map.put(state.notes, normalized, note)
       new_graph = Map.put(state.link_graph, normalized, wikilinks)
 
-      {:reply, :ok, %{state | notes: new_notes, link_graph: new_graph}}
+      # Update mtime so next poll skips this file
+      new_mtimes = Map.put(state.file_mtimes, normalized, get_mtime(abs_path))
+
+      {:reply, :ok, %{state | notes: new_notes, link_graph: new_graph, file_mtimes: new_mtimes}}
     else
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
@@ -177,7 +195,8 @@ defmodule Kyber.Knowledge do
         File.rm(abs_path)
         new_notes = Map.delete(state.notes, normalized)
         new_graph = Map.delete(state.link_graph, normalized)
-        {:reply, :ok, %{state | notes: new_notes, link_graph: new_graph}}
+        new_mtimes = Map.delete(state.file_mtimes, normalized)
+        {:reply, :ok, %{state | notes: new_notes, link_graph: new_graph, file_mtimes: new_mtimes}}
     end
   end
 
@@ -237,11 +256,48 @@ defmodule Kyber.Knowledge do
     {:reply, state.vault_path, state}
   end
 
+  def handle_call(:note_count, _from, state) do
+    {:reply, map_size(state.notes), state}
+  end
+
+  # ── handle_info ─────────────────────────────────────────────────────────────
+
   @impl true
   def handle_info(:poll_vault, state) do
-    new_state = load_vault(state)
+    # Kick off an async vault reload — do NOT block the GenServer on file I/O.
+    # Stale data continues to be served from state while the task runs.
+    server = self()
+    vault_dir = state.vault_path
+    old_mtimes = state.file_mtimes
+
+    Task.start(fn ->
+      if File.dir?(vault_dir) do
+        result = read_changed_notes(vault_dir, old_mtimes)
+        send(server, {:reload_complete, result})
+      end
+    end)
+
     schedule_poll(state.poll_interval)
-    {:noreply, new_state}
+    {:noreply, state}
+  end
+
+  def handle_info({:reload_complete, {changed_notes, changed_graph, new_mtimes, deleted_paths}}, state) do
+    # Atomically merge changed notes and drop deleted ones
+    new_notes =
+      state.notes
+      |> Map.merge(changed_notes)
+      |> Map.drop(deleted_paths)
+
+    new_graph =
+      state.link_graph
+      |> Map.merge(changed_graph)
+      |> Map.drop(deleted_paths)
+
+    if map_size(changed_notes) > 0 or length(deleted_paths) > 0 do
+      Logger.debug("[Kyber.Knowledge] vault updated: #{map_size(changed_notes)} changed, #{length(deleted_paths)} deleted")
+    end
+
+    {:noreply, %{state | notes: new_notes, link_graph: new_graph, file_mtimes: new_mtimes}}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -256,31 +312,83 @@ defmodule Kyber.Knowledge do
     Process.send_after(self(), :poll_vault, interval)
   end
 
-  defp load_vault(%{vault_path: vault_dir} = state) do
+  # Synchronous full load — used only at startup
+  defp load_vault_sync(%{vault_path: vault_dir} = state) do
     if File.dir?(vault_dir) do
-      {notes, graph} = read_all_notes(vault_dir)
-      %{state | notes: notes, link_graph: graph}
+      {notes, graph, mtimes} = read_all_notes(vault_dir)
+      %{state | notes: notes, link_graph: graph, file_mtimes: mtimes}
     else
       state
     end
   end
 
+  # Read ALL notes (used at startup); returns {notes, graph, mtimes}
   defp read_all_notes(vault_dir) do
     md_files = Path.wildcard(Path.join([vault_dir, "**", "*.md"]))
 
-    Enum.reduce(md_files, {%{}, %{}}, fn abs_path, {notes, graph} ->
+    Enum.reduce(md_files, {%{}, %{}, %{}}, fn abs_path, {notes, graph, mtimes} ->
       rel_path = Path.relative_to(abs_path, vault_dir)
+      mtime = get_mtime(abs_path)
 
       case read_note_file(abs_path, rel_path) do
         {:ok, note} ->
-          new_notes = Map.put(notes, rel_path, note)
-          new_graph = Map.put(graph, rel_path, note.wikilinks)
-          {new_notes, new_graph}
+          {
+            Map.put(notes, rel_path, note),
+            Map.put(graph, rel_path, note.wikilinks),
+            Map.put(mtimes, rel_path, mtime)
+          }
 
         {:error, _} ->
-          {notes, graph}
+          {notes, graph, mtimes}
       end
     end)
+  end
+
+  # Incremental reload — only re-reads files whose mtime changed.
+  # Returns {changed_notes, changed_graph, new_full_mtimes, deleted_paths}
+  defp read_changed_notes(vault_dir, old_mtimes) do
+    md_files = Path.wildcard(Path.join([vault_dir, "**", "*.md"]))
+
+    # Build updated mtime map and collect changed files
+    {new_mtimes, changed_files} =
+      Enum.reduce(md_files, {%{}, []}, fn abs_path, {mtimes_acc, changed} ->
+        rel_path = Path.relative_to(abs_path, vault_dir)
+        mtime = get_mtime(abs_path)
+        old_mtime = Map.get(old_mtimes, rel_path)
+
+        changed =
+          if mtime != old_mtime do
+            [{abs_path, rel_path} | changed]
+          else
+            changed
+          end
+
+        {Map.put(mtimes_acc, rel_path, mtime), changed}
+      end)
+
+    # Detect deleted files (were tracked, no longer present)
+    deleted_paths = Map.keys(old_mtimes) -- Map.keys(new_mtimes)
+
+    # Re-read only changed files
+    {changed_notes, changed_graph} =
+      Enum.reduce(changed_files, {%{}, %{}}, fn {abs_path, rel_path}, {notes, graph} ->
+        case read_note_file(abs_path, rel_path) do
+          {:ok, note} ->
+            {Map.put(notes, rel_path, note), Map.put(graph, rel_path, note.wikilinks)}
+
+          {:error, _} ->
+            {notes, graph}
+        end
+      end)
+
+    {changed_notes, changed_graph, new_mtimes, deleted_paths}
+  end
+
+  defp get_mtime(abs_path) do
+    case File.stat(abs_path) do
+      {:ok, %{mtime: mtime}} -> mtime
+      _ -> nil
+    end
   end
 
   defp read_note_file(abs_path, rel_path) do
