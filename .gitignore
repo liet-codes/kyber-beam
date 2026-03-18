@@ -1,0 +1,21 @@
+# Build artifacts
+/_build/
+/cover/
+/deps/
+/doc/
+
+# Test data
+priv/data/
+
+# Mix lock (commit this in production, optional in OSS libs)
+# mix.lock
+
+# Elixir/Erlang
+*.beam
+*.plt
+erl_crash.dump
+
+# Editor
+.DS_Store
+.elixir_ls/
+.vscode/
