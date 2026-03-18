@@ -117,10 +117,14 @@ defmodule Kyber.Web.DeltaSocket do
 
   @impl true
   def init(%{store: store}) do
+    # Capture ws_pid BEFORE the subscribe call. The subscribe callback is
+    # invoked from a Task spawned by Delta.Store.broadcast/2 — if we called
+    # self() inside the closure, it would return the Task's PID, not ours,
+    # and the {:delta, delta} message would be sent to the wrong process.
+    ws_pid = self()
+
     unsubscribe_fn = Kyber.Delta.Store.subscribe(store, fn delta ->
-      # We can't send from a callback in another process directly.
-      # Instead, we send a message to the WebSocket process.
-      send(self(), {:delta, delta})
+      send(ws_pid, {:delta, delta})
     end)
 
     {:ok, %{unsubscribe_fn: unsubscribe_fn}}

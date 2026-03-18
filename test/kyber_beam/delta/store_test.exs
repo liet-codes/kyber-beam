@@ -7,9 +7,18 @@ defmodule Kyber.Delta.StoreTest do
   setup do
     # Use a unique temp file per test to avoid interference
     path = System.tmp_dir!() |> Path.join("kyber_test_#{:rand.uniform(999_999)}.jsonl")
-    on_exit(fn -> File.rm(path) end)
-    {:ok, pid} = Store.start_link(path: path, name: :"store_#{:rand.uniform(999_999)}")
-    {:ok, store: pid, path: path}
+    # Start a Task.Supervisor so broadcast can use supervised tasks
+    {:ok, task_sup} = Task.Supervisor.start_link()
+    on_exit(fn ->
+      File.rm(path)
+      try do
+        if Process.alive?(task_sup), do: Supervisor.stop(task_sup, :normal, 500)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+    {:ok, pid} = Store.start_link(path: path, name: :"store_#{:rand.uniform(999_999)}", task_supervisor: task_sup)
+    {:ok, store: pid, path: path, task_sup: task_sup}
   end
 
   test "appends a delta and returns :ok", %{store: store} do
@@ -112,9 +121,9 @@ defmodule Kyber.Delta.StoreTest do
     assert_receive {:sub2, ^id}, 500
   end
 
-  test "persists to disk and loads on restart", %{path: path} do
+  test "persists to disk and loads on restart", %{path: path, task_sup: task_sup} do
     store_name = :"reload_test_#{:rand.uniform(999_999)}"
-    {:ok, s1} = Store.start_link(path: path, name: store_name)
+    {:ok, s1} = Store.start_link(path: path, name: store_name, task_supervisor: task_sup)
 
     d1 = Delta.new("message.received", %{"persisted" => true})
     d2 = Delta.new("error.route", %{"persisted" => true})
@@ -123,7 +132,7 @@ defmodule Kyber.Delta.StoreTest do
     GenServer.stop(s1)
 
     # Start fresh — should reload from disk
-    {:ok, s2} = Store.start_link(path: path, name: :"#{store_name}_2")
+    {:ok, s2} = Store.start_link(path: path, name: :"#{store_name}_2", task_supervisor: task_sup)
     results = Store.query(s2)
     assert length(results) == 2
     ids = Enum.map(results, & &1.id)
@@ -142,5 +151,108 @@ defmodule Kyber.Delta.StoreTest do
     results = Store.query(store, kind: "message.received", limit: 2)
     assert length(results) == 2
     assert Enum.all?(results, &(&1.kind == "message.received"))
+  end
+
+  # ── New tests for supervised broadcast and bounded memory ─────────────────
+
+  test "crashing subscriber callback does not crash store or other subscribers",
+       %{store: store} do
+    test_pid = self()
+
+    # Subscriber that always crashes
+    _u1 = Store.subscribe(store, fn _delta -> raise "intentional crash" end)
+
+    # Subscriber that is well-behaved
+    _u2 = Store.subscribe(store, fn delta -> send(test_pid, {:healthy_sub, delta.id}) end)
+
+    delta = Delta.new("test.event", %{})
+    Store.append(store, delta)
+
+    # The healthy subscriber must still receive the delta
+    assert_receive {:healthy_sub, id}, 500
+    assert id == delta.id
+
+    # The store must still be alive after the crash
+    assert Process.alive?(store)
+
+    # Store must remain functional after a subscriber crash
+    d2 = Delta.new("test.event", %{"after_crash" => true})
+    assert Store.append(store, d2) == :ok
+    assert_receive {:healthy_sub, _id2}, 500
+  end
+
+  test "max_memory_deltas trims oldest deltas from memory", %{path: path, task_sup: task_sup} do
+    name = :"bounded_store_#{:rand.uniform(999_999)}"
+    {:ok, store} = Store.start_link(path: path, name: name, task_supervisor: task_sup, max_memory_deltas: 5)
+    on_exit(fn ->
+      try do
+        if Process.alive?(store), do: GenServer.stop(store, :normal, 500)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    # Append 7 deltas — only the last 5 should remain in memory
+    deltas = for i <- 1..7, do: Delta.new("test.event", %{"i" => i})
+    Enum.each(deltas, &Store.append(store, &1))
+
+    # Query without filters returns only in-memory deltas (last 5)
+    results = Store.query(store)
+    assert length(results) == 5
+
+    # The first 2 deltas should have been dropped from memory
+    first_two_ids = Enum.map(Enum.take(deltas, 2), & &1.id)
+    result_ids = Enum.map(results, & &1.id)
+    Enum.each(first_two_ids, fn id -> refute id in result_ids end)
+
+    # But all 7 are on disk — verify via reload
+    GenServer.stop(store)
+    {:ok, s2} = Store.start_link(path: path, name: :"#{name}_2", task_supervisor: task_sup)
+    all_results = Store.query(s2)
+    assert length(all_results) == 7
+    GenServer.stop(s2)
+  end
+
+  test "query falls back to disk when :since predates in-memory window",
+       %{path: path, task_sup: task_sup} do
+    name = :"fallback_store_#{:rand.uniform(999_999)}"
+    {:ok, store} = Store.start_link(path: path, name: name, task_supervisor: task_sup, max_memory_deltas: 3)
+    on_exit(fn ->
+      try do
+        if Process.alive?(store), do: GenServer.stop(store, :normal, 500)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    # Append 5 deltas — last 3 in memory, first 2 on disk only
+    d_old = Delta.new("test.event", %{"old" => true})
+    Store.append(store, d_old)
+    Process.sleep(5)
+
+    for i <- 1..4 do
+      Store.append(store, Delta.new("test.event", %{"i" => i}))
+    end
+
+    # Query with since < oldest in-memory ts — should fall back to disk
+    # and return d_old + newer deltas
+    results = Store.query(store, since: d_old.ts)
+    assert Enum.any?(results, &(&1.id == d_old.id)),
+           "disk fallback should include old delta"
+    assert length(results) == 5
+  end
+
+  test "broadcast uses task supervisor when provided", %{store: store, task_sup: task_sup} do
+    # Verify task_sup is alive and broadcasts work end-to-end
+    assert Process.alive?(task_sup)
+
+    test_pid = self()
+    _u = Store.subscribe(store, fn d -> send(test_pid, {:received, d.id}) end)
+
+    delta = Delta.new("supervised.broadcast.test", %{})
+    Store.append(store, delta)
+
+    assert_receive {:received, id}, 500
+    assert id == delta.id
   end
 end

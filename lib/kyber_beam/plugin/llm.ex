@@ -138,7 +138,7 @@ defmodule Kyber.Plugin.LLM do
         do: Map.put(body, "system", params["system"]),
         else: body
 
-    case Req.post(@anthropic_url, headers: headers, json: body) do
+    case Req.post(@anthropic_url, headers: headers, json: body, receive_timeout: 30_000) do
       {:ok, %{status: 200, body: response}} ->
         {:ok, response}
 
@@ -194,6 +194,11 @@ defmodule Kyber.Plugin.LLM do
     {:noreply, %{state | auth_config: auth_config}}
   end
 
+  @impl true
+  def handle_call(:get_auth_config, _from, state) do
+    {:reply, state.auth_config, state}
+  end
+
   def handle_info(msg, state) do
     Logger.warning("[Kyber.Plugin.LLM] unexpected message: #{inspect(msg)}")
     {:noreply, state}
@@ -207,8 +212,15 @@ defmodule Kyber.Plugin.LLM do
 
   # ── Private ───────────────────────────────────────────────────────────────
 
-  defp register_effect_handler(%{core: core, session: session, auth_config: auth_config}) do
+  defp register_effect_handler(%{core: core, session: session}) do
+    # Capture plugin_pid (self()) BEFORE the closure, so the handler always
+    # fetches the current auth config at invocation time rather than using the
+    # stale value that was closed over at registration time. This allows
+    # handle_info({:update_auth, ...}) to propagate token updates correctly.
+    plugin_pid = self()
+
     handler = fn effect ->
+      auth_config = GenServer.call(plugin_pid, :get_auth_config)
       handle_llm_call(effect, core, session, auth_config)
     end
 

@@ -51,6 +51,26 @@ defmodule Kyber.EffectTest do
     end
   end
 
+  describe "Kyber.Effect.Executor — string type safety" do
+    test "unknown string type does not crash (DoS fix)", %{executor: pid} do
+      # String.to_existing_atom was a crash vector for unknown atoms.
+      # safe_to_atom now returns :unknown instead of raising ArgumentError.
+      result = Executor.execute(pid, %{"type" => "totally_unknown_effect_xyz_abc_123"})
+      # Returns :no_handler (not a crash), and executor stays alive
+      assert result == {:error, :no_handler}
+      assert Process.alive?(pid)
+    end
+
+    test "known string type is resolved correctly", %{executor: pid} do
+      test_pid = self()
+      Executor.register(pid, :llm_call, fn _effect -> send(test_pid, :ran) end)
+
+      # String "llm_call" should resolve to :llm_call atom
+      {:ok, _ref} = Executor.execute(pid, %{"type" => "llm_call"})
+      assert_receive :ran, 500
+    end
+  end
+
   describe "Kyber.Effect.Executor — execute" do
     test "returns {:ok, ref} when handler is registered", %{executor: pid} do
       Executor.register(pid, :test_type, fn _ -> :handled end)

@@ -28,8 +28,8 @@ defmodule Kyber.CoreTest do
 
   test "emit appends a delta to the store" do
     {:ok, _pid, name} = start_core()
-    Process.sleep(100)  # let subscription wire up
-
+    # PipelineWirer wires synchronously during startup — no sleep needed for
+    # subscription, but emit is still async (runs via Task in Delta.Store)
     delta = Delta.new("test.event", %{"data" => 1})
     :ok = Core.emit(name, delta)
     Process.sleep(50)
@@ -40,7 +40,6 @@ defmodule Kyber.CoreTest do
 
   test "emit message.received triggers reducer and updates state" do
     {:ok, _pid, name} = start_core()
-    Process.sleep(100)
 
     delta = Delta.new("message.received", %{"text" => "hi"})
     :ok = Core.emit(name, delta)
@@ -53,7 +52,6 @@ defmodule Kyber.CoreTest do
 
   test "emit plugin.loaded updates state.plugins" do
     {:ok, _pid, name} = start_core()
-    Process.sleep(100)
 
     delta = Delta.new("plugin.loaded", %{"name" => "test_plugin"})
     :ok = Core.emit(name, delta)
@@ -65,7 +63,6 @@ defmodule Kyber.CoreTest do
 
   test "emit error.route updates state.errors" do
     {:ok, _pid, name} = start_core()
-    Process.sleep(100)
 
     delta = Delta.new("error.route", %{"message" => "test error"})
     :ok = Core.emit(name, delta)
@@ -77,7 +74,7 @@ defmodule Kyber.CoreTest do
 
   test "register_effect_handler + emit triggers handler" do
     {:ok, _pid, name} = start_core()
-    Process.sleep(150)  # let subscription wire up (wires at 50ms)
+    # PipelineWirer runs synchronously as last supervisor child — no sleep needed
 
     test_pid = self()
     Core.register_effect_handler(name, :llm_call, fn effect ->
@@ -93,7 +90,6 @@ defmodule Kyber.CoreTest do
 
   test "query_deltas returns stored deltas" do
     {:ok, _pid, name} = start_core()
-    Process.sleep(100)
 
     d1 = Delta.new("event.a", %{})
     d2 = Delta.new("event.b", %{})
@@ -109,7 +105,6 @@ defmodule Kyber.CoreTest do
 
   test "multiple emits accumulate correctly" do
     {:ok, _pid, name} = start_core()
-    Process.sleep(150)  # let subscription wire up
 
     for i <- 1..5 do
       Core.emit(name, Delta.new("plugin.loaded", %{"name" => "p#{i}"}))
@@ -118,5 +113,40 @@ defmodule Kyber.CoreTest do
     Process.sleep(300)
     state = Core.get_state(name)
     assert length(state.plugins) == 5
+  end
+
+  # ── New tests for PipelineWirer and supervision fixes ────────────────────
+
+  test "PipelineWirer: pipeline is wired synchronously — no sleep needed" do
+    {:ok, _pid, name} = start_core()
+    # Immediately after start_link returns, PipelineWirer has already run
+    # and subscribed to the store. We can emit and expect effects without delay.
+    test_pid = self()
+    Core.register_effect_handler(name, :llm_call, fn effect ->
+      send(test_pid, {:instant_effect, effect})
+    end)
+
+    delta = Delta.new("message.received", %{"text" => "no-sleep"})
+    :ok = Core.emit(name, delta)
+
+    # Only Task dispatch latency; no 50ms sleep hack needed.
+    assert_receive {:instant_effect, _effect}, 1000
+  end
+
+  test "PipelineWirer: supervision tree has PipelineWirer as last child" do
+    {:ok, pid, _name} = start_core()
+
+    children = Supervisor.which_children(pid)
+    child_ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
+
+    # PipelineWirer must be present in the supervision tree
+    assert Kyber.Core.PipelineWirer in child_ids
+  end
+
+  test "supervision strategy rest_for_one: all children listed" do
+    {:ok, pid, _name} = start_core()
+    children = Supervisor.which_children(pid)
+    # Should have 6 children: TaskSup, Store, State, Executor, PluginMgr, PipelineWirer
+    assert length(children) == 6
   end
 end

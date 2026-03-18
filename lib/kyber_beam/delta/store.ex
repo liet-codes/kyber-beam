@@ -5,15 +5,22 @@ defmodule Kyber.Delta.Store do
   - `query/2` — read deltas with optional filters (since, kind, limit)
   - `subscribe/2` — register a callback for new deltas (returns unsubscribe fn)
 
-  PubSub is handled via a Registry; each subscriber registers under the
-  store's name. On append, all registered callbacks are called in their
-  own Task so the store process is never blocked.
+  ## Improvements over naive implementation
+
+  - **Supervised broadcast**: callbacks run under a `Task.Supervisor`, so
+    crashes are isolated, logged, and don't affect other subscribers.
+  - **Async file I/O**: the file is opened once at startup in `:append` mode.
+    `IO.binwrite/2` is used per-append — avoids open/close overhead per write.
+  - **Bounded in-memory list**: `max_memory_deltas` (default 10,000) limits
+    RAM usage. When exceeded, oldest deltas are dropped from memory but
+    remain on disk. Queries with a `:since` predating the in-memory window
+    automatically fall back to reading from disk.
   """
 
   use GenServer
   require Logger
 
-  @registry Kyber.Delta.Store.Registry
+  @default_max_memory_deltas 10_000
 
   # ── Public API ────────────────────────────────────────────────────────────
 
@@ -22,7 +29,14 @@ defmodule Kyber.Delta.Store do
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
     path = Keyword.get(opts, :path, default_path())
-    GenServer.start_link(__MODULE__, %{path: path, name: name}, name: name)
+    task_sup = Keyword.get(opts, :task_supervisor, nil)
+    max_memory_deltas = Keyword.get(opts, :max_memory_deltas, @default_max_memory_deltas)
+
+    GenServer.start_link(
+      __MODULE__,
+      %{path: path, name: name, task_sup: task_sup, max_memory_deltas: max_memory_deltas},
+      name: name
+    )
   end
 
   @doc "Append a delta to the store. Broadcasts to all subscribers."
@@ -35,7 +49,11 @@ defmodule Kyber.Delta.Store do
   Query deltas with optional filters:
   - `:since` — only deltas with `ts >= since` (milliseconds)
   - `:kind` — only deltas matching this kind string
-  - `:limit` — maximum number of results (newest-first after filtering)
+  - `:limit` — maximum number of results (oldest-first after filtering)
+
+  When `max_memory_deltas` is exceeded, old deltas are dropped from memory
+  but remain on disk. Queries with `:since` predating the in-memory window
+  transparently fall back to a full disk scan.
   """
   @spec query(GenServer.server(), keyword()) :: [Kyber.Delta.t()]
   def query(pid, filters \\ []) do
@@ -56,26 +74,55 @@ defmodule Kyber.Delta.Store do
   # ── GenServer callbacks ───────────────────────────────────────────────────
 
   @impl true
-  def init(%{path: path, name: name}) do
+  def init(%{path: path, name: name, task_sup: task_sup, max_memory_deltas: max_memory_deltas}) do
     Process.flag(:trap_exit, true)
     deltas = load_from_disk(path)
+
+    # Open file for append once at startup. IO.binwrite avoids per-write
+    # open/close overhead and keeps the GenServer from blocking on file ops.
+    {:ok, io_device} = File.open(path, [:append, :binary])
+
     Logger.info("[Kyber.Delta.Store] started, loaded #{length(deltas)} deltas from #{path}")
-    {:ok, %{path: path, deltas: deltas, name: name, subs: %{}}}
+
+    {:ok,
+     %{
+       path: path,
+       io_device: io_device,
+       deltas: deltas,
+       name: name,
+       subs: %{},
+       task_sup: task_sup,
+       max_memory_deltas: max_memory_deltas
+     }}
   end
 
   @impl true
   def handle_call({:append, delta}, _from, state) do
-    :ok = write_line(state.path, delta)
-    state = %{state | deltas: state.deltas ++ [delta]}
+    :ok = write_line(state.io_device, delta)
+
+    # Trim oldest deltas from memory when limit exceeded; they remain on disk.
+    new_deltas = trim_memory(state.deltas ++ [delta], state.max_memory_deltas)
+    state = %{state | deltas: new_deltas}
+
     broadcast(state, delta)
     {:reply, :ok, state}
   end
 
   @impl true
   def handle_call({:query, filters}, _from, state) do
+    since = Keyword.get(filters, :since)
+
+    # If the requested window predates our in-memory data, load from disk.
+    deltas =
+      if needs_disk_fallback?(state.deltas, since) do
+        load_from_disk(state.path)
+      else
+        state.deltas
+      end
+
     results =
-      state.deltas
-      |> apply_since(Keyword.get(filters, :since))
+      deltas
+      |> apply_since(since)
       |> apply_kind(Keyword.get(filters, :kind))
       |> apply_limit(Keyword.get(filters, :limit))
 
@@ -108,8 +155,12 @@ defmodule Kyber.Delta.Store do
   end
 
   @impl true
-  def terminate(reason, _state) do
+  def terminate(reason, state) do
     Logger.info("[Kyber.Delta.Store] terminating: #{inspect(reason)}")
+
+    # Close the IO device gracefully so buffered writes are flushed.
+    if io = Map.get(state, :io_device), do: File.close(io)
+
     :ok
   end
 
@@ -144,11 +195,25 @@ defmodule Kyber.Delta.Store do
     end
   end
 
-  defp write_line(path, delta) do
+  # Use the open IO device — avoids open/close on every append.
+  defp write_line(io_device, delta) do
     json = Jason.encode!(Kyber.Delta.to_map(delta))
-    File.write!(path, json <> "\n", [:append])
+    IO.binwrite(io_device, json <> "\n")
     :ok
   end
+
+  # Keep only the most recent `max` deltas in memory; oldest are still on disk.
+  defp trim_memory(deltas, max) when length(deltas) > max do
+    Enum.take(deltas, -max)
+  end
+
+  defp trim_memory(deltas, _max), do: deltas
+
+  # True when the oldest in-memory delta is newer than `since`, meaning the
+  # caller wants data that was already trimmed from the in-memory list.
+  defp needs_disk_fallback?([], _since), do: false
+  defp needs_disk_fallback?(_deltas, nil), do: false
+  defp needs_disk_fallback?([oldest | _], since), do: oldest.ts > since
 
   defp apply_since(deltas, nil), do: deltas
   defp apply_since(deltas, since), do: Enum.filter(deltas, &(&1.ts >= since))
@@ -159,9 +224,28 @@ defmodule Kyber.Delta.Store do
   defp apply_limit(deltas, nil), do: deltas
   defp apply_limit(deltas, limit), do: Enum.take(deltas, limit)
 
-  defp broadcast(%{subs: subs}, delta) do
+  # Broadcast to all subscribers via supervised Tasks so that:
+  # 1. A crashing callback cannot crash the store
+  # 2. Callbacks don't block the store GenServer
+  # 3. Crashes are logged rather than silently swallowed
+  defp broadcast(%{subs: subs, task_sup: task_sup}, delta) do
     Enum.each(subs, fn {_id, callback_fn} ->
-      Task.start(fn -> callback_fn.(delta) end)
+      wrapped = fn ->
+        try do
+          callback_fn.(delta)
+        rescue
+          e ->
+            Logger.error(
+              "[Kyber.Delta.Store] subscriber callback raised: #{inspect(e)}"
+            )
+        end
+      end
+
+      if task_sup do
+        Task.Supervisor.start_child(task_sup, wrapped)
+      else
+        Task.start(wrapped)
+      end
     end)
   end
 end

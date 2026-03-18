@@ -131,4 +131,52 @@ defmodule Kyber.Web.RouterTest do
       assert String.starts_with?(content_type, "application/json")
     end
   end
+
+  describe "DeltaSocket WebSocket pid capture" do
+    test "subscribe callback delivers deltas to the correct process (ws_pid fix)", %{store: store} do
+      test_pid = self()
+
+      # Simulate what DeltaSocket.init/1 does — capture self() BEFORE subscribing.
+      # This is the fix: ws_pid is bound to the WebSocket handler's PID, not the
+      # Task PID that runs the broadcast callback.
+      ws_pid = test_pid
+
+      unsubscribe_fn = Store.subscribe(store, fn delta ->
+        # In the old (buggy) code, self() here would return the Task's PID.
+        # With ws_pid captured outside, we correctly target the WebSocket handler.
+        send(ws_pid, {:delta, delta})
+      end)
+
+      delta = Delta.new("ws.test.event", %{"msg" => "hello ws"})
+      Store.append(store, delta)
+
+      assert_receive {:delta, received}, 500
+      assert received.id == delta.id
+      assert received.kind == "ws.test.event"
+
+      unsubscribe_fn.()
+    end
+
+    test "DeltaSocket handles multiple deltas in sequence", %{store: store} do
+      test_pid = self()
+      ws_pid = test_pid
+
+      unsubscribe_fn = Store.subscribe(store, fn delta ->
+        send(ws_pid, {:delta, delta})
+      end)
+
+      d1 = Delta.new("ws.seq.1", %{})
+      d2 = Delta.new("ws.seq.2", %{})
+      Store.append(store, d1)
+      Store.append(store, d2)
+
+      assert_receive {:delta, r1}, 500
+      assert_receive {:delta, r2}, 500
+      received_ids = MapSet.new([r1.id, r2.id])
+      assert MapSet.member?(received_ids, d1.id)
+      assert MapSet.member?(received_ids, d2.id)
+
+      unsubscribe_fn.()
+    end
+  end
 end

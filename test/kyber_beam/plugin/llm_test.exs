@@ -203,6 +203,35 @@ defmodule Kyber.Plugin.LLMTest do
     end
   end
 
+  describe "auth token refresh (get_auth_config)" do
+    test "handle_call :get_auth_config returns current auth config" do
+      # Start an LLM plugin with a known auth path (will fail to load, that's ok)
+      {:ok, pid} = GenServer.start_link(LLM, [
+        core: :fake_core,
+        session: :fake_session,
+        auth_path: "/nonexistent/auth.json"
+      ])
+      on_exit(fn ->
+        try do
+          if Process.alive?(pid), do: GenServer.stop(pid, :normal, 500)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      # Initially nil (auth failed to load)
+      assert GenServer.call(pid, :get_auth_config) == nil
+
+      # Inject an updated auth config via handle_info
+      new_config = %{token: "sk-ant-api03-new-token", type: :api_key}
+      send(pid, {:update_auth, new_config})
+      Process.sleep(20)
+
+      # get_auth_config must now return the updated config
+      assert GenServer.call(pid, :get_auth_config) == new_config
+    end
+  end
+
   describe "delta emission format" do
     test "llm.response delta has correct payload structure" do
       # Verify the expected payload structure for llm.response deltas

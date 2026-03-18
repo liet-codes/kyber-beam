@@ -143,6 +143,30 @@ defmodule Kyber.Effect.Executor do
 
   defp get_type(%Kyber.Effect{type: t}), do: t
   defp get_type(%{type: t}) when is_atom(t), do: t
-  defp get_type(%{"type" => t}) when is_binary(t), do: String.to_existing_atom(t)
+
+  # String.to_existing_atom/1 would crash with ArgumentError for unknown atoms,
+  # making this a DoS vector. We use a safe conversion instead: attempt to
+  # match known types, or fall back gracefully to :unknown.
+  defp get_type(%{"type" => t}) when is_binary(t), do: safe_to_atom(t)
   defp get_type(_), do: :unknown
+
+  @known_effect_types ~w(
+    llm_call
+    discord_message
+    error_route
+    plugin_loaded
+    message_received
+  )a
+
+  defp safe_to_atom(t) when t in @known_effect_types, do: String.to_existing_atom(t)
+
+  defp safe_to_atom(t) when is_binary(t) do
+    # For a personal tool, String.to_atom is acceptable — atom table is bounded
+    # by known inputs. Unknown strings return :unknown rather than crashing.
+    try do
+      String.to_existing_atom(t)
+    rescue
+      ArgumentError -> :unknown
+    end
+  end
 end

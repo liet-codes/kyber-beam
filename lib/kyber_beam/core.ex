@@ -4,18 +4,25 @@ defmodule Kyber.Core do
 
   ## Supervision tree
 
-      Kyber.Core (Supervisor)
-      ├── Kyber.Delta.Store        (GenServer — persists/broadcasts deltas)
-      ├── Kyber.State              (Agent — holds application state)
+      Kyber.Core (Supervisor, strategy: :rest_for_one)
       ├── Kyber.Effect.TaskSupervisor (Task.Supervisor — async effect tasks)
-      ├── Kyber.Effect.Executor    (GenServer — dispatches effects)
-      └── Kyber.Plugin.Manager     (DynamicSupervisor — plugin lifecycle)
+      ├── Kyber.Delta.Store           (GenServer — persists/broadcasts deltas)
+      ├── Kyber.State                 (Agent — holds application state)
+      ├── Kyber.Effect.Executor       (GenServer — dispatches effects)
+      ├── Kyber.Plugin.Manager        (DynamicSupervisor — plugin lifecycle)
+      └── Kyber.Core.PipelineWirer    (GenServer — wires store→reducer→executor)
+
+  The `:rest_for_one` strategy ensures that if an early child crashes, all
+  children started after it are also restarted, preventing stale subscriptions.
+
+  `PipelineWirer` is the last child: when its `init/1` runs, all prior siblings
+  are guaranteed to be started and registered by name — no sleep hack needed.
 
   ## Data flow
 
       emit(delta)
         → Delta.Store.append        (persist + broadcast)
-        → subscriber callback       (registered by Core.init)
+        → subscriber callback       (registered by PipelineWirer.init)
         → Reducer.reduce            (pure: state + effects)
         → State.update              (apply state change)
         → Effect.Executor.execute   (async dispatch per effect)
@@ -108,58 +115,24 @@ defmodule Kyber.Core do
     task_sup = task_supervisor_name(core_name)
 
     children = [
+      # Task.Supervisor must be first — Delta.Store and Executor depend on it.
       {Task.Supervisor, name: task_sup},
-      {Kyber.Delta.Store, [name: store, path: store_path]},
+      {Kyber.Delta.Store, [name: store, path: store_path, task_supervisor: task_sup]},
       {Kyber.State, [name: state]},
       {Kyber.Effect.Executor, [name: executor, task_supervisor: task_sup]},
-      {Kyber.Plugin.Manager, [name: plugin_mgr]}
+      {Kyber.Plugin.Manager, [name: plugin_mgr]},
+      # PipelineWirer MUST be last: all prior siblings are guaranteed started
+      # when its init/1 runs, so the subscribe call succeeds without any sleep.
+      {Kyber.Core.PipelineWirer,
+       [core_name: core_name, store: store, state: state, executor: executor]}
     ]
 
-    # Wire up the subscription pipeline after a brief delay to let
-    # children register their names. We spawn a task that waits briefly
-    # then subscribes to the store.
-    Task.start(fn ->
-      Process.sleep(50)
-      subscribe_reducer(core_name, store, state, executor)
-      Logger.info("[Kyber.Core] pipeline wired for #{inspect(core_name)}")
-    end)
-
-    Supervisor.init(children, strategy: :one_for_one)
+    # :rest_for_one ensures that if an early child (e.g. Delta.Store) crashes,
+    # all children started after it also restart, preventing stale subscriptions.
+    Supervisor.init(children, strategy: :rest_for_one)
   end
 
   # ── Private ───────────────────────────────────────────────────────────────
-
-  defp subscribe_reducer(core_name, store, state, executor) do
-    Kyber.Delta.Store.subscribe(store, fn delta ->
-      # Atomically: read current state, reduce with delta, write new state.
-      # Using get_and_update avoids the get/compute/update race condition
-      # when multiple deltas are broadcast concurrently.
-      effects =
-        try do
-          Kyber.State.get_and_update(state, fn current_state ->
-            {new_state, effects} = Kyber.Reducer.reduce(current_state, delta)
-            {effects, new_state}
-          end)
-        rescue
-          e ->
-            Logger.error("[Kyber.Core/#{inspect(core_name)}] reducer error: #{inspect(e)}\n#{Exception.format_stacktrace(__STACKTRACE__)}")
-            []
-        end
-
-      Enum.each(effects, fn effect ->
-        try do
-          case Kyber.Effect.Executor.execute(executor, effect) do
-            {:ok, _ref} -> :ok
-            {:error, reason} ->
-              Logger.warning("[Kyber.Core/#{inspect(core_name)}] effect dispatch failed: #{inspect(reason)}")
-          end
-        rescue
-          e ->
-            Logger.error("[Kyber.Core/#{inspect(core_name)}] effect dispatch error: #{inspect(e)}")
-        end
-      end)
-    end)
-  end
 
   defp default_store_path do
     data_dir = System.get_env("KYBER_DATA_DIR", "priv/data")
@@ -212,4 +185,89 @@ defmodule Kyber.Core do
       _ -> Kyber.Effect.TaskSupervisor
     end
   end
+end
+
+defmodule Kyber.Core.PipelineWirer do
+  @moduledoc """
+  GenServer that wires the Delta.Store subscription to the reducer pipeline.
+
+  Started as the **last child** in `Kyber.Core`'s supervision tree. Because
+  supervisors start children in order, when `init/1` runs here, all prior
+  siblings (TaskSupervisor, Delta.Store, State, Executor, PluginManager) are
+  guaranteed to be started and registered — eliminating the need for any
+  `Process.sleep` hacks.
+
+  Calling `Delta.Store.subscribe/2` from `init/1` is safe and synchronous:
+  the subscription is registered before `init/1` returns `{:ok, state}`,
+  which is before the supervisor considers startup complete.
+  """
+
+  use GenServer
+  require Logger
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @impl true
+  def init(opts) do
+    core_name = Keyword.fetch!(opts, :core_name)
+    store = Keyword.fetch!(opts, :store)
+    state_server = Keyword.fetch!(opts, :state)
+    executor = Keyword.fetch!(opts, :executor)
+
+    unsubscribe_fn =
+      Kyber.Delta.Store.subscribe(store, fn delta ->
+        effects =
+          try do
+            Kyber.State.get_and_update(state_server, fn current_state ->
+              {new_state, effects} = Kyber.Reducer.reduce(current_state, delta)
+              {effects, new_state}
+            end)
+          rescue
+            e ->
+              Logger.error(
+                "[Kyber.Core.PipelineWirer/#{inspect(core_name)}] reducer error: #{inspect(e)}\n" <>
+                  Exception.format_stacktrace(__STACKTRACE__)
+              )
+
+              []
+          end
+
+        Enum.each(effects, fn effect ->
+          try do
+            case Kyber.Effect.Executor.execute(executor, effect) do
+              {:ok, _ref} ->
+                :ok
+
+              {:error, reason} ->
+                Logger.warning(
+                  "[Kyber.Core.PipelineWirer/#{inspect(core_name)}] effect dispatch failed: #{inspect(reason)}"
+                )
+            end
+          rescue
+            e ->
+              Logger.error(
+                "[Kyber.Core.PipelineWirer/#{inspect(core_name)}] effect dispatch error: #{inspect(e)}"
+              )
+          end
+        end)
+      end)
+
+    Logger.info("[Kyber.Core] pipeline wired for #{inspect(core_name)}")
+    {:ok, %{unsubscribe_fn: unsubscribe_fn, core_name: core_name}}
+  end
+
+  @impl true
+  def terminate(_reason, %{unsubscribe_fn: unsubscribe_fn}) do
+    try do
+      unsubscribe_fn.()
+    rescue
+      _ -> :ok
+    end
+
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
 end
