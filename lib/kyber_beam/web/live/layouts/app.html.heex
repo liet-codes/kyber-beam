@@ -1,0 +1,9 @@
+<div id="app">
+  <%= if flash_msg = @flash["info"] do %>
+    <div style="background:#2d6a4f;color:#d8f3dc;padding:12px 24px;border-radius:6px;margin-bottom:16px;"><%= flash_msg %></div>
+  <% end %>
+  <%= if flash_msg = @flash["error"] do %>
+    <div style="background:#7b2d2d;color:#fed7d7;padding:12px 24px;border-radius:6px;margin-bottom:16px;"><%= flash_msg %></div>
+  <% end %>
+  {@inner_content}
+</div>

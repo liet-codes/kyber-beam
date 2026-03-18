@@ -1,0 +1,299 @@
+defmodule Kyber.Web.DashboardLive do
+  @moduledoc """
+  Phoenix LiveView dashboard for Kyber BEAM.
+
+  Displays real-time system state including:
+  - **Overview**: uptime, node info, plugin status, delta/error counts
+  - **Delta stream**: live-updating list of recent deltas
+  - **Node map**: connected distribution nodes and their status
+
+  Subscribes to the Delta.Store for live updates without requiring Phoenix.PubSub.
+  Auto-refreshes state on a 5-second timer for counts/plugins/nodes.
+  """
+
+  use Phoenix.LiveView
+  require Logger
+
+  @refresh_interval_ms 5_000
+  @max_displayed_deltas 50
+
+  # ── Mount ─────────────────────────────────────────────────────────────────
+
+  @impl true
+  def mount(_params, _session, socket) do
+    if connected?(socket) do
+      # Subscribe to live delta stream
+      lv_pid = self()
+      store = store_pid()
+
+      Kyber.Delta.Store.subscribe(store, fn delta ->
+        send(lv_pid, {:new_delta, delta})
+      end)
+
+      # Schedule periodic refresh
+      Process.send_after(self(), :refresh, @refresh_interval_ms)
+    end
+
+    socket =
+      socket
+      |> assign(:started_at, System.system_time(:millisecond))
+      |> assign(:node_name, node())
+      |> load_state()
+
+    {:ok, socket}
+  end
+
+  @impl true
+  def handle_params(_params, _uri, socket) do
+    {:noreply, socket}
+  end
+
+  # ── Events ────────────────────────────────────────────────────────────────
+
+  @impl true
+  def handle_info({:new_delta, delta}, socket) do
+    deltas = [delta | Enum.take(socket.assigns.recent_deltas, @max_displayed_deltas - 1)]
+    {:noreply, assign(socket, :recent_deltas, deltas)}
+  end
+
+  @impl true
+  def handle_info(:refresh, socket) do
+    Process.send_after(self(), :refresh, @refresh_interval_ms)
+    {:noreply, load_state(socket)}
+  end
+
+  @impl true
+  def handle_info(_msg, socket) do
+    {:noreply, socket}
+  end
+
+  # ── Render ────────────────────────────────────────────────────────────────
+
+  @impl true
+  def render(%{live_action: :deltas} = assigns) do
+    ~H"""
+    <div style="padding: 16px 0;">
+      <h1 style="color:#63b3ed;margin-bottom:16px;">Delta Stream</h1>
+      <p style="color:#718096;margin-bottom:16px;">Live feed — newest first. Total: <%= @delta_count %></p>
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <%= for delta <- @recent_deltas do %>
+          <div style="background:#1a1d2e;border:1px solid #2d3748;border-radius:8px;padding:12px;font-size:0.85rem;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+              <span style="color:#68d391;font-weight:bold;"><%= delta.kind %></span>
+              <span style="color:#718096;"><%= format_ts(delta.ts) %></span>
+            </div>
+            <div style="color:#a0aec0;">id: <span style="color:#63b3ed;"><%= String.slice(delta.id, 0, 12) %>…</span></div>
+            <%= if map_size(delta.payload) > 0 do %>
+              <div style="color:#a0aec0;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                <%= inspect(delta.payload) %>
+              </div>
+            <% end %>
+          </div>
+        <% end %>
+        <%= if @recent_deltas == [] do %>
+          <div style="color:#4a5568;text-align:center;padding:32px;">No deltas yet…</div>
+        <% end %>
+      </div>
+    </div>
+    """
+  end
+
+  def render(%{live_action: :nodes} = assigns) do
+    ~H"""
+    <div style="padding: 16px 0;">
+      <h1 style="color:#63b3ed;margin-bottom:16px;">Node Map</h1>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;">
+        <!-- Local node -->
+        <div style="background:#1a1d2e;border:2px solid #68d391;border-radius:12px;padding:20px;">
+          <div style="color:#68d391;font-weight:bold;margin-bottom:8px;">● LOCAL</div>
+          <div style="color:#e2e8f0;font-size:0.9rem;"><%= @node_name %></div>
+          <div style="color:#718096;font-size:0.8rem;margin-top:8px;">Uptime: <%= format_uptime(@started_at) %></div>
+          <div style="color:#718096;font-size:0.8rem;">Deltas: <%= @delta_count %></div>
+          <div style="color:#718096;font-size:0.8rem;">Plugins: <%= length(@plugins) %></div>
+        </div>
+        <!-- Remote nodes -->
+        <%= for node_name <- @connected_nodes do %>
+          <div style="background:#1a1d2e;border:2px solid #4299e1;border-radius:12px;padding:20px;">
+            <div style="color:#4299e1;font-weight:bold;margin-bottom:8px;">◉ REMOTE</div>
+            <div style="color:#e2e8f0;font-size:0.9rem;"><%= node_name %></div>
+            <div style="color:#718096;font-size:0.8rem;margin-top:8px;">Connected</div>
+          </div>
+        <% end %>
+        <%= if @connected_nodes == [] do %>
+          <div style="background:#1a1d2e;border:1px dashed #2d3748;border-radius:12px;padding:20px;color:#4a5568;font-size:0.9rem;text-align:center;">
+            No remote nodes connected.<br/>
+            <small>Use Kyber.Distribution.connect/1 to add nodes.</small>
+          </div>
+        <% end %>
+      </div>
+    </div>
+    """
+  end
+
+  def render(assigns) do
+    # Default: :overview
+    ~H"""
+    <div style="padding: 16px 0;">
+      <h1 style="color:#63b3ed;margin-bottom:24px;">Kyber BEAM — Overview</h1>
+
+      <!-- Stats row -->
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;margin-bottom:32px;">
+        <div style={stat_card_style()}>
+          <div style="color:#718096;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;">Uptime</div>
+          <div style="color:#68d391;font-size:1.4rem;font-weight:bold;margin-top:4px;"><%= format_uptime(@started_at) %></div>
+        </div>
+        <div style={stat_card_style()}>
+          <div style="color:#718096;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;">Total Deltas</div>
+          <div style="color:#63b3ed;font-size:1.4rem;font-weight:bold;margin-top:4px;"><%= @delta_count %></div>
+        </div>
+        <div style={stat_card_style()}>
+          <div style="color:#718096;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;">Errors</div>
+          <div style={error_count_style(@error_count)}><%= @error_count %></div>
+        </div>
+        <div style={stat_card_style()}>
+          <div style="color:#718096;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;">Remote Nodes</div>
+          <div style="color:#b794f4;font-size:1.4rem;font-weight:bold;margin-top:4px;"><%= length(@connected_nodes) %></div>
+        </div>
+        <div style={stat_card_style()}>
+          <div style="color:#718096;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;">Active Sessions</div>
+          <div style="color:#fbd38d;font-size:1.4rem;font-weight:bold;margin-top:4px;"><%= @session_count %></div>
+        </div>
+      </div>
+
+      <!-- Two-column layout -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;">
+
+        <!-- Plugins -->
+        <div style="background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:20px;">
+          <h2 style="color:#a0aec0;font-size:0.9rem;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:16px;">Plugins</h2>
+          <%= if @plugins == [] do %>
+            <div style="color:#4a5568;font-size:0.9rem;">No plugins loaded</div>
+          <% else %>
+            <%= for plugin <- @plugins do %>
+              <div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #2d3748;">
+                <span style="color:#68d391;">●</span>
+                <span style="color:#e2e8f0;font-size:0.9rem;"><%= plugin %></span>
+              </div>
+            <% end %>
+          <% end %>
+        </div>
+
+        <!-- Recent deltas preview -->
+        <div style="background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:20px;">
+          <h2 style="color:#a0aec0;font-size:0.9rem;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:16px;">Recent Deltas</h2>
+          <%= for delta <- Enum.take(@recent_deltas, 8) do %>
+            <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e2435;font-size:0.8rem;">
+              <span style="color:#68d391;"><%= delta.kind %></span>
+              <span style="color:#4a5568;"><%= format_ts(delta.ts) %></span>
+            </div>
+          <% end %>
+          <%= if @recent_deltas == [] do %>
+            <div style="color:#4a5568;font-size:0.9rem;">No deltas yet</div>
+          <% end %>
+          <%= if length(@recent_deltas) > 0 do %>
+            <div style="margin-top:12px;">
+              <a href="/dashboard/deltas" style="color:#63b3ed;font-size:0.8rem;">View all →</a>
+            </div>
+          <% end %>
+        </div>
+
+      </div>
+
+      <!-- Node info -->
+      <div style="background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:20px;margin-top:24px;">
+        <h2 style="color:#a0aec0;font-size:0.9rem;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:12px;">Current Node</h2>
+        <div style="color:#e2e8f0;font-size:0.9rem;"><strong style="color:#718096;">Name:</strong> <%= @node_name %></div>
+        <div style="color:#e2e8f0;font-size:0.9rem;margin-top:4px;"><strong style="color:#718096;">OTP:</strong> <%= :erlang.system_info(:otp_release) %></div>
+        <div style="color:#e2e8f0;font-size:0.9rem;margin-top:4px;"><strong style="color:#718096;">Processes:</strong> <%= :erlang.system_info(:process_count) %></div>
+      </div>
+    </div>
+    """
+  end
+
+  # ── Private ───────────────────────────────────────────────────────────────
+
+  defp load_state(socket) do
+    {delta_count, recent_deltas} = fetch_deltas()
+    kyber_state = safe_get_state()
+    connected_nodes = safe_get_nodes()
+
+    socket
+    |> assign(:delta_count, delta_count)
+    |> assign(:recent_deltas, recent_deltas)
+    |> assign(:plugins, kyber_state.plugins)
+    |> assign(:error_count, length(kyber_state.errors))
+    |> assign(:session_count, map_size(kyber_state.sessions))
+    |> assign(:connected_nodes, connected_nodes)
+  end
+
+  defp fetch_deltas do
+    store = store_pid()
+
+    deltas =
+      try do
+        Kyber.Delta.Store.query(store)
+      rescue
+        _ -> []
+      end
+
+    recent = deltas |> Enum.reverse() |> Enum.take(@max_displayed_deltas)
+    {length(deltas), recent}
+  end
+
+  defp safe_get_state do
+    try do
+      Kyber.State.get(Kyber.State)
+    rescue
+      _ -> %Kyber.State{}
+    end
+  end
+
+  defp safe_get_nodes do
+    try do
+      Kyber.Distribution.nodes(Kyber.Distribution)
+    rescue
+      _ -> []
+    end
+  end
+
+  defp store_pid do
+    Process.get(:kyber_store_pid) || Kyber.Delta.Store
+  end
+
+  defp format_ts(ts) when is_integer(ts) do
+    seconds = div(ts, 1000)
+    now = System.system_time(:second)
+    diff = now - seconds
+
+    cond do
+      diff < 60 -> "#{diff}s ago"
+      diff < 3600 -> "#{div(diff, 60)}m ago"
+      true -> "#{div(diff, 3600)}h ago"
+    end
+  end
+
+  defp format_ts(_), do: "unknown"
+
+  defp format_uptime(started_at) do
+    now = System.system_time(:millisecond)
+    diff_s = div(now - started_at, 1000)
+
+    cond do
+      diff_s < 60 -> "#{diff_s}s"
+      diff_s < 3600 -> "#{div(diff_s, 60)}m #{rem(diff_s, 60)}s"
+      true -> "#{div(diff_s, 3600)}h #{rem(div(diff_s, 60), 60)}m"
+    end
+  end
+
+  defp stat_card_style do
+    "background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:16px;"
+  end
+
+  defp error_count_style(count) when count > 0 do
+    "color:#fc8181;font-size:1.4rem;font-weight:bold;margin-top:4px;"
+  end
+
+  defp error_count_style(_) do
+    "color:#68d391;font-size:1.4rem;font-weight:bold;margin-top:4px;"
+  end
+end

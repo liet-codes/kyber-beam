@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en" style="background:#0f1117;color:#e2e8f0;">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <title>Kyber BEAM Dashboard</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0f1117; color: #e2e8f0; }
+      nav { background: #1a1d2e; border-bottom: 1px solid #2d3748; padding: 12px 24px; display: flex; align-items: center; gap: 24px; }
+      nav .brand { color: #63b3ed; font-weight: bold; font-size: 1.1rem; }
+      nav a { color: #a0aec0; text-decoration: none; font-size: 0.9rem; }
+      nav a:hover { color: #63b3ed; }
+      main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+    </style>
+    <!-- Import maps for Phoenix/LiveView JS (no build step required) -->
+    <script type="importmap">
+    {
+      "imports": {
+        "phoenix": "/assets/phoenix/phoenix.esm.js",
+        "phoenix_live_view": "/assets/lv/phoenix_live_view.esm.js"
+      }
+    }
+    </script>
+    <script type="module">
+      import {Socket} from "phoenix";
+      import {LiveSocket} from "phoenix_live_view";
+      let csrfToken = document.querySelector("meta[name='csrf-token']")?.content || "";
+      let liveSocket = new LiveSocket("/live", Socket, {params: {_csrf_token: csrfToken}});
+      liveSocket.connect();
+      window.liveSocket = liveSocket;
+    </script>
+  </head>
+  <body>
+    <nav>
+      <span class="brand">⚡ Kyber BEAM</span>
+      <a href="/dashboard">Overview</a>
+      <a href="/dashboard/deltas">Deltas</a>
+      <a href="/dashboard/nodes">Nodes</a>
+      <a href="/sys">System</a>
+    </nav>
+    <main>
+      {@inner_content}
+    </main>
+  </body>
+</html>
