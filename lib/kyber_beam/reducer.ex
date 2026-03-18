@@ -100,6 +100,64 @@ defmodule Kyber.Reducer do
     {new_state, []}
   end
 
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "cron.fired"} = delta) do
+    # When a cron job fires, optionally emit an :llm_call for heartbeat jobs,
+    # or let downstream subscribers handle it via pattern matching.
+    job_name = Map.get(delta.payload, "job_name", "")
+
+    effects =
+      if job_name == "heartbeat" do
+        [%{
+          type: :llm_call,
+          delta_id: delta.id,
+          payload: %{"text" => "[heartbeat] check in"},
+          origin: delta.origin
+        }]
+      else
+        []
+      end
+
+    {state, effects}
+  end
+
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "familiard.escalation"} = delta) do
+    # Escalation events may trigger an LLM call or a direct message,
+    # depending on severity level.
+    level = Map.get(delta.payload, "level", "info")
+    message = Map.get(delta.payload, "message", "")
+
+    effects =
+      case level do
+        "critical" ->
+          [%{
+            type: :llm_call,
+            delta_id: delta.id,
+            payload: %{"text" => "[CRITICAL escalation from familiard] #{message}"},
+            origin: delta.origin
+          }]
+
+        "warning" ->
+          [%{
+            type: :llm_call,
+            delta_id: delta.id,
+            payload: %{"text" => "[warning from familiard] #{message}"},
+            origin: delta.origin
+          }]
+
+        _ ->
+          []
+      end
+
+    {state, effects}
+  end
+
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "voice.audio"}) do
+    # Audio data is passed through; no state change.
+    # Downstream effect handlers (e.g. :send_audio) are not emitted here —
+    # they're registered by consumers of the voice plugin.
+    {state, []}
+  end
+
   def reduce(%Kyber.State{} = state, %Kyber.Delta{}) do
     {state, []}
   end

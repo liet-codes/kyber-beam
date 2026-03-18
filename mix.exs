@@ -38,6 +38,9 @@ defmodule KyberBeam.MixProject do
       {:phoenix_pubsub, "~> 2.1"},
       {:phoenix_live_dashboard, "~> 0.8"},
 
+      # YAML frontmatter parsing (Phase 3)
+      {:yaml_elixir, "~> 2.9"},
+
       # Dev/test
       {:excoveralls, "~> 0.18", only: :test}
     ]

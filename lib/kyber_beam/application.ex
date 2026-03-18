@@ -8,6 +8,9 @@ defmodule KyberBeam.Application do
   def start(_type, _args) do
     Logger.info("[KyberBeam] starting application v#{Application.spec(:kyber_beam, :vsn)}")
 
+    vault_path = Application.get_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
+    heartbeat_interval = Application.get_env(:kyber_beam, :heartbeat_interval, nil)
+
     children =
       [
         # PubSub for Phoenix LiveView
@@ -18,7 +21,16 @@ defmodule KyberBeam.Application do
         {Kyber.Core, name: Kyber.Core},
 
         # Hot code deployment (Phase 2)
-        {Kyber.Deployment, name: Kyber.Deployment}
+        {Kyber.Deployment, name: Kyber.Deployment},
+
+        # Phase 3: Knowledge graph
+        {Kyber.Knowledge, name: Kyber.Knowledge, vault_path: vault_path},
+
+        # Phase 3: Cron scheduler
+        {Kyber.Cron,
+         name: Kyber.Cron,
+         core: Kyber.Core,
+         heartbeat_interval: heartbeat_interval}
       ]
       |> then(&(&1 ++ web_children()))
       |> then(&(&1 ++ phoenix_children()))

@@ -21,6 +21,10 @@ defmodule Kyber.Web.PhoenixRouter do
     plug :put_secure_browser_headers
   end
 
+  pipeline :api do
+    plug :accepts, ["json"]
+  end
+
   scope "/" do
     pipe_through :browser
 
@@ -33,5 +37,15 @@ defmodule Kyber.Web.PhoenixRouter do
     live_dashboard "/sys",
       metrics: Kyber.Telemetry,
       ecto_repos: []
+  end
+
+  # Phase 3: Familiard webhook and Knowledge API
+  scope "/api" do
+    pipe_through :api
+
+    post "/familiard/escalate", Kyber.Web.FamiliardController, :escalate
+
+    get "/knowledge/notes", Kyber.Web.KnowledgeController, :index
+    get "/knowledge/notes/*path", Kyber.Web.KnowledgeController, :show
   end
 end

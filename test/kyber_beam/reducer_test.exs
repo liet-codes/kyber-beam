@@ -141,4 +141,59 @@ defmodule Kyber.ReducerTest do
     assert length(e1) == length(e2)
     assert hd(e1).type == hd(e2).type
   end
+
+  # Phase 3 reducer tests
+
+  test "cron.fired heartbeat emits :llm_call effect" do
+    state = empty_state()
+    delta = Delta.new("cron.fired", %{"job_name" => "heartbeat"}, {:cron, "heartbeat"})
+    {_state, effects} = Reducer.reduce(state, delta)
+
+    assert length(effects) == 1
+    assert hd(effects).type == :llm_call
+  end
+
+  test "cron.fired non-heartbeat emits no effects" do
+    state = empty_state()
+    delta = Delta.new("cron.fired", %{"job_name" => "daily-report"}, {:cron, "daily-report"})
+    {_state, effects} = Reducer.reduce(state, delta)
+
+    assert effects == []
+  end
+
+  test "familiard.escalation critical emits :llm_call effect" do
+    state = empty_state()
+    delta = Delta.new("familiard.escalation", %{"level" => "critical", "message" => "down"})
+    {_state, effects} = Reducer.reduce(state, delta)
+
+    assert length(effects) == 1
+    assert hd(effects).type == :llm_call
+    assert hd(effects).payload["text"] =~ "CRITICAL"
+  end
+
+  test "familiard.escalation warning emits :llm_call effect" do
+    state = empty_state()
+    delta = Delta.new("familiard.escalation", %{"level" => "warning", "message" => "slow"})
+    {_state, effects} = Reducer.reduce(state, delta)
+
+    assert length(effects) == 1
+    assert hd(effects).type == :llm_call
+  end
+
+  test "familiard.escalation info emits no effects" do
+    state = empty_state()
+    delta = Delta.new("familiard.escalation", %{"level" => "info", "message" => "all good"})
+    {_state, effects} = Reducer.reduce(state, delta)
+
+    assert effects == []
+  end
+
+  test "voice.audio emits no effects and does not change state" do
+    state = empty_state()
+    delta = Delta.new("voice.audio", %{"audio" => "base64data", "encoding" => "mp3"})
+    {new_state, effects} = Reducer.reduce(state, delta)
+
+    assert new_state == state
+    assert effects == []
+  end
 end
