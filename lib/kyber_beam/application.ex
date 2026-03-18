@@ -1,20 +1,28 @@
 defmodule KyberBeam.Application do
-  # See https://hexdocs.pm/elixir/Application.html
-  # for more information on OTP Applications
   @moduledoc false
 
   use Application
+  require Logger
 
   @impl true
   def start(_type, _args) do
-    children = [
-      # Starts a worker by calling: KyberBeam.Worker.start_link(arg)
-      # {KyberBeam.Worker, arg}
-    ]
+    Logger.info("[KyberBeam] starting application")
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
+    children =
+      [
+        {Kyber.Core, name: Kyber.Core}
+      ] ++ web_children()
+
     opts = [strategy: :one_for_one, name: KyberBeam.Supervisor]
     Supervisor.start_link(children, opts)
+  end
+
+  defp web_children do
+    if Application.get_env(:kyber_beam, :start_web, false) do
+      port = Application.get_env(:kyber_beam, :port, 4000)
+      [{Kyber.Web.Server, port: port}]
+    else
+      []
+    end
   end
 end
