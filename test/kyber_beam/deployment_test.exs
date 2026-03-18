@@ -79,10 +79,62 @@ defmodule Kyber.DeploymentTest do
     end
   end
 
-  describe "deploy/2" do
-    test "returns {:error, _} for a nonexistent git ref", %{dep: dep} do
+  describe "deploy/2 — async" do
+    test "returns {:ok, :deploying} immediately", %{dep: dep} do
       result = Kyber.Deployment.deploy(dep, "definitely-not-a-real-ref-xyz123abc")
-      assert match?({:error, _}, result)
+      assert result == {:ok, :deploying}
+    end
+
+    test "deploying?/1 returns true while a deploy task is running", %{dep: dep} do
+      # Kick off a deploy (will fail quickly on bad ref, but we check state first)
+      Kyber.Deployment.deploy(dep, "nonexistent-ref-check-deploying")
+      # deploying? should return true right after the call
+      assert Kyber.Deployment.deploying?(dep) == true
+    end
+
+    test "deploying?/1 returns false after task completes", %{dep: dep} do
+      Kyber.Deployment.deploy(dep, "nonexistent-ref-will-fail-fast")
+      # Wait for the git command to fail and the cast to arrive
+      assert_eventually(fn -> Kyber.Deployment.deploying?(dep) == false end, 3_000)
+    end
+
+    test "second deploy while one is running returns {:error, :already_deploying}", %{dep: dep} do
+      Kyber.Deployment.deploy(dep, "nonexistent-ref-block-1")
+      result = Kyber.Deployment.deploy(dep, "nonexistent-ref-block-2")
+      assert result == {:error, :already_deploying}
+    end
+
+    test "deploy is re-entrant after task completes", %{dep: dep} do
+      Kyber.Deployment.deploy(dep, "nonexistent-ref-retry-1")
+      # Wait for first deploy to finish
+      assert_eventually(fn -> Kyber.Deployment.deploying?(dep) == false end, 3_000)
+      # Should accept a new deploy now
+      result = Kyber.Deployment.deploy(dep, "nonexistent-ref-retry-2")
+      assert result == {:ok, :deploying}
+    end
+
+    test "GenServer stays responsive immediately after deploy/2 call", %{dep: dep} do
+      Kyber.Deployment.deploy(dep, "nonexistent-ref-responsive")
+      # This call must not block — deploy is async
+      assert Process.alive?(dep)
+      assert is_list(Kyber.Deployment.deployed_versions(dep))
+    end
+  end
+
+  # Helper: poll a condition up to `timeout_ms`, sleeping 50ms between tries.
+  defp assert_eventually(condition, timeout_ms, start \\ System.monotonic_time(:millisecond)) do
+    if condition.() do
+      :ok
+    else
+      now = System.monotonic_time(:millisecond)
+      elapsed = now - start
+
+      if elapsed >= timeout_ms do
+        flunk("Condition never became true within #{timeout_ms}ms")
+      else
+        Process.sleep(50)
+        assert_eventually(condition, timeout_ms, start)
+      end
     end
   end
 end

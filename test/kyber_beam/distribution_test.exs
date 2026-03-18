@@ -125,6 +125,19 @@ defmodule Kyber.DistributionTest do
       Process.sleep(100)
       assert Process.alive?(dist)
     end
+
+    test "GenServer stays responsive immediately after :nodeup for known node", %{dist: dist} do
+      # Manually add a node to the node set so nodeup triggers a sync attempt
+      # (which should be async and not block the GenServer)
+      send(dist, {:nodedown, :"slow_remote@host"})
+      # nodedown records last_seen_ts; nodeup for same node triggers sync
+      send(dist, {:nodeup, :"slow_remote@host"})
+
+      # GenServer must respond to calls immediately (sync is in a Task)
+      result = Kyber.Distribution.nodes(dist)
+      assert is_list(result)
+      assert Process.alive?(dist)
+    end
   end
 
   describe "store subscription" do
@@ -140,6 +153,131 @@ defmodule Kyber.DistributionTest do
       :ok = Kyber.Delta.Store.append(sn, delta)
       Process.sleep(100)
       assert Process.alive?(dist)
+    end
+  end
+
+  describe "bounded dedup cache" do
+    test "dedup_seen?/2 returns false for unseen id" do
+      cache = {MapSet.new(), :queue.new()}
+      refute Kyber.Distribution.dedup_seen?(cache, "abc")
+    end
+
+    test "dedup_add/2 then dedup_seen?/2 returns true" do
+      cache = {MapSet.new(), :queue.new()}
+      cache = Kyber.Distribution.dedup_add(cache, "abc")
+      assert Kyber.Distribution.dedup_seen?(cache, "abc")
+    end
+
+    test "dedup_size/1 tracks count correctly" do
+      cache = {MapSet.new(), :queue.new()}
+      cache = Kyber.Distribution.dedup_add(cache, "id1")
+      cache = Kyber.Distribution.dedup_add(cache, "id2")
+      cache = Kyber.Distribution.dedup_add(cache, "id2")  # duplicate
+      assert Kyber.Distribution.dedup_size(cache) == 2
+    end
+
+    test "evicts oldest entry when cache exceeds 50,000" do
+      # Build a cache with 50,000 entries using unique IDs
+      cache =
+        Enum.reduce(1..50_000, {MapSet.new(), :queue.new()}, fn i, acc ->
+          Kyber.Distribution.dedup_add(acc, "id_#{i}")
+        end)
+
+      assert Kyber.Distribution.dedup_size(cache) == 50_000
+      # "id_1" is oldest — adding one more should evict it
+      cache = Kyber.Distribution.dedup_add(cache, "id_new")
+      assert Kyber.Distribution.dedup_size(cache) == 50_000
+      refute Kyber.Distribution.dedup_seen?(cache, "id_1"), "oldest entry should have been evicted"
+      assert Kyber.Distribution.dedup_seen?(cache, "id_new"), "newest entry should be present"
+    end
+
+    test "cache size never exceeds max after many insertions" do
+      cache =
+        Enum.reduce(1..60_000, {MapSet.new(), :queue.new()}, fn i, acc ->
+          Kyber.Distribution.dedup_add(acc, "id_#{i}")
+        end)
+
+      assert Kyber.Distribution.dedup_size(cache) == 50_000
+    end
+
+    test "adding duplicate IDs does not grow the cache beyond max" do
+      # Fill to 50,000 with unique IDs, then re-add existing ones
+      cache =
+        Enum.reduce(1..50_000, {MapSet.new(), :queue.new()}, fn i, acc ->
+          Kyber.Distribution.dedup_add(acc, "stable_#{i}")
+        end)
+
+      # Re-add the same IDs — set stays at 50,000 but queue grows,
+      # causing earlier stable IDs to be evicted from the set when queue
+      # entries exceed max. Size must not exceed 50,000.
+      cache =
+        Enum.reduce(1..1_000, cache, fn i, acc ->
+          Kyber.Distribution.dedup_add(acc, "stable_#{i}")
+        end)
+
+      assert Kyber.Distribution.dedup_size(cache) <= 50_000
+    end
+
+    test "GenServer continues to accept new deltas after receiving many", %{dist: dist, store_name: sn} do
+      # Send 100 unique remote deltas to exercise the bounded cache path
+      for i <- 1..100 do
+        delta = Kyber.Delta.new("bulk.event.#{i}", %{"source_node" => "remote@host"})
+        GenServer.call(dist, {:receive_remote_delta, delta})
+      end
+
+      assert Process.alive?(dist)
+
+      # Verify they are stored
+      stored = Kyber.Delta.Store.query(sn)
+      assert length(stored) >= 100
+    end
+  end
+
+  describe "async sync_results" do
+    test "GenServer accepts :sync_results cast without crashing", %{dist: dist, store_name: sn} do
+      delta = Kyber.Delta.new("synced.event", %{"source_node" => "remote@host"})
+
+      # Simulate what the sync Task would cast back
+      GenServer.cast(dist, {:sync_results, :"remote@host", [delta]})
+      Process.sleep(50)
+
+      assert Process.alive?(dist)
+      stored = Kyber.Delta.Store.query(sn)
+      assert Enum.any?(stored, &(&1.id == delta.id))
+    end
+
+    test "sync_results deduplicates deltas already in the seen set", %{dist: dist, store_name: sn} do
+      delta = Kyber.Delta.new("synced.dup", %{"source_node" => "remote@host"})
+
+      # Apply via receive_remote_delta first
+      GenServer.call(dist, {:receive_remote_delta, delta})
+      stored_before = Kyber.Delta.Store.query(sn)
+      count_before = length(Enum.filter(stored_before, &(&1.id == delta.id)))
+      assert count_before == 1
+
+      # Now sync_results with the same delta — should be deduped
+      GenServer.cast(dist, {:sync_results, :"remote@host", [delta]})
+      Process.sleep(50)
+
+      stored_after = Kyber.Delta.Store.query(sn)
+      count_after = length(Enum.filter(stored_after, &(&1.id == delta.id)))
+      assert count_after == 1, "delta should be stored exactly once"
+    end
+
+    test "sync_results with multiple deltas applies all unique ones", %{dist: dist, store_name: sn} do
+      deltas =
+        for i <- 1..5 do
+          Kyber.Delta.new("multi.sync.#{i}", %{"source_node" => "remote@host"})
+        end
+
+      GenServer.cast(dist, {:sync_results, :"remote@host", deltas})
+      Process.sleep(100)
+
+      stored = Kyber.Delta.Store.query(sn)
+      for delta <- deltas do
+        assert Enum.any?(stored, &(&1.id == delta.id)),
+               "delta #{delta.id} should be stored after sync"
+      end
     end
   end
 end

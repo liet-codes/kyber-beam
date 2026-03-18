@@ -14,7 +14,8 @@ defmodule Kyber.Deployment do
       # Reload on all connected Distribution nodes
       Kyber.Deployment.reload_cluster(MyModule)
 
-      # Pull a git ref, compile, and reload changed modules
+      # Pull a git ref, compile, and reload changed modules.
+      # Returns {:ok, :deploying} immediately; result announced via Logger.
       Kyber.Deployment.deploy("main")
       Kyber.Deployment.deploy("v1.2.3")
 
@@ -24,8 +25,11 @@ defmodule Kyber.Deployment do
     to hot-swap the BEAM bytecode in memory.
   - `reload_cluster/1`: Uses `:erpc.multicall/4` to run the reload on
     all nodes connected via `Kyber.Distribution`.
-  - `deploy/1`: Runs `git fetch && git checkout <ref>`, calls `mix compile`,
-    then reloads all modules that changed (detected via beam file mtimes).
+  - `deploy/1`: Starts an async Task that runs `git fetch && git checkout <ref>`,
+    calls `mix compile`, then reloads all modules that changed (detected via
+    beam file mtimes). Returns `{:ok, :deploying}` immediately so the GenServer
+    remains responsive. Returns `{:error, :already_deploying}` if a deploy
+    is already in progress.
 
   Deployed versions are tracked in the GenServer state for introspection.
   """
@@ -73,15 +77,18 @@ defmodule Kyber.Deployment do
   end
 
   @doc """
-  Pull a git ref, compile, and reload all changed modules.
+  Pull a git ref, compile, and reload all changed modules asynchronously.
+
+  Returns `{:ok, :deploying}` immediately — the actual git/compile work runs
+  in a supervised Task. Returns `{:error, :already_deploying}` if a deploy is
+  already running. Progress and results are logged at info/error level.
 
   `git_ref` can be a branch, tag, or commit SHA.
   Runs in the current working directory (assumes it's a git repo).
-  Returns `{:ok, [modules]}` or `{:error, reason}`.
   """
-  @spec deploy(GenServer.server(), git_ref()) :: {:ok, [module_name()]} | {:error, any()}
+  @spec deploy(GenServer.server(), git_ref()) :: {:ok, :deploying} | {:error, :already_deploying}
   def deploy(server \\ __MODULE__, git_ref) when is_binary(git_ref) do
-    GenServer.call(server, {:deploy, git_ref}, 120_000)
+    GenServer.call(server, {:deploy, git_ref})
   end
 
   @doc "List recently deployed module versions."
@@ -90,16 +97,25 @@ defmodule Kyber.Deployment do
     GenServer.call(server, :deployed_versions)
   end
 
+  @doc "Returns true if a deploy is currently in progress."
+  @spec deploying?(GenServer.server()) :: boolean()
+  def deploying?(server \\ __MODULE__) do
+    GenServer.call(server, :deploying?)
+  end
+
   # ── GenServer callbacks ───────────────────────────────────────────────────
 
   @impl true
   def init(opts) do
     project_dir = Keyword.get(opts, :project_dir, File.cwd!())
+    {:ok, task_sup} = Task.Supervisor.start_link()
 
     {:ok,
      %{
        deployed: [],
-       project_dir: project_dir
+       project_dir: project_dir,
+       task_sup: task_sup,
+       deploying: false
      }}
   end
 
@@ -156,27 +172,54 @@ defmodule Kyber.Deployment do
   end
 
   @impl true
+  def handle_call({:deploy, _git_ref}, _from, %{deploying: true} = state) do
+    {:reply, {:error, :already_deploying}, state}
+  end
+
+  @impl true
   def handle_call({:deploy, git_ref}, _from, state) do
-    Logger.info("[Kyber.Deployment] deploying #{git_ref}")
+    server = self()
+    project_dir = state.project_dir
 
-    with :ok <- git_fetch_and_checkout(git_ref, state.project_dir),
-         {:ok, changed_modules} <- mix_compile(state.project_dir),
-         reloaded <- reload_changed_modules(changed_modules) do
-      Logger.info(
-        "[Kyber.Deployment] deployed #{git_ref}, reloaded #{length(reloaded)} modules"
-      )
+    Task.Supervisor.start_child(state.task_sup, fn ->
+      Logger.info("[Kyber.Deployment] deploying #{git_ref}")
 
-      {:reply, {:ok, reloaded}, state}
-    else
-      {:error, reason} = err ->
-        Logger.error("[Kyber.Deployment] deploy failed: #{inspect(reason)}")
-        {:reply, err, state}
-    end
+      result =
+        with :ok <- git_fetch_and_checkout(git_ref, project_dir),
+             {:ok, changed_modules} <- mix_compile(project_dir),
+             reloaded <- reload_changed_modules(changed_modules) do
+          {:ok, reloaded}
+        end
+
+      GenServer.cast(server, {:deploy_complete, git_ref, result})
+    end)
+
+    {:reply, {:ok, :deploying}, %{state | deploying: true}}
   end
 
   @impl true
   def handle_call(:deployed_versions, _from, state) do
     {:reply, state.deployed, state}
+  end
+
+  @impl true
+  def handle_call(:deploying?, _from, state) do
+    {:reply, state.deploying, state}
+  end
+
+  @impl true
+  def handle_cast({:deploy_complete, git_ref, result}, state) do
+    case result do
+      {:ok, reloaded} ->
+        Logger.info(
+          "[Kyber.Deployment] deployed #{git_ref}, reloaded #{length(reloaded)} modules"
+        )
+
+      {:error, reason} ->
+        Logger.error("[Kyber.Deployment] deploy failed for #{git_ref}: #{inspect(reason)}")
+    end
+
+    {:noreply, %{state | deploying: false}}
   end
 
   # ── Private ───────────────────────────────────────────────────────────────

@@ -28,12 +28,24 @@ defmodule Kyber.Distribution do
   `:net_kernel.monitor_nodes/1` is used to detect `:nodeup`/`:nodedown` events.
   On `:nodeup` for a known node, missed deltas are queried from the remote
   store (using the last-seen timestamp) and replayed locally.
+
+  Sync runs in a supervised Task so the GenServer stays responsive during
+  potentially long remote calls.
+
+  ## Deduplication
+
+  `seen_delta_ids` is a bounded cache of `{MapSet, :queue}`. When the set
+  exceeds `@max_seen_ids` entries the oldest entry is evicted, keeping memory
+  usage capped even during long-running sessions.
   """
 
   use GenServer
   require Logger
 
   @type node_name :: atom()
+
+  # Max entries in the dedup cache before evicting oldest.
+  @max_seen_ids 50_000
 
   # ── Public API ────────────────────────────────────────────────────────────
 
@@ -88,13 +100,18 @@ defmodule Kyber.Distribution do
     store = Keyword.get(opts, :store, :"#{Kyber.Core}.Store")
     auto_nodes = Keyword.get(opts, :auto_nodes, [])
 
+    # Supervised task pool for async operations (sync, etc.)
+    {:ok, task_sup} = Task.Supervisor.start_link()
+
     state = %{
       nodes: MapSet.new(),
       last_seen_ts: %{},
       store: store,
-      seen_delta_ids: MapSet.new(),
+      # Bounded dedup cache: {MapSet, :queue} — capped at @max_seen_ids
+      seen_delta_ids: {MapSet.new(), :queue.new()},
       unsubscribe_fn: nil,
-      auto_nodes: auto_nodes
+      auto_nodes: auto_nodes,
+      task_sup: task_sup
     }
 
     Logger.info("[Kyber.Distribution] started, node=#{node()}")
@@ -150,10 +167,10 @@ defmodule Kyber.Distribution do
 
   @impl true
   def handle_call({:receive_remote_delta, delta}, _from, state) do
-    if MapSet.member?(state.seen_delta_ids, delta.id) do
+    if dedup_seen?(state.seen_delta_ids, delta.id) do
       {:reply, :duplicate, state}
     else
-      seen = MapSet.put(state.seen_delta_ids, delta.id)
+      seen = dedup_add(state.seen_delta_ids, delta.id)
       :ok = Kyber.Delta.Store.append(state.store, delta)
       Logger.debug("[Kyber.Distribution] received remote delta #{delta.id} kind=#{delta.kind}")
       {:reply, :ok, %{state | seen_delta_ids: seen}}
@@ -173,7 +190,7 @@ defmodule Kyber.Distribution do
       }
 
       # Mark as seen so we don't re-apply our own broadcast
-      seen = MapSet.put(state.seen_delta_ids, tagged_delta.id)
+      seen = dedup_add(state.seen_delta_ids, tagged_delta.id)
       new_state = %{state | seen_delta_ids: seen}
 
       # Send to all connected remote nodes
@@ -188,14 +205,31 @@ defmodule Kyber.Distribution do
   end
 
   @impl true
+  def handle_cast({:sync_results, remote_node, deltas}, state) do
+    # Apply deltas received from an async sync task, deduplicating as we go.
+    {new_seen, count} =
+      Enum.reduce(deltas, {state.seen_delta_ids, 0}, fn delta, {seen, n} ->
+        if dedup_seen?(seen, delta.id) do
+          {seen, n}
+        else
+          :ok = Kyber.Delta.Store.append(state.store, delta)
+          {dedup_add(seen, delta.id), n + 1}
+        end
+      end)
+
+    Logger.info("[Kyber.Distribution] synced #{count} deltas from #{remote_node}")
+    {:noreply, %{state | seen_delta_ids: new_seen}}
+  end
+
+  @impl true
   def handle_info({:nodeup, node_name}, state) do
     Logger.info("[Kyber.Distribution] :nodeup #{node_name}")
 
-    # If this is a known node, sync missed deltas
+    # If this is a known node, kick off an async sync so we don't block.
     new_state =
       if MapSet.member?(state.nodes, node_name) do
         since = Map.get(state.last_seen_ts, node_name, 0)
-        sync_missed_deltas(node_name, since, state.store)
+        spawn_sync_task(state.task_sup, self(), node_name, since)
         state
       else
         state
@@ -227,7 +261,7 @@ defmodule Kyber.Distribution do
         :pong ->
           nodes = MapSet.put(state.nodes, node_name)
           since = Map.get(state.last_seen_ts, node_name, 0)
-          sync_missed_deltas(node_name, since, state.store)
+          spawn_sync_task(state.task_sup, self(), node_name, since)
           Logger.info("[Kyber.Distribution] connected to #{node_name}")
           {:ok, %{state | nodes: nodes}}
 
@@ -238,23 +272,46 @@ defmodule Kyber.Distribution do
     end
   end
 
-  defp sync_missed_deltas(remote_node, since_ts, _local_store) do
-    Logger.info("[Kyber.Distribution] syncing from #{remote_node} since #{since_ts}")
+  # Spawn an async Task to fetch missed deltas from a remote node.
+  # Results are delivered back via GenServer.cast so the GenServer stays
+  # responsive during the (potentially slow) remote :erpc.call.
+  defp spawn_sync_task(task_sup, server, remote_node, since_ts) do
+    Task.Supervisor.start_child(task_sup, fn ->
+      Logger.info("[Kyber.Distribution] syncing from #{remote_node} since #{since_ts}")
 
-    try do
-      remote_deltas =
-        :erpc.call(remote_node, Kyber.Delta.Store, :query, [[since: since_ts]], 5_000)
+      try do
+        remote_deltas =
+          :erpc.call(remote_node, Kyber.Delta.Store, :query, [[since: since_ts]], 5_000)
 
-      Enum.each(remote_deltas, fn delta ->
-        GenServer.call(__MODULE__, {:receive_remote_delta, delta})
-      end)
+        GenServer.cast(server, {:sync_results, remote_node, remote_deltas})
+        Logger.info("[Kyber.Distribution] sync task complete for #{remote_node}, #{length(remote_deltas)} deltas queued")
+      rescue
+        e ->
+          Logger.warning(
+            "[Kyber.Distribution] sync failed for #{remote_node}: #{inspect(e)}"
+          )
+      end
+    end)
+  end
 
-      Logger.info("[Kyber.Distribution] synced #{length(remote_deltas)} deltas from #{remote_node}")
-    rescue
-      e ->
-        Logger.warning(
-          "[Kyber.Distribution] sync failed for #{remote_node}: #{inspect(e)}"
-        )
+  # ── Bounded dedup cache helpers ───────────────────────────────────────────
+
+  @doc false
+  def dedup_seen?({set, _queue}, id), do: MapSet.member?(set, id)
+
+  @doc false
+  def dedup_add({set, queue}, id) do
+    set = MapSet.put(set, id)
+    queue = :queue.in(id, queue)
+
+    if MapSet.size(set) > @max_seen_ids do
+      {{:value, oldest}, queue} = :queue.out(queue)
+      {MapSet.delete(set, oldest), queue}
+    else
+      {set, queue}
     end
   end
+
+  @doc false
+  def dedup_size({set, _queue}), do: MapSet.size(set)
 end
