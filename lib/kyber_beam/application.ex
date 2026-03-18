@@ -10,6 +10,7 @@ defmodule KyberBeam.Application do
 
     children =
       [
+        {Kyber.Session, name: Kyber.Session},
         {Kyber.Core, name: Kyber.Core}
       ] ++ web_children()
 

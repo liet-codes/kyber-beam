@@ -14,12 +14,14 @@ defmodule Kyber.Reducer do
 
   ## Pattern dispatch
 
-  | `delta.kind`       | State change               | Effects emitted        |
-  |--------------------|----------------------------|------------------------|
-  | `"message.received"` | none                     | `[llm_call effect]`    |
-  | `"error.route"`    | append to `state.errors`   | `[]`                   |
-  | `"plugin.loaded"`  | prepend to `state.plugins` | `[]`                   |
-  | _(any other)_      | none                       | `[]`                   |
+  | `delta.kind`         | State change               | Effects emitted          |
+  |----------------------|----------------------------|--------------------------|
+  | `"message.received"` | none                       | `[llm_call effect]`      |
+  | `"llm.response"`     | none                       | `[:send_message effect]` |
+  | `"llm.error"`        | append to `state.errors`   | `[]`                     |
+  | `"error.route"`      | append to `state.errors`   | `[]`                     |
+  | `"plugin.loaded"`    | prepend to `state.plugins` | `[]`                     |
+  | _(any other)_        | none                       | `[]`                     |
   """
 
   @type effect :: map()
@@ -47,6 +49,45 @@ defmodule Kyber.Reducer do
       delta_id: delta.id,
       ts: delta.ts,
       payload: delta.payload
+    }
+
+    new_state = Kyber.State.add_error(state, error)
+    {new_state, []}
+  end
+
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "llm.response"} = delta) do
+    # Extract the channel from the parent delta's origin (stored in the effect)
+    # Emit a :send_message effect so the response gets routed back to the caller
+    content = Map.get(delta.payload, "content", "")
+
+    # Derive channel_id from the delta origin (if it's a channel origin)
+    channel_id =
+      case delta.origin do
+        {:channel, "discord", cid, _} -> cid
+        _ -> nil
+      end
+
+    effects =
+      if channel_id && content != "" do
+        [%{
+          type: :send_message,
+          delta_id: delta.id,
+          origin: delta.origin,
+          payload: %{"channel_id" => channel_id, "content" => content}
+        }]
+      else
+        []
+      end
+
+    {state, effects}
+  end
+
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "llm.error"} = delta) do
+    error = %{
+      delta_id: delta.id,
+      ts: delta.ts,
+      payload: delta.payload,
+      kind: "llm.error"
     }
 
     new_state = Kyber.State.add_error(state, error)

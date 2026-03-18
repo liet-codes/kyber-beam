@@ -26,6 +26,8 @@ defmodule KyberBeam.MixProject do
       {:plug, "~> 1.15"},
       {:websock_adapter, "~> 0.5"},
       {:jason, "~> 1.4"},
+      {:req, "~> 0.5"},
+      {:websock, "~> 0.5"},
       {:excoveralls, "~> 0.18", only: :test}
     ]
   end

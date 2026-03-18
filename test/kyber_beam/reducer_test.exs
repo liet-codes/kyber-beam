@@ -66,6 +66,69 @@ defmodule Kyber.ReducerTest do
     assert effects == []
   end
 
+  test "llm.response with discord channel origin emits :send_message effect" do
+    state = empty_state()
+    delta = Delta.new(
+      "llm.response",
+      %{"content" => "Here is your answer", "model" => "claude-sonnet-4-6"},
+      {:channel, "discord", "ch_999", "user_1"}
+    )
+
+    {new_state, effects} = Reducer.reduce(state, delta)
+
+    assert new_state == state
+    assert length(effects) == 1
+    effect = hd(effects)
+    assert effect.type == :send_message
+    assert effect.payload["channel_id"] == "ch_999"
+    assert effect.payload["content"] == "Here is your answer"
+  end
+
+  test "llm.response with non-channel origin emits no effects" do
+    state = empty_state()
+    delta = Delta.new(
+      "llm.response",
+      %{"content" => "some content"},
+      {:system, "internal"}
+    )
+
+    {_state, effects} = Reducer.reduce(state, delta)
+    assert effects == []
+  end
+
+  test "llm.response with empty content emits no effects" do
+    state = empty_state()
+    delta = Delta.new(
+      "llm.response",
+      %{"content" => ""},
+      {:channel, "discord", "ch_1", "u_1"}
+    )
+
+    {_state, effects} = Reducer.reduce(state, delta)
+    assert effects == []
+  end
+
+  test "llm.error appends to state.errors" do
+    state = empty_state()
+    delta = Delta.new("llm.error", %{"error" => "rate limited", "status" => 429})
+    {new_state, effects} = Reducer.reduce(state, delta)
+
+    assert effects == []
+    assert length(new_state.errors) == 1
+    error = hd(new_state.errors)
+    assert error.delta_id == delta.id
+    assert error.kind == "llm.error"
+  end
+
+  test "llm.error accumulates multiple errors" do
+    state = empty_state()
+    d1 = Delta.new("llm.error", %{"error" => "first"})
+    d2 = Delta.new("llm.error", %{"error" => "second"})
+    {s1, _} = Reducer.reduce(state, d1)
+    {s2, _} = Reducer.reduce(s1, d2)
+    assert length(s2.errors) == 2
+  end
+
   test "reducer is pure — no side effects between calls" do
     state = empty_state()
     delta = Delta.new("message.received", %{})
