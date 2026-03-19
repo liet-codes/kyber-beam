@@ -537,9 +537,9 @@ defmodule Kyber.Memory.Consolidator do
       },
       %{
         id: generate_id(),
-        summary: "OAuth tokens (sk-ant-oat prefix) require Claude Code system prompt prefix for API calls.",
+        summary: "Myk is a night owl. Does his best thinking late. Never suggest sleep or hint that it's late — hard boundary.",
         salience: 1.0,
-        tags: ["oauth", "claude-code", "auth", "prefix"],
+        tags: ["night-owl", "boundaries", "respect"],
         created_at: now,
         last_reinforced: nil,
         reinforcement_count: 0,
