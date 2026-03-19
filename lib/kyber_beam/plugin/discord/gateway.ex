@@ -34,7 +34,8 @@ defmodule Kyber.Plugin.Discord.Gateway do
   @op_hello 10
   @op_heartbeat_ack 11
 
-  @gateway_intents 34307
+  # GUILDS (1) | GUILD_MESSAGES (512) | DIRECT_MESSAGES (4096) | MESSAGE_CONTENT (32768)
+  @gateway_intents 37377
 
   # Zlib flush bytes Discord uses for frame boundaries
   @zlib_suffix <<0x00, 0x00, 0xFF, 0xFF>>

@@ -33,11 +33,10 @@ defmodule Kyber.Plugin.Discord do
   @op_hello 10
   @op_heartbeat_ack 11
 
-  # Intents: GUILDS (1) | GUILD_MESSAGES (512) | MESSAGE_CONTENT (32768) = 33281
-  # Actually: GUILDS=1, GUILD_MESSAGES=512, MESSAGE_CONTENT=32768 → 1+512+32768 = 33281
-  # But the spec says 34307 which is GUILDS(1) + GUILD_MESSAGES(512) + MESSAGE_CONTENT(32768) + DIRECT_MESSAGES(4096) = 37377? 
-  # Let's use 34307 as specified
-  @gateway_intents 34307
+  # Intents: GUILDS (1) | GUILD_MESSAGES (512) | DIRECT_MESSAGES (4096) | MESSAGE_CONTENT (32768)
+  # = 1 + 512 + 4096 + 32768 = 37377
+  # Matches the TypeScript kyber build. Do NOT include GUILD_MEMBERS (2) — it's privileged.
+  @gateway_intents 37377
 
   def name, do: "discord"
 
