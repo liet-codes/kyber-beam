@@ -15,7 +15,7 @@ defmodule Kyber.Memory.ConsolidatorTest do
     Map.merge(
       %{
         id: :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower),
-        summary: "Test memory: something happened",
+        vault_ref: "concepts/test-memory.md",
         salience: 0.7,
         tags: ["recall", "memory", "architecture"],
         created_at: now - 3_600,
@@ -35,9 +35,9 @@ defmodule Kyber.Memory.ConsolidatorTest do
       on_exit(fn -> File.rm(path) end)
 
       pool = [
-        sample_memory(%{id: "aaa111", summary: "First memory", salience: 0.8, tags: ["elixir"]}),
-        sample_memory(%{id: "bbb222", summary: "Second memory", salience: 0.5, tags: ["discord", "oauth"]}),
-        sample_memory(%{id: "ccc333", summary: "Third memory", salience: 0.3, tags: ["reducer"]})
+        sample_memory(%{id: "aaa111", vault_ref: "concepts/first.md", salience: 0.8, tags: ["elixir"]}),
+        sample_memory(%{id: "bbb222", vault_ref: "concepts/second.md", salience: 0.5, tags: ["discord", "oauth"]}),
+        sample_memory(%{id: "ccc333", vault_ref: "concepts/third.md", salience: 0.3, tags: ["reducer"]})
       ]
 
       Consolidator.save_pool(pool, path)
@@ -59,7 +59,7 @@ defmodule Kyber.Memory.ConsolidatorTest do
       now = System.system_time(:second)
       mem = %{
         id: "deadbeef",
-        summary: "OAuth tokens need Claude Code prefix",
+        vault_ref: "concepts/oauth-prefix.md",
         salience: 0.95,
         tags: ["oauth", "auth", "important"],
         created_at: now - 7200,
@@ -72,13 +72,26 @@ defmodule Kyber.Memory.ConsolidatorTest do
       [loaded] = Consolidator.load_pool(path)
 
       assert loaded.id == mem.id
-      assert loaded.summary == mem.summary
+      assert loaded.vault_ref == mem.vault_ref
       assert Float.round(loaded.salience, 4) == Float.round(mem.salience, 4)
       assert loaded.tags == mem.tags
       assert loaded.created_at == mem.created_at
       assert loaded.last_reinforced == mem.last_reinforced
       assert loaded.reinforcement_count == mem.reinforcement_count
       assert loaded.pinned == mem.pinned
+    end
+
+    test "pool entry has vault_ref, not summary" do
+      path = tmp_path("schema")
+      on_exit(fn -> File.rm(path) end)
+
+      mem = sample_memory(%{id: "schema1", vault_ref: "concepts/important.md"})
+      Consolidator.save_pool([mem], path)
+      [loaded] = Consolidator.load_pool(path)
+
+      assert Map.has_key?(loaded, :vault_ref)
+      refute Map.has_key?(loaded, :summary)
+      assert loaded.vault_ref == "concepts/important.md"
     end
 
     test "returns empty list for missing file" do
@@ -90,13 +103,45 @@ defmodule Kyber.Memory.ConsolidatorTest do
       on_exit(fn -> File.rm(path) end)
 
       now = System.system_time(:second)
-      good = %{id: "good1", summary: "Good memory", salience: 0.5, tags: [], created_at: now, last_reinforced: nil, reinforcement_count: 0}
 
-      File.write!(path, ~s({"garbage": true}\n#{Jason.encode!(good |> Map.new(fn {k, v} -> {to_string(k), v} end))}\nnot json at all\n))
+      good = %{
+        id: "good1",
+        vault_ref: "concepts/good.md",
+        salience: 0.5,
+        tags: [],
+        created_at: now,
+        last_reinforced: nil,
+        reinforcement_count: 0
+      }
+
+      json_good = good |> Map.new(fn {k, v} -> {to_string(k), v} end) |> Jason.encode!()
+      File.write!(path, ~s({"garbage": true}\n#{json_good}\nnot json at all\n))
 
       loaded = Consolidator.load_pool(path)
       assert length(loaded) == 1
       assert hd(loaded).id == "good1"
+    end
+
+    test "skips entries missing vault_ref" do
+      path = tmp_path("no_vault_ref")
+      on_exit(fn -> File.rm(path) end)
+
+      now = System.system_time(:second)
+      # Old-style entry with summary instead of vault_ref
+      old_entry = %{
+        "id" => "old1",
+        "summary" => "An old memory without vault_ref",
+        "salience" => 0.5,
+        "tags" => [],
+        "created_at" => now,
+        "last_reinforced" => nil,
+        "reinforcement_count" => 0
+      }
+      File.write!(path, Jason.encode!(old_entry) <> "\n")
+
+      loaded = Consolidator.load_pool(path)
+      # Old entries without vault_ref should be skipped
+      assert loaded == []
     end
 
     test "save_pool handles empty pool" do
@@ -113,26 +158,6 @@ defmodule Kyber.Memory.ConsolidatorTest do
 
   describe "decay calculation" do
     test "salience decays by rate each cycle" do
-      # Start a consolidator with a very short interval and no LLM scoring
-      pool_path = tmp_path("decay_pool")
-      memory_path = tmp_path("decay_memory.md")
-      on_exit(fn -> File.rm(pool_path); File.rm(memory_path) end)
-
-      # Pre-populate pool file with a known memory
-      now = System.system_time(:second)
-      mem = %{
-        "id" => "decay1",
-        "summary" => "A memory that will decay",
-        "salience" => 1.0,
-        "tags" => ["decay"],
-        "created_at" => now - 3600,
-        "last_reinforced" => nil,
-        "reinforcement_count" => 0
-      }
-      File.write!(pool_path, Jason.encode!(mem) <> "\n")
-
-      # Verify: after one decay cycle, salience should be 0.95 (rate 0.95)
-      # We test the math directly since the GenServer would call an LLM
       initial_salience = 1.0
       decay_rate = 0.95
       after_one_cycle = initial_salience * decay_rate
@@ -162,12 +187,10 @@ defmodule Kyber.Memory.ConsolidatorTest do
 
   describe "reinforce/1" do
     test "reinforce/1 with empty tags is a no-op" do
-      # Should not crash or raise
       assert :ok = Consolidator.reinforce([])
     end
 
     test "reinforce/1 with tags and no running process is a no-op" do
-      # The reinforce function guards against missing process
       assert :ok = Consolidator.reinforce(["some", "tags"])
     end
 
@@ -184,77 +207,51 @@ defmodule Kyber.Memory.ConsolidatorTest do
     end
   end
 
-  # ── MEMORY.md Generation ──────────────────────────────────────────────────
+  # ── MEMORY.md Generation (structure) ─────────────────────────────────────
 
-  describe "MEMORY.md generation" do
-    test "persistent section contains highest-salience memories" do
-      pool_path = tmp_path("gen_pool")
-      memory_path = tmp_path("gen_memory.md")
-      on_exit(fn -> File.rm(pool_path); File.rm(memory_path) end)
+  describe "MEMORY.md data structure" do
+    test "persistent section gets top entries by salience*recency" do
+      pool = [
+        sample_memory(%{id: "hi1", vault_ref: "concepts/high-a.md", salience: 0.95, tags: ["important"]}),
+        sample_memory(%{id: "hi2", vault_ref: "concepts/high-b.md", salience: 0.90, tags: ["critical"]}),
+        sample_memory(%{id: "lo1", vault_ref: "concepts/low.md", salience: 0.20, tags: ["minor"]})
+      ]
 
       now = System.system_time(:second)
+      sorted =
+        pool
+        |> Enum.map(fn mem ->
+          age_days = (now - mem.created_at) / 86_400
+          recency = max(0.3, 1.0 - age_days / 30.0)
+          {mem.salience * recency, mem}
+        end)
+        |> Enum.sort_by(fn {score, _} -> score end, :desc)
+        |> Enum.map(fn {_, mem} -> mem end)
 
-      mems = [
-        %{"id" => "hi1", "summary" => "High salience memory A", "salience" => 0.95, "tags" => ["important"], "created_at" => now, "last_reinforced" => nil, "reinforcement_count" => 0},
-        %{"id" => "hi2", "summary" => "High salience memory B", "salience" => 0.90, "tags" => ["critical"], "created_at" => now, "last_reinforced" => nil, "reinforcement_count" => 0},
-        %{"id" => "lo1", "summary" => "Low salience memory C", "salience" => 0.20, "tags" => ["minor"], "created_at" => now - 86400, "last_reinforced" => nil, "reinforcement_count" => 0}
-      ]
-
-      File.write!(pool_path, Enum.map_join(mems, "\n", &Jason.encode!/1) <> "\n")
-      pool = Consolidator.load_pool(pool_path)
-
-      # Use consolidate_now via internal function by starting a server
-      # Instead, test the render logic indirectly via save + inspect
-
-      # Verify pool loaded correctly
-      assert length(pool) == 3
-      saliences = Enum.map(pool, & &1.salience) |> Enum.sort(:desc)
-      assert hd(saliences) >= 0.90
+      top2 = Enum.take(sorted, 2)
+      assert Enum.any?(top2, fn m -> m.vault_ref == "concepts/high-a.md" end)
+      assert Enum.any?(top2, fn m -> m.vault_ref == "concepts/high-b.md" end)
     end
 
-    test "MEMORY.md contains both sections" do
-      # Verify the rendered format has the right structure
-      persistent = [
-        sample_memory(%{summary: "Persistent memory one", salience: 0.9, tags: ["important"]}),
-        sample_memory(%{summary: "Persistent memory two", salience: 0.8, tags: ["architecture"]})
-      ]
-
-      drifting = [
-        sample_memory(%{summary: "Drifting memory alpha", salience: 0.4, tags: ["drift"]}),
-      ]
-
-      # Simulate the render by checking what write_memory_md would produce
-      # We verify the format expectations
-      assert Enum.all?(persistent, fn m -> is_binary(m.summary) end)
-      assert Enum.all?(drifting, fn m -> is_binary(m.summary) end)
-
-      # The persistent section should be in the top half of the output
-      sorted = Enum.sort_by(persistent ++ drifting, & &1.salience, :desc)
-      top = Enum.take(sorted, 2)
-      assert Enum.any?(top, fn m -> m.summary == "Persistent memory one" end)
-    end
-
-    test "persistent and drifting sections are separated correctly" do
-      pool = Enum.map(1..12, fn i ->
-        sample_memory(%{
-          id: "mem#{i}",
-          summary: "Memory number #{i}",
-          salience: (12 - i) / 12.0,
-          tags: ["tag#{i}"]
-        })
-      end)
+    test "persistent and drifting sections split correctly with max_persistent=8" do
+      pool =
+        Enum.map(1..12, fn i ->
+          sample_memory(%{
+            id: "mem#{i}",
+            vault_ref: "concepts/note#{i}.md",
+            salience: (12 - i) / 12.0,
+            tags: ["tag#{i}"]
+          })
+        end)
 
       config = %{max_persistent: 8, max_drifting: 8}
 
-      # With 12 memories and max 8 persistent + 8 drifting,
-      # top 8 by score should be persistent, rest eligible for drifting
       sorted = Enum.sort_by(pool, & &1.salience, :desc)
       {top8, rest4} = Enum.split(sorted, config.max_persistent)
 
       assert length(top8) == 8
       assert length(rest4) == 4
 
-      # Top 8 are the ones with higher salience
       top_saliences = Enum.map(top8, & &1.salience)
       rest_saliences = Enum.map(rest4, & &1.salience)
 
@@ -266,38 +263,29 @@ defmodule Kyber.Memory.ConsolidatorTest do
 
   describe "token budget enforcement" do
     test "drops lowest-salience drifting memories when over budget" do
-      # Build a large drifting set that would exceed 8000 chars
-      long_summary = String.duplicate("x", 200)
+      sorted_drifting =
+        Enum.map(1..30, fn i ->
+          sample_memory(%{
+            vault_ref: "concepts/drift#{i}.md",
+            salience: i / 30.0,
+            tags: ["drift"]
+          })
+        end)
+        |> Enum.sort_by(& &1.salience, :asc)
 
-      drifting = Enum.map(1..30, fn i ->
-        sample_memory(%{
-          summary: "#{long_summary} memory #{i}",
-          salience: i / 30.0,
-          tags: ["drift"]
-        })
-      end)
-
-      persistent = [sample_memory(%{summary: "Core memory", salience: 0.99})]
-
-      # Simulate what enforce_token_budget would do:
-      # Sort drifting ascending by salience, drop lowest until under limit
-      sorted_drifting = Enum.sort_by(drifting, & &1.salience, :asc)
-
-      # After dropping the lowest, the remaining should be higher salience
       [dropped | remaining] = sorted_drifting
       assert dropped.salience < hd(remaining).salience
-
-      # Persistent memories are never dropped in budget enforcement
-      assert length(persistent) == 1
-      assert hd(persistent).salience == 0.99
     end
 
-    test "does not drop persistent memories for budget" do
-      persistent = Enum.map(1..8, fn i ->
-        sample_memory(%{summary: "Important memory #{i}", salience: 0.9})
-      end)
+    test "persistent memories are never dropped for budget" do
+      persistent =
+        Enum.map(1..8, fn i ->
+          sample_memory(%{
+            vault_ref: "concepts/important#{i}.md",
+            salience: 0.9
+          })
+        end)
 
-      # These should never be dropped — they're in the persistent section
       assert length(persistent) == 8
       assert Enum.all?(persistent, fn m -> m.salience >= 0.9 end)
     end
@@ -310,18 +298,19 @@ defmodule Kyber.Memory.ConsolidatorTest do
       pool_path = tmp_path("gs_pool")
       memory_path = tmp_path("gs_memory.md")
       unique_name = :"Kyber.Memory.Consolidator.Test.#{:rand.uniform(999_999)}"
+
       on_exit(fn ->
         File.rm(pool_path)
         File.rm(memory_path)
       end)
 
-      # Use a very long consolidation interval so it doesn't fire during test
-      {:ok, pid} = Consolidator.start_link(
-        name: unique_name,
-        pool_path: pool_path,
-        memory_md_path: memory_path,
-        consolidation_interval_ms: 999_999_999
-      )
+      {:ok, pid} =
+        Consolidator.start_link(
+          name: unique_name,
+          pool_path: pool_path,
+          memory_md_path: memory_path,
+          consolidation_interval_ms: 999_999_999
+        )
 
       assert Process.alive?(pid)
 
@@ -346,7 +335,7 @@ defmodule Kyber.Memory.ConsolidatorTest do
       now = System.system_time(:second)
       existing = %{
         "id" => "preexisting1",
-        "summary" => "A memory that was already there",
+        "vault_ref" => "concepts/preloaded.md",
         "salience" => 0.75,
         "tags" => ["preloaded"],
         "created_at" => now - 3600,
@@ -355,15 +344,91 @@ defmodule Kyber.Memory.ConsolidatorTest do
       }
       File.write!(pool_path, Jason.encode!(existing) <> "\n")
 
-      {:ok, pid} = Consolidator.start_link(
-        name: unique_name,
-        pool_path: pool_path,
-        memory_md_path: memory_path,
-        consolidation_interval_ms: 999_999_999
-      )
+      {:ok, pid} =
+        Consolidator.start_link(
+          name: unique_name,
+          pool_path: pool_path,
+          memory_md_path: memory_path,
+          consolidation_interval_ms: 999_999_999
+        )
 
       pool = Consolidator.get_pool(pid)
       assert Enum.any?(pool, fn m -> m.id == "preexisting1" end)
+
+      loaded = Enum.find(pool, fn m -> m.id == "preexisting1" end)
+      assert loaded.vault_ref == "concepts/preloaded.md"
+      refute Map.has_key?(loaded, :summary)
+
+      GenServer.stop(pid)
+    end
+
+    test "pin_memory and unpin_memory work by ID" do
+      pool_path = tmp_path("pin_pool")
+      memory_path = tmp_path("pin_memory.md")
+      unique_name = :"Kyber.Memory.Consolidator.Test.Pin.#{:rand.uniform(999_999)}"
+      on_exit(fn -> File.rm(pool_path); File.rm(memory_path) end)
+
+      now = System.system_time(:second)
+      entry = %{
+        "id" => "pin_test_id",
+        "vault_ref" => "concepts/pinnable.md",
+        "salience" => 0.6,
+        "tags" => ["test"],
+        "created_at" => now - 100,
+        "last_reinforced" => nil,
+        "reinforcement_count" => 0
+      }
+      File.write!(pool_path, Jason.encode!(entry) <> "\n")
+
+      {:ok, pid} =
+        Consolidator.start_link(
+          name: unique_name,
+          pool_path: pool_path,
+          memory_md_path: memory_path,
+          consolidation_interval_ms: 999_999_999
+        )
+
+      assert :ok = Consolidator.pin_memory("pin_test_id", pid)
+      pool = Consolidator.get_pool(pid)
+      pinned = Enum.find(pool, fn m -> m.id == "pin_test_id" end)
+      assert pinned.pinned == true
+
+      assert :ok = Consolidator.unpin_memory("pin_test_id", pid)
+      pool2 = Consolidator.get_pool(pid)
+      unpinned = Enum.find(pool2, fn m -> m.id == "pin_test_id" end)
+      assert unpinned.pinned == false
+
+      assert {:error, :not_found} = Consolidator.pin_memory("no_such_id", pid)
+
+      GenServer.stop(pid)
+    end
+  end
+
+  # ── Vault-change event scoring ────────────────────────────────────────────
+
+  describe "vault_changed event" do
+    test "consolidator handles vault_changed message gracefully without auth" do
+      pool_path = tmp_path("vc_pool")
+      memory_path = tmp_path("vc_memory.md")
+      unique_name = :"Kyber.Memory.Consolidator.Test.VC.#{:rand.uniform(999_999)}"
+      on_exit(fn -> File.rm(pool_path); File.rm(memory_path) end)
+
+      {:ok, pid} =
+        Consolidator.start_link(
+          name: unique_name,
+          pool_path: pool_path,
+          memory_md_path: memory_path,
+          consolidation_interval_ms: 999_999_999
+        )
+
+      # Sending vault_changed without auth configured should not crash
+      send(pid, {:vault_changed, ["concepts/new-note.md", "memory/2026-03-19.md"]})
+
+      # Give it a moment to process
+      Process.sleep(100)
+
+      # Consolidator should still be alive
+      assert Process.alive?(pid)
 
       GenServer.stop(pid)
     end

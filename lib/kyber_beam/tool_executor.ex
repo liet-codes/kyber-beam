@@ -256,16 +256,20 @@ defmodule Kyber.ToolExecutor do
       case find_memory_by_query(query) do
         {:ok, mem} ->
           case Kyber.Memory.Consolidator.pin_memory(mem.id) do
-            :ok -> {:ok, "📌 Pinned: #{mem.summary}"}
-            {:error, :not_found} -> {:error, "Memory vanished during pin"}
+            :ok ->
+              display = memory_display_name(mem)
+              {:ok, "📌 Pinned: #{display}"}
+
+            {:error, :not_found} ->
+              {:error, "Memory vanished during pin"}
           end
 
         {:error, :no_match} ->
-          {:error, "No memory matching '#{query}'. This searches your memory pool by tags and summary text."}
+          {:error, "No memory matching '#{query}'. This searches your memory pool by tags and vault note title."}
 
         {:error, :ambiguous, matches} ->
-          summaries = Enum.map_join(matches, "\n- ", & &1.summary)
-          {:error, "Multiple matches — be more specific:\n- #{summaries}"}
+          names = Enum.map_join(matches, "\n- ", &memory_display_name/1)
+          {:error, "Multiple matches — be more specific:\n- #{names}"}
       end
     catch
       :exit, _ -> {:error, "Memory.Consolidator not running"}
@@ -277,19 +281,33 @@ defmodule Kyber.ToolExecutor do
       case find_memory_by_query(query) do
         {:ok, mem} ->
           case Kyber.Memory.Consolidator.unpin_memory(mem.id) do
-            :ok -> {:ok, "Unpinned: #{mem.summary}"}
-            {:error, :not_found} -> {:error, "Memory vanished during unpin"}
+            :ok ->
+              display = memory_display_name(mem)
+              {:ok, "Unpinned: #{display}"}
+
+            {:error, :not_found} ->
+              {:error, "Memory vanished during unpin"}
           end
 
         {:error, :no_match} ->
           {:error, "No memory matching '#{query}'."}
 
         {:error, :ambiguous, matches} ->
-          summaries = Enum.map_join(matches, "\n- ", & &1.summary)
-          {:error, "Multiple matches — be more specific:\n- #{summaries}"}
+          names = Enum.map_join(matches, "\n- ", &memory_display_name/1)
+          {:error, "Multiple matches — be more specific:\n- #{names}"}
       end
     catch
       :exit, _ -> {:error, "Memory.Consolidator not running"}
+    end
+  end
+
+  # Fetch a human-readable display name for a pool entry (vault_ref → L0 title).
+  defp memory_display_name(mem) do
+    vault_ref = Map.get(mem, :vault_ref, "")
+
+    case knowledge_l0(vault_ref) do
+      {:ok, %{title: title}} -> "#{title} (#{vault_ref})"
+      _ -> vault_ref
     end
   end
 
@@ -301,29 +319,60 @@ defmodule Kyber.ToolExecutor do
     scored =
       memories
       |> Enum.map(fn mem ->
-        summary_lower = String.downcase(mem.summary)
-        tags = Enum.map(Map.get(mem, :tags, []), &String.downcase/1)
+        vault_ref = Map.get(mem, :vault_ref, "")
+        mem_tags = Enum.map(Map.get(mem, :tags, []), &String.downcase/1)
 
-        # Score: tag matches worth 2, summary word matches worth 1
-        tag_score = Enum.count(query_words, fn w -> Enum.any?(tags, &String.contains?(&1, w)) end) * 2
-        summary_score = Enum.count(query_words, fn w -> String.contains?(summary_lower, w) end)
-        total = tag_score + summary_score
+        # Fetch L0 title from Knowledge for content-based matching
+        title_lower =
+          case knowledge_l0(vault_ref) do
+            {:ok, %{title: title}} -> String.downcase(title)
+            _ -> ""
+          end
 
+        ref_lower = String.downcase(vault_ref)
+
+        # Score: tag matches worth 2, title/vault_ref word matches worth 1
+        tag_score =
+          Enum.count(query_words, fn w ->
+            Enum.any?(mem_tags, &String.contains?(&1, w))
+          end) * 2
+
+        title_score =
+          Enum.count(query_words, fn w ->
+            String.contains?(title_lower, w) or String.contains?(ref_lower, w)
+          end)
+
+        total = tag_score + title_score
         {mem, total}
       end)
       |> Enum.filter(fn {_mem, score} -> score > 0 end)
       |> Enum.sort_by(fn {_mem, score} -> score end, :desc)
 
     case scored do
-      [] -> {:error, :no_match}
+      [] ->
+        {:error, :no_match}
+
       [{best, best_score} | rest] ->
-        # If the top match is clearly better (2x score), use it
+        # If the top match is clearly better (1.5× score), use it
         if rest == [] or best_score > elem(hd(rest), 1) * 1.5 do
           {:ok, best}
         else
           top_matches = Enum.take([{best, best_score} | rest], 3) |> Enum.map(&elem(&1, 0))
           {:error, :ambiguous, top_matches}
         end
+    end
+  end
+
+  # Safely call Kyber.Knowledge.get_tiered at L0.
+  defp knowledge_l0(vault_ref) do
+    if Process.whereis(Kyber.Knowledge) do
+      try do
+        Kyber.Knowledge.get_tiered(Kyber.Knowledge, vault_ref, :l0)
+      catch
+        :exit, _ -> {:error, :not_running}
+      end
+    else
+      {:error, :not_running}
     end
   end
 

@@ -356,6 +356,78 @@ defmodule Kyber.KnowledgeTest do
     end
   end
 
+  # ── Subscription (vault_changed notifications) ────────────────────────────
+
+  describe "subscribe/unsubscribe" do
+    test "subscribe/1 registers and subscriber receives vault_changed on file change",
+         %{pid: pid, vault_dir: vault_dir} do
+      :ok = Knowledge.subscribe(pid)
+
+      # Write a new file directly to disk (bypassing GenServer)
+      ext_path = Path.join(vault_dir, "subscribed.md")
+      File.write!(ext_path, "---\ntitle: Sub Test\n---\n\nContent.")
+
+      # Trigger an async poll
+      send(pid, :poll_vault)
+
+      # The subscriber (this test process) should receive the message
+      assert_receive {:vault_changed, paths}, 1_000
+      assert "subscribed.md" in paths
+    end
+
+    test "unsubscribe/1 stops notifications", %{pid: pid, vault_dir: vault_dir} do
+      :ok = Knowledge.subscribe(pid)
+      :ok = Knowledge.unsubscribe(pid)
+
+      ext_path = Path.join(vault_dir, "after-unsub.md")
+      File.write!(ext_path, "content.")
+
+      send(pid, :poll_vault)
+      Process.sleep(300)
+
+      refute_receive {:vault_changed, _}, 100
+    end
+
+    test "deleted paths are included in vault_changed", %{pid: pid, vault_dir: vault_dir} do
+      # First add a note so it's tracked
+      :ok = Knowledge.put_note(pid, "to-delete-sub.md", %{"title" => "Doomed"}, "bye")
+
+      :ok = Knowledge.subscribe(pid)
+
+      # Delete from disk
+      File.rm!(Path.join(vault_dir, "to-delete-sub.md"))
+
+      send(pid, :poll_vault)
+
+      assert_receive {:vault_changed, paths}, 1_000
+      assert "to-delete-sub.md" in paths
+    end
+
+    test "no vault_changed sent when nothing changes", %{pid: pid} do
+      :ok = Knowledge.subscribe(pid)
+
+      # Trigger poll with no changes on disk
+      send(pid, :poll_vault)
+      Process.sleep(300)
+
+      refute_receive {:vault_changed, _}, 100
+    end
+
+    test "duplicate subscribe is idempotent", %{pid: pid, vault_dir: vault_dir} do
+      :ok = Knowledge.subscribe(pid)
+      :ok = Knowledge.subscribe(pid)
+
+      ext_path = Path.join(vault_dir, "dup-sub.md")
+      File.write!(ext_path, "dup.")
+
+      send(pid, :poll_vault)
+
+      # Should receive exactly one message, not two
+      assert_receive {:vault_changed, _paths}, 1_000
+      refute_receive {:vault_changed, _}, 100
+    end
+  end
+
   # ── mtime-based polling ───────────────────────────────────────────────────
 
   describe "mtime-based incremental polling" do

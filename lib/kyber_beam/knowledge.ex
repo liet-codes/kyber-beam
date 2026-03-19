@@ -124,6 +124,24 @@ defmodule Kyber.Knowledge do
     GenServer.call(server, :note_count)
   end
 
+  @doc """
+  Subscribe the calling process to vault change notifications.
+
+  When vault polling detects changed or deleted files, the server sends
+  `{:vault_changed, [path1, path2, ...]}` to all subscribed PIDs.
+  Paths are relative to the vault root.
+  """
+  @spec subscribe(GenServer.server()) :: :ok
+  def subscribe(server \\ __MODULE__) do
+    GenServer.call(server, {:subscribe, self()})
+  end
+
+  @doc "Unsubscribe the calling process from vault change notifications."
+  @spec unsubscribe(GenServer.server()) :: :ok
+  def unsubscribe(server \\ __MODULE__) do
+    GenServer.call(server, {:unsubscribe, self()})
+  end
+
   # ── GenServer callbacks ─────────────────────────────────────────────────────
 
   @impl true
@@ -137,7 +155,8 @@ defmodule Kyber.Knowledge do
       notes: %{},        # path → note map
       link_graph: %{},   # path → [linked paths]
       file_mtimes: %{},  # rel_path → mtime (for incremental reloads)
-      reload_task: nil   # Task ref of in-progress async reload
+      reload_task: nil,  # Task ref of in-progress async reload
+      subscribers: []    # PIDs to notify on vault changes
     }
 
     # Initial load — synchronous on startup so we're ready to serve immediately
@@ -260,6 +279,21 @@ defmodule Kyber.Knowledge do
     {:reply, map_size(state.notes), state}
   end
 
+  def handle_call({:subscribe, pid}, _from, state) do
+    subs =
+      if pid in state.subscribers do
+        state.subscribers
+      else
+        [pid | state.subscribers]
+      end
+
+    {:reply, :ok, %{state | subscribers: subs}}
+  end
+
+  def handle_call({:unsubscribe, pid}, _from, state) do
+    {:reply, :ok, %{state | subscribers: List.delete(state.subscribers, pid)}}
+  end
+
   # ── handle_info ─────────────────────────────────────────────────────────────
 
   @impl true
@@ -297,7 +331,24 @@ defmodule Kyber.Knowledge do
       Logger.debug("[Kyber.Knowledge] vault updated: #{map_size(changed_notes)} changed, #{length(deleted_paths)} deleted")
     end
 
-    {:noreply, %{state | notes: new_notes, link_graph: new_graph, file_mtimes: new_mtimes}}
+    # Notify subscribers of changed/deleted paths; prune dead PIDs
+    changed_paths = Map.keys(changed_notes) ++ deleted_paths
+
+    live_subscribers =
+      if changed_paths != [] and state.subscribers != [] do
+        Enum.filter(state.subscribers, fn pid ->
+          if Process.alive?(pid) do
+            send(pid, {:vault_changed, changed_paths})
+            true
+          else
+            false
+          end
+        end)
+      else
+        state.subscribers
+      end
+
+    {:noreply, %{state | notes: new_notes, link_graph: new_graph, file_mtimes: new_mtimes, subscribers: live_subscribers}}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -307,6 +358,8 @@ defmodule Kyber.Knowledge do
   defp default_vault_path do
     Path.expand("~/.kyber/vault")
   end
+
+  defp schedule_poll(0), do: :ok
 
   defp schedule_poll(interval) do
     Process.send_after(self(), :poll_vault, interval)

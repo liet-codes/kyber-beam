@@ -1,49 +1,59 @@
 defmodule Kyber.Memory.Consolidator do
   @moduledoc """
-  Long-term memory management for Stilgar.
+  Long-term memory management — salience layer over the Knowledge graph.
 
-  Runs as a GenServer that periodically (default: every 60 minutes):
-  1. Queries recent deltas from `Kyber.Delta.Store`
-  2. Sends them to a cheap LLM (Haiku) to score for long-term salience
-  3. Stores scored memories in ETS table `:memory_pool`
-  4. Rebuilds `~/.kyber/vault/identity/MEMORY.md` from the pool:
-     - Top half (max 8): highest salience × recency_weight items
-     - Bottom half (max 8): random sample, weighted toward age diversity
-  5. Persists the pool to `~/.kyber/memory_pool.jsonl`
+  Pool entries are **pointers to vault notes** with salience metadata.
+  No content is duplicated here: summaries come from Knowledge L0/L1 tiers
+  on demand when MEMORY.md is generated.
 
-  ## Memory Lifecycle
+  ## Pool Entry Structure
 
-  Each memory in the pool has:
+  Each entry in the pool (ETS + JSONL) has:
   - `id` — unique binary ID
-  - `summary` — one-line human-readable summary (aggressive compression)
-  - `salience` — 0.0–1.0 score from LLM, adjusted by reinforcement/decay
-  - `tags` — list of topic tags for fuzzy matching
+  - `vault_ref` — path relative to vault root (e.g. "concepts/reducer-purity.md")
+  - `salience` — 0.0–1.0 score, adjusted by reinforcement/decay
+  - `tags` — list of topic tags from note frontmatter or LLM scoring
+  - `pinned` — if true, never decays or gets GC'd
   - `created_at` — Unix timestamp
   - `last_reinforced` — Unix timestamp of last reinforcement (nil if never)
   - `reinforcement_count` — how many times this memory has been reinforced
-  - `pinned` — if true, never decays and never gets GC'd
+
+  ## Vault Change Scoring
+
+  On init, subscribes to `Kyber.Knowledge`. When vault files change,
+  `handle_info({:vault_changed, paths})` fires and each changed path is scored
+  individually via a Haiku call: "should this note be in long-term memory?"
+  Only changed/new notes are scored — never the whole vault.
+
+  ## Periodic Consolidation
+
+  Every hour (default):
+  1. Apply buffered reinforcements
+  2. Decay unreinforced memories (salience × 0.95)
+  3. GC low-salience entries + dead vault refs (note deleted from vault)
+  4. Rebuild MEMORY.md from pool (content pulled from Knowledge L0 tiers)
+  5. Persist pool to JSONL
+
+  Scoring is NOT done in the periodic cycle — it is event-driven from vault changes.
 
   ## Reinforcement
-  When a memory's tags appear in an LLM response, call `reinforce/1` with
-  the matched tag list. Reinforcements are buffered and applied at the start
-  of each consolidation cycle (single GenServer process — no ETS race).
 
-  ## Decay
-  Each consolidation cycle, unreinforced memories decay: `salience *= 0.95`.
-  Memories reinforced within the last 2 cycles are skipped.
-  Pinned memories never decay.
-  Memories below 0.05 salience are GC'd unless `reinforcement_count > 5` or pinned.
+  When memory tags appear in an LLM response, call `reinforce/1`. Tags are
+  buffered and applied atomically at the start of the next consolidation cycle.
 
-  ## Token Budget
-  MEMORY.md is capped at ~8000 chars (~2000 tokens). If over budget, the
-  lowest-salience drifting memories are dropped first.
+  ## MEMORY.md Structure
 
-  ## Architecture note
-  MEMORY.md is a *view*. The pool JSONL is the *source of truth*. On startup,
-  the pool is loaded from disk; on each cycle it is saved back.
+  - Persistent section: top 8 by salience × recency, rendered as L0 titles
+  - Drifting section: random 8, rendered as L0 titles
+  - Pinned memories get 📌 prefix
+  - Dead refs (vault note deleted) are skipped automatically
+  - Token budget: capped at ~8000 chars; lowest-salience drifting dropped first
 
-  This is a novel architecture worth understanding: salience-weighted, stochastic
-  long-term memory that persists across VM restarts.
+  ## Architecture Note
+
+  MEMORY.md is a *view*. The pool JSONL is the *source of truth*. The vault
+  notes are the *content source*. This three-layer design avoids duplication:
+  salience is separate from knowledge; neither modifies the other.
   """
 
   use GenServer
@@ -63,12 +73,6 @@ defmodule Kyber.Memory.Consolidator do
   @memory_md_path "~/.kyber/vault/identity/MEMORY.md"
   @anthropic_url "https://api.anthropic.com/v1/messages"
   @max_memory_chars 8_000
-
-  # Keys to strip from delta payloads before sending to LLM
-  @sensitive_keys ~w(
-    auth_config token api_key secret password authorization
-    cookie session_id access_token refresh_token private_key
-  )
 
   # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -139,6 +143,7 @@ defmodule Kyber.Memory.Consolidator do
     pool_path = Keyword.get(opts, :pool_path, @pool_path) |> Path.expand()
     memory_md_path = Keyword.get(opts, :memory_md_path, @memory_md_path) |> Path.expand()
     core = Keyword.get(opts, :core, Kyber.Core)
+    knowledge = Keyword.get(opts, :knowledge, Kyber.Knowledge)
 
     # Load pool from disk
     pool = load_pool(pool_path)
@@ -166,9 +171,9 @@ defmodule Kyber.Memory.Consolidator do
     # Populate ETS from loaded pool
     Enum.each(pool, fn mem -> :ets.insert(table, {mem.id, mem}) end)
 
-    # Seed pinned memories if pool is empty
-    if pool == [] do
-      seed_pinned_memories(table)
+    # Subscribe to vault changes (graceful if Knowledge not yet running)
+    if Process.whereis(knowledge) do
+      Kyber.Knowledge.subscribe(knowledge)
     end
 
     state = %{
@@ -176,6 +181,7 @@ defmodule Kyber.Memory.Consolidator do
       pool_path: pool_path,
       memory_md_path: memory_md_path,
       core: core,
+      knowledge: knowledge,
       table: table,
       last_consolidated: nil,
       pending_reinforcements: []
@@ -238,6 +244,12 @@ defmodule Kyber.Memory.Consolidator do
   end
 
   @impl true
+  def handle_info({:vault_changed, paths}, state) do
+    # Event-driven scoring: only score notes that actually changed
+    new_state = score_vault_notes(paths, state)
+    {:noreply, new_state}
+  end
+
   def handle_info(:consolidate, state) do
     new_state = run_consolidation(state)
     schedule_consolidation(state.config.consolidation_interval_ms)
@@ -257,27 +269,17 @@ defmodule Kyber.Memory.Consolidator do
     # 1. Apply decay to all existing memories (skipping pinned + recently reinforced)
     state = apply_decay(state)
 
-    # 2. Query recent deltas and score them (if auth available)
-    {state, scoring_succeeded} = score_and_merge_deltas(state)
-
-    # 3. Garbage collect low-salience memories
+    # 2. Garbage collect low-salience entries and dead vault refs
     state = gc_memories(state)
 
-    # 4. Rebuild MEMORY.md from pool
+    # 3. Rebuild MEMORY.md from pool (content pulled from Knowledge)
     pool = read_pool_from_ets(state.table)
-    write_memory_md(pool, state.memory_md_path, state.config)
+    write_memory_md(pool, state.memory_md_path, state.config, state.knowledge)
 
-    # 5. Persist pool to JSONL
+    # 4. Persist pool to JSONL
     save_pool(read_pool_from_ets(state.table), state.pool_path)
 
-    # 6. Only advance last_consolidated if LLM scoring was attempted and succeeded.
-    #    On failure, the same delta window is re-queried next cycle.
-    if scoring_succeeded do
-      %{state | last_consolidated: DateTime.utc_now()}
-    else
-      Logger.info("[Kyber.Memory.Consolidator] not advancing last_consolidated (scoring failed)")
-      state
-    end
+    %{state | last_consolidated: DateTime.utc_now()}
   end
 
   # Apply buffered reinforcements atomically in the GenServer process.
@@ -329,117 +331,121 @@ defmodule Kyber.Memory.Consolidator do
     state
   end
 
-  # Query recent deltas, send to LLM for scoring, merge into pool.
-  # Returns {state, scoring_succeeded?} — on LLM failure scoring_succeeded = false.
-  defp score_and_merge_deltas(state) do
-    auth_config = load_auth_config()
-
-    case auth_config do
-      {:ok, auth} ->
-        since_seconds =
-          case state.last_consolidated do
-            nil -> System.system_time(:second) - 7_200
-            dt -> DateTime.to_unix(dt)
-          end
-
-        deltas = query_recent_deltas(state.core, since_seconds)
-
-        if deltas != [] do
-          case score_deltas(deltas, auth, state.config.salience_model) do
-            {:ok, scored} ->
-              merge_scored_memories(scored, state.table)
-              Logger.info("[Kyber.Memory.Consolidator] merged #{length(scored)} scored memories")
-              {state, true}
-
-            {:error, reason} ->
-              Logger.warning("[Kyber.Memory.Consolidator] scoring failed: #{inspect(reason)}")
-              # Do NOT advance last_consolidated — retry same window next cycle
-              {state, false}
-          end
-        else
-          # No deltas to score — that's fine, still advance the window
-          {state, true}
-        end
-
-      {:error, reason} ->
-        Logger.warning("[Kyber.Memory.Consolidator] no auth config for scoring: #{inspect(reason)}")
-        # No auth is not an LLM failure; advance the window
-        {state, true}
-    end
-  end
-
-  # Garbage collect memories below min_salience (unless pinned or high-reinforcement).
+  # Garbage collect:
+  # - Dead vault refs (note deleted from vault), unless Knowledge is not running
+  # - Low-salience memories below min threshold (not pinned, not heavily reinforced)
   defp gc_memories(state) do
     min_sal = state.config.min_salience
+    knowledge = state.knowledge
 
     :ets.tab2list(state.table)
     |> Enum.each(fn {id, mem} ->
       pinned = Map.get(mem, :pinned, false)
+      vault_ref = Map.get(mem, :vault_ref)
 
-      if not pinned and mem.salience < min_sal and mem.reinforcement_count <= 5 do
-        :ets.delete(state.table, id)
-        Logger.debug("[Kyber.Memory.Consolidator] GC'd memory #{id} (salience #{Float.round(mem.salience, 3)})")
+      cond do
+        # Dead vault ref: vault note was deleted (only when not pinned, Knowledge must be running)
+        vault_ref != nil and not pinned and not safe_vault_ref_exists?(knowledge, vault_ref) ->
+          :ets.delete(state.table, id)
+          Logger.debug("[Kyber.Memory.Consolidator] removed dead ref #{vault_ref}")
+
+        # Low-salience GC: unpinned, below threshold, low reinforcement count
+        not pinned and mem.salience < min_sal and mem.reinforcement_count <= 5 ->
+          :ets.delete(state.table, id)
+          Logger.debug("[Kyber.Memory.Consolidator] GC'd memory #{id} (salience #{Float.round(mem.salience, 3)})")
+
+        true ->
+          :ok
       end
     end)
 
     state
   end
 
-  # Query Kyber.Delta.Store for deltas since the given Unix timestamp.
-  defp query_recent_deltas(core, _since_seconds) do
+  # Check if a vault ref still exists in Knowledge.
+  # Returns true if Knowledge is not running (graceful: don't GC on outage).
+  defp safe_vault_ref_exists?(knowledge, vault_ref) do
     try do
-      store = GenServer.call(core, :get_store_name, 1_000)
-      all = Kyber.Delta.Store.query(store, [])
-
-      Enum.filter(all, fn delta ->
-        delta.kind not in ["cron.fired", "system.heartbeat"] and
-          byte_size(inspect(delta.payload)) > 20
-      end)
-      |> Enum.take_random(min(50, length(all)))
-    rescue
-      _ -> []
+      case GenServer.call(knowledge, {:get_tiered, vault_ref, :l0}, 2_000) do
+        {:ok, _} -> true
+        {:error, :not_found} -> false
+      end
     catch
-      :exit, _ -> []
+      :exit, _ ->
+        # Knowledge not running — assume ref is alive to avoid false GC
+        true
     end
   end
 
-  # Send deltas to LLM (Haiku) for salience scoring.
-  # Returns {:ok, [%{summary, salience, tags}]} or {:error, reason}.
-  defp score_deltas(deltas, auth_config, model) do
-    # Sanitize and cap each delta before building the prompt
-    delta_summaries =
-      deltas
-      |> Enum.map(fn delta ->
-        safe_payload = sanitize_delta(delta.payload)
-        summary = "kind=#{delta.kind} payload=#{inspect(safe_payload, limit: 10)}"
-        # Cap each delta's contribution to 500 chars
-        String.slice(summary, 0, 500)
-      end)
-      |> Enum.join("\n")
-      # Hard cap on total prompt input: ~8000 chars
-      |> String.slice(0, 8_000)
+  # ── Vault Change Scoring ───────────────────────────────────────────────────
 
+  # Event-driven: called when vault files change. Scores each changed note.
+  defp score_vault_notes(paths, state) do
+    auth_config = load_auth_config()
+
+    case auth_config do
+      {:ok, auth} ->
+        Enum.each(paths, fn path ->
+          score_and_merge_vault_note(path, auth, state)
+        end)
+        state
+
+      {:error, reason} ->
+        Logger.debug("[Kyber.Memory.Consolidator] no auth for vault note scoring: #{inspect(reason)}")
+        state
+    end
+  end
+
+  # Score a single vault note and merge the result into the pool.
+  defp score_and_merge_vault_note(vault_ref, auth, state) do
+    # Use L1 content (frontmatter + first paragraph) for richer scoring context
+    l1_content =
+      case safe_knowledge_get_tiered(state.knowledge, vault_ref, :l1) do
+        {:ok, %{frontmatter: fm, first_paragraph: para}} ->
+          title = Map.get(fm, "title", Path.basename(vault_ref, ".md"))
+          tags = Map.get(fm, "tags", [])
+          tag_line = if tags != [], do: "Tags: #{Enum.join(tags, ", ")}\n", else: ""
+          "Title: #{title}\n#{tag_line}#{para}"
+
+        _ ->
+          nil
+      end
+
+    if l1_content do
+      case score_vault_note(vault_ref, l1_content, auth, state.config.salience_model) do
+        {:ok, %{salience: salience, tags: tags}} ->
+          merge_vault_scored(vault_ref, salience, tags, state.table)
+
+        {:error, reason} ->
+          Logger.warning("[Kyber.Memory.Consolidator] failed to score #{vault_ref}: #{inspect(reason)}")
+      end
+    end
+  end
+
+  # Call Haiku to score a single vault note for long-term salience.
+  # Returns {:ok, %{salience: float, tags: [string]}} or {:error, reason}.
+  defp score_vault_note(vault_ref, l1_content, auth_config, model) do
     prompt = """
-    You are reviewing a list of events from an AI agent's delta log.
-    Score each item for long-term salience (how useful will this be to remember in the future?).
+    You are evaluating a vault note for long-term memory salience.
 
-    Return a JSON array of objects. Each object must have:
-    - "summary": one concise line (max 100 chars) describing what happened
-    - "salience": float 0.0 to 1.0 (0=ephemeral, 1=highly important to remember)
-    - "tags": list of 1-5 lowercase topic strings (e.g. ["architecture", "oauth", "tools"])
+    Score how useful this note will be to remember in the future.
 
-    Only include items worth remembering (salience >= 0.3). Skip noise.
-    Return ONLY the JSON array, no other text.
+    Return a JSON object with exactly these fields:
+    - "salience": float 0.0 to 1.0 (0=ephemeral/temporary, 1=highly important to remember)
+    - "tags": list of 1-5 lowercase topic strings (e.g. ["architecture", "auth", "elixir"])
 
-    Events:
-    #{delta_summaries}
+    Return ONLY the JSON object, no other text.
+
+    Note path: #{vault_ref}
+    Note content:
+    #{String.slice(l1_content, 0, 2_000)}
     """
 
     headers = build_auth_headers(auth_config)
 
     body = %{
       "model" => model,
-      "max_tokens" => 2048,
+      "max_tokens" => 256,
       "messages" => [%{"role" => "user", "content" => prompt}]
     }
 
@@ -448,16 +454,17 @@ defmodule Kyber.Memory.Consolidator do
         :oauth ->
           Map.put(body, "system", [
             %{"type" => "text", "text" => "You are Claude Code, Anthropic's official CLI for Claude."},
-            %{"type" => "text", "text" => "You are a memory scoring assistant. Return only valid JSON."}
+            %{"type" => "text", "text" => "You are a memory salience scorer. Return only valid JSON."}
           ])
+
         _ ->
-          Map.put(body, "system", "You are a memory scoring assistant. Return only valid JSON.")
+          Map.put(body, "system", "You are a memory salience scorer. Return only valid JSON.")
       end
 
     case Req.post(@anthropic_url, headers: headers, json: body, receive_timeout: 30_000) do
       {:ok, %{status: 200, body: response}} ->
         content = extract_response_text(response)
-        parse_scored_memories(content)
+        parse_vault_score(content)
 
       {:ok, %{status: status, body: err_body}} ->
         {:error, "LLM API #{status}: #{inspect(err_body)}"}
@@ -467,94 +474,72 @@ defmodule Kyber.Memory.Consolidator do
     end
   end
 
-  # Deep-walk a delta payload, stripping sensitive keys and capping string lengths.
-  defp sanitize_delta(payload) when is_map(payload) do
-    payload
-    |> Map.drop(@sensitive_keys)
-    |> Map.drop(Enum.map(@sensitive_keys, &String.to_atom/1))
-    |> Map.new(fn {k, v} ->
-      key_str = k |> to_string() |> String.downcase()
-      if Enum.any?(@sensitive_keys, &String.contains?(key_str, &1)) do
-        {k, "[REDACTED]"}
-      else
-        {k, sanitize_delta(v)}
-      end
-    end)
-  end
-
-  defp sanitize_delta(v) when is_binary(v) and byte_size(v) > 200 do
-    String.slice(v, 0, 200) <> "..."
-  end
-
-  defp sanitize_delta(v) when is_list(v) do
-    Enum.map(v, &sanitize_delta/1)
-  end
-
-  defp sanitize_delta(v), do: v
-
-  # Parse the LLM's JSON response into a list of memory maps.
-  defp parse_scored_memories(content) do
+  # Parse the LLM's JSON response into a salience score + tags.
+  defp parse_vault_score(content) do
     cleaned =
       content
       |> String.replace(~r/```(?:json)?\n?/, "")
       |> String.trim()
 
     case Jason.decode(cleaned) do
-      {:ok, list} when is_list(list) ->
-        memories =
-          list
-          |> Enum.filter(fn item ->
-            is_map(item) and
-              is_binary(item["summary"]) and
-              is_number(item["salience"]) and
-              is_list(item["tags"])
-          end)
-          |> Enum.map(fn item ->
-            %{
-              summary: item["summary"],
-              salience: clamp(item["salience"], 0.0, 1.0),
-              tags: item["tags"]
-            }
-          end)
-
-        {:ok, memories}
+      {:ok, %{"salience" => salience, "tags" => tags}}
+      when is_number(salience) and is_list(tags) ->
+        {:ok, %{salience: clamp(salience, 0.0, 1.0), tags: tags}}
 
       {:ok, _} ->
-        {:error, "LLM returned non-list JSON"}
+        {:error, "unexpected JSON structure"}
 
       {:error, reason} ->
         {:error, "JSON parse error: #{inspect(reason)}"}
     end
   end
 
-  # Add newly scored memories to the ETS pool.
-  defp merge_scored_memories(scored, table) do
+  # Merge a scored vault note into the ETS pool.
+  # - salience < 0.3 → remove existing entry if any (not salient enough)
+  # - existing entry → update tags
+  # - new salient note → create entry
+  defp merge_vault_scored(vault_ref, salience, tags, table) do
     now = System.system_time(:second)
+    existing = find_by_vault_ref(table, vault_ref)
 
-    Enum.each(scored, fn mem ->
-      id = generate_id()
-      entry = %{
-        id: id,
-        summary: mem.summary,
-        salience: mem.salience,
-        tags: mem.tags,
-        created_at: now,
-        last_reinforced: nil,
-        reinforcement_count: 0,
-        pinned: false
-      }
-      :ets.insert(table, {id, entry})
-    end)
+    cond do
+      salience < 0.3 ->
+        if existing, do: :ets.delete(table, existing.id)
+
+      existing ->
+        # Only update tags; salience changes via decay/reinforcement mechanics
+        updated = %{existing | tags: tags}
+        :ets.insert(table, {existing.id, updated})
+        Logger.debug("[Kyber.Memory.Consolidator] updated pool entry for #{vault_ref}")
+
+      true ->
+        id = generate_id()
+        entry = %{
+          id: id,
+          vault_ref: vault_ref,
+          salience: salience,
+          tags: tags,
+          created_at: now,
+          last_reinforced: nil,
+          reinforcement_count: 0,
+          pinned: false
+        }
+        :ets.insert(table, {id, entry})
+        Logger.info("[Kyber.Memory.Consolidator] added pool entry for #{vault_ref} (salience #{Float.round(salience, 2)})")
+    end
   end
 
-  # On first run with empty pool, just log. Agent decides what to pin.
-  defp seed_pinned_memories(_table) do
-    Logger.info("[Kyber.Memory.Consolidator] empty pool — agent will build memories organically")
+  # Find a pool entry by vault_ref (linear scan; pool is small).
+  defp find_by_vault_ref(table, vault_ref) do
+    :ets.tab2list(table)
+    |> Enum.find_value(fn {_id, mem} ->
+      if Map.get(mem, :vault_ref) == vault_ref, do: mem, else: nil
+    end)
   end
 
   # ── MEMORY.md Generation ──────────────────────────────────────────────────
 
-  defp write_memory_md(pool, path, config) do
+  defp write_memory_md(pool, path, config, knowledge) do
     now = System.system_time(:second)
 
     sorted_pool =
@@ -569,17 +554,17 @@ defmodule Kyber.Memory.Consolidator do
     {top_n, rest} = Enum.split(sorted_pool, config.max_persistent)
 
     persistent_mems = Enum.map(top_n, fn {_, mem} -> mem end)
-
     drifting_mems = sample_drifting(rest, config.max_drifting)
 
-    content = render_memory_md(persistent_mems, drifting_mems)
-    final_content = enforce_token_budget(content, drifting_mems, persistent_mems)
+    content = render_memory_md(persistent_mems, drifting_mems, knowledge)
+    final_content = enforce_token_budget(content, drifting_mems, persistent_mems, knowledge)
 
     case File.mkdir_p(Path.dirname(path)) do
       :ok ->
         case File.write(path, final_content) do
           :ok ->
             Logger.debug("[Kyber.Memory.Consolidator] MEMORY.md written (#{byte_size(final_content)} chars)")
+
           {:error, reason} ->
             Logger.error("[Kyber.Memory.Consolidator] failed to write MEMORY.md: #{inspect(reason)}")
         end
@@ -615,11 +600,11 @@ defmodule Kyber.Memory.Consolidator do
     |> Enum.take_random(n)
   end
 
-  defp render_memory_md(persistent, drifting) do
+  defp render_memory_md(persistent, drifting, knowledge) do
     header = """
     # MEMORY.md — Long-Term Memory
 
-    *This file is a view, not a source of truth. Regenerated each consolidation cycle by `Kyber.Memory.Consolidator`. The pool JSONL at `~/.kyber/memory_pool.jsonl` is the source of truth.*
+    *This file is a view, not a source of truth. Regenerated each consolidation cycle by `Kyber.Memory.Consolidator`. The pool JSONL at `~/.kyber/memory_pool.jsonl` is the source of truth. Content comes from the Knowledge vault.*
 
     ---
 
@@ -631,12 +616,13 @@ defmodule Kyber.Memory.Consolidator do
       if persistent == [] do
         "*No persistent memories yet.*\n"
       else
-        persistent
-        |> Enum.map_join("\n", fn mem ->
-          pin_flag = if Map.get(mem, :pinned, false), do: " 📌", else: ""
-          tags = if mem.tags != [], do: " [#{Enum.join(mem.tags, ", ")}]", else: ""
-          "- #{mem.summary}#{tags}#{pin_flag}"
-        end)
+        lines =
+          persistent
+          |> Enum.map(fn mem -> memory_line(mem, knowledge) end)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.join("\n")
+
+        if lines == "", do: "*No persistent memories yet.*\n", else: lines
       end
 
     drifting_header = "\n\n## Drifting (stochastic rotation)\n\n"
@@ -645,32 +631,65 @@ defmodule Kyber.Memory.Consolidator do
       if drifting == [] do
         "*[populated by Memory.Consolidator — next rotation pending]*\n"
       else
-        drifting
-        |> Enum.map_join("\n", fn mem ->
-          tags = if mem.tags != [], do: " [#{Enum.join(mem.tags, ", ")}]", else: ""
-          "- #{mem.summary}#{tags}"
-        end)
+        lines =
+          drifting
+          |> Enum.map(fn mem -> memory_line(mem, knowledge) end)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.join("\n")
+
+        if lines == "",
+          do: "*[populated by Memory.Consolidator — next rotation pending]*\n",
+          else: lines
       end
 
     header <> persistent_lines <> drifting_header <> drifting_lines
   end
 
-  defp enforce_token_budget(content, drifting, persistent) when byte_size(content) > @max_memory_chars do
+  # Render a single memory as a MEMORY.md line, fetching title from Knowledge L0.
+  # Returns nil if the vault ref is dead (note deleted).
+  defp memory_line(mem, knowledge) do
+    vault_ref = Map.get(mem, :vault_ref, "")
+
+    case safe_knowledge_get_tiered(knowledge, vault_ref, :l0) do
+      {:ok, %{title: title, tags: _fm_tags}} ->
+        pin_flag = if Map.get(mem, :pinned, false), do: " 📌", else: ""
+        # Prefer pool tags (may include LLM-scored terms beyond frontmatter)
+        display_tags = mem.tags || []
+        tag_str = if display_tags != [], do: " [#{Enum.join(display_tags, ", ")}]", else: ""
+        "- #{title}#{tag_str}#{pin_flag}"
+
+      _ ->
+        # Dead ref or Knowledge not running — skip this line
+        nil
+    end
+  end
+
+  # Call Knowledge GenServer safely (no crash if not running).
+  defp safe_knowledge_get_tiered(knowledge, vault_ref, tier) do
+    try do
+      GenServer.call(knowledge, {:get_tiered, vault_ref, tier}, 2_000)
+    catch
+      :exit, _ -> {:error, :not_running}
+    end
+  end
+
+  defp enforce_token_budget(content, drifting, persistent, knowledge)
+       when byte_size(content) > @max_memory_chars do
     trimmed_drifting =
       drifting
       |> Enum.sort_by(& &1.salience, :asc)
       |> Enum.drop(1)
 
-    new_content = render_memory_md(persistent, trimmed_drifting)
+    new_content = render_memory_md(persistent, trimmed_drifting, knowledge)
 
     if byte_size(new_content) > @max_memory_chars and trimmed_drifting != [] do
-      enforce_token_budget(new_content, trimmed_drifting, persistent)
+      enforce_token_budget(new_content, trimmed_drifting, persistent, knowledge)
     else
       new_content
     end
   end
 
-  defp enforce_token_budget(content, _drifting, _persistent), do: content
+  defp enforce_token_budget(content, _drifting, _persistent, _knowledge), do: content
 
   # ── Pool Persistence ──────────────────────────────────────────────────────
 
@@ -686,7 +705,9 @@ defmodule Kyber.Memory.Consolidator do
           {:ok, map} ->
             mem = map_to_memory(map)
             if mem, do: [mem], else: []
-          _ -> []
+
+          _ ->
+            []
         end
       end)
       |> Enum.to_list()
@@ -712,7 +733,9 @@ defmodule Kyber.Memory.Consolidator do
     content = if content == "", do: "", else: content <> "\n"
 
     case File.write(path, content) do
-      :ok -> :ok
+      :ok ->
+        :ok
+
       {:error, reason} ->
         Logger.warning("[Kyber.Memory.Consolidator] failed to save pool: #{inspect(reason)}")
     end
@@ -721,7 +744,7 @@ defmodule Kyber.Memory.Consolidator do
   defp memory_to_json(mem) do
     %{
       "id" => mem.id,
-      "summary" => mem.summary,
+      "vault_ref" => Map.get(mem, :vault_ref, ""),
       "salience" => mem.salience,
       "tags" => mem.tags || [],
       "created_at" => mem.created_at,
@@ -733,13 +756,13 @@ defmodule Kyber.Memory.Consolidator do
 
   defp map_to_memory(map) do
     with id when is_binary(id) <- Map.get(map, "id"),
-         summary when is_binary(summary) <- Map.get(map, "summary"),
+         vault_ref when is_binary(vault_ref) <- Map.get(map, "vault_ref"),
          salience when is_number(salience) <- Map.get(map, "salience"),
          tags when is_list(tags) <- Map.get(map, "tags", []),
          created_at when is_integer(created_at) <- Map.get(map, "created_at") do
       %{
         id: id,
-        summary: summary,
+        vault_ref: vault_ref,
         salience: clamp(salience, 0.0, 1.0),
         tags: tags,
         created_at: created_at,
