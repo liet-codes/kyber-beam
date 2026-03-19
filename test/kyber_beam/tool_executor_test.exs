@@ -253,7 +253,7 @@ defmodule Kyber.ToolExecutorTest do
         "path" => "../../../etc/passwd",
         "content" => "hax"
       })
-      assert String.contains?(msg, "escapes vault")
+      assert String.contains?(msg, "invalid vault path")
     end
   end
 

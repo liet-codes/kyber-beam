@@ -146,12 +146,14 @@ defmodule Kyber.Introspection do
 
   Works on any named GenServer. Returns the state as an inspected string
   (not all states are JSON-safe, so inspect is safer than Jason.encode).
+  Sensitive fields (auth_config, token, api_key, secret) are redacted.
   Truncated to 10KB.
   """
   def genserver_state(name) when is_atom(name) do
     try do
       state = :sys.get_state(name, 5_000)
-      full = inspect(state, limit: 50, pretty: true)
+      sanitized = redact_sensitive(state)
+      full = inspect(sanitized, limit: 50, pretty: true)
       {:ok, String.slice(full, 0, 10_240)}
     catch
       :exit, {:timeout, _} -> {:error, "timeout — process may be busy"}
@@ -159,6 +161,17 @@ defmodule Kyber.Introspection do
       :exit, reason -> {:error, "exit: #{inspect(reason)}"}
     end
   end
+
+  # Redact known sensitive fields from a map before inspect/serialization.
+  defp redact_sensitive(state) when is_map(state) do
+    sensitive_keys = [:auth_config, :token, :api_key, :secret]
+
+    Enum.reduce(sensitive_keys, state, fn key, acc ->
+      if Map.has_key?(acc, key), do: Map.put(acc, key, "[REDACTED]"), else: acc
+    end)
+  end
+
+  defp redact_sensitive(state), do: state
 
   @doc """
   Walk a supervisor's children. Returns name, pid-or-status, type, module.
@@ -230,13 +243,20 @@ defmodule Kyber.Introspection do
     try do
       info = :ets.info(table_name)
 
+      # Use first/next to sample 5 keys without loading the full table into memory.
       sample_keys =
-        :ets.tab2list(table_name)
-        |> Enum.take(5)
-        |> Enum.map(fn
-          {k, _v} -> inspect(k)
-          other -> inspect(other)
-        end)
+        case :ets.first(table_name) do
+          :"$end_of_table" ->
+            []
+
+          first_key ->
+            Stream.unfold(first_key, fn
+              :"$end_of_table" -> nil
+              key -> {key, :ets.next(table_name, key)}
+            end)
+            |> Enum.take(5)
+            |> Enum.map(&inspect/1)
+        end
 
       %{
         name: to_string(info[:name]),
@@ -393,29 +413,39 @@ defmodule Kyber.Introspection do
 
   @doc """
   Hot-reload a module. Logs a warning and returns result.
+
+  Only modules with the `Kyber.` prefix are permitted. System modules
+  (`:kernel`, `:stdlib`, etc.) and Elixir stdlib modules are rejected
+  to prevent VM instability.
   """
   def reload_module(module_name) when is_atom(module_name) do
-    Logger.warning("[Kyber.Introspection] Hot reloading module: #{module_name}")
+    mod_str = to_string(module_name)
 
-    case Code.ensure_loaded(module_name) do
-      {:module, _} ->
-        try do
-          case :code.purge(module_name) do
-            _ ->
-              case :code.load_file(module_name) do
-                {:module, ^module_name} ->
-                  {:ok, "#{module_name} reloaded successfully"}
+    if not String.starts_with?(mod_str, "Elixir.Kyber.") do
+      {:error, "module not in reload allowlist"}
+    else
+      Logger.warning("[Kyber.Introspection] Hot reloading module: #{module_name}")
 
-                {:error, reason} ->
-                  {:error, "load failed: #{inspect(reason)}"}
-              end
+      case Code.ensure_loaded(module_name) do
+        {:module, _} ->
+          try do
+            case :code.purge(module_name) do
+              _ ->
+                case :code.load_file(module_name) do
+                  {:module, ^module_name} ->
+                    {:ok, "#{module_name} reloaded successfully"}
+
+                  {:error, reason} ->
+                    {:error, "load failed: #{inspect(reason)}"}
+                end
+            end
+          rescue
+            e -> {:error, "reload failed: #{inspect(e)}"}
           end
-        rescue
-          e -> {:error, "reload failed: #{inspect(e)}"}
-        end
 
-      {:error, reason} ->
-        {:error, "module not found: #{inspect(reason)}"}
+        {:error, reason} ->
+          {:error, "module not found: #{inspect(reason)}"}
+      end
     end
   end
 

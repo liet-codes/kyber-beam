@@ -31,6 +31,10 @@ defmodule Kyber.ToolExecutor do
   @vault_path Path.expand("~/.kyber/vault")
   @web_fetch_max_bytes 50_000
 
+  # SSRF: blocked host literals (IPv6 loopback stored without brackets)
+  @blocked_hosts ["localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254",
+                  "metadata.google.internal", "::1"]
+
   @doc """
   Execute a tool by name with its input map.
 
@@ -197,13 +201,13 @@ defmodule Kyber.ToolExecutor do
   # ── memory_write ─────────────────────────────────────────────────────────
 
   def execute("memory_write", %{"path" => path, "content" => content}) do
-    # Normalize path (strip leading slash) and resolve symlinks/.. components
-    normalized = String.trim_leading(path, "/")
-    abs_path = Path.expand(Path.join(@vault_path, normalized))
-
-    unless String.starts_with?(abs_path, @vault_path) do
-      {:error, "path escapes vault directory: #{path}"}
+    # Reject paths with ".." components or absolute paths to prevent traversal
+    if String.contains?(path, "..") or String.starts_with?(path, "/") do
+      {:error, "invalid vault path: must be relative with no '..' components"}
     else
+      normalized = path
+      abs_path = Path.join(@vault_path, normalized)
+
       with :ok <- File.mkdir_p(Path.dirname(abs_path)),
            :ok <- File.write(abs_path, content) do
         # Trigger async vault reload by touching the file
@@ -219,55 +223,69 @@ defmodule Kyber.ToolExecutor do
   def execute("memory_list", input) do
     subdir = Map.get(input, "subdir")
 
-    search_root =
-      if subdir && subdir != "" do
-        Path.join(@vault_path, String.trim_leading(subdir, "/"))
-      else
-        @vault_path
-      end
-
-    if File.dir?(search_root) do
-      paths =
-        Path.wildcard(Path.join([search_root, "**", "*.md"]))
-        |> Enum.map(&Path.relative_to(&1, @vault_path))
-        |> Enum.sort()
-        |> Enum.join("\n")
-
-      count = length(String.split(paths, "\n", trim: true))
-      {:ok, "(#{count} notes)\n#{paths}"}
+    # Reject ".." in subdir to prevent path traversal
+    if subdir && String.contains?(subdir, "..") do
+      {:error, "invalid vault path: must be relative with no '..' components"}
     else
-      {:error, "Vault directory not found: #{search_root}"}
+      search_root =
+        if subdir && subdir != "" do
+          Path.join(@vault_path, String.trim_leading(subdir, "/"))
+        else
+          @vault_path
+        end
+
+      if File.dir?(search_root) do
+        paths =
+          Path.wildcard(Path.join([search_root, "**", "*.md"]))
+          |> Enum.map(&Path.relative_to(&1, @vault_path))
+          |> Enum.sort()
+          |> Enum.join("\n")
+
+        count = length(String.split(paths, "\n", trim: true))
+        {:ok, "(#{count} notes)\n#{paths}"}
+      else
+        {:error, "Vault directory not found: #{search_root}"}
+      end
     end
   end
 
   # ── web_fetch ─────────────────────────────────────────────────────────────
 
   def execute("web_fetch", %{"url" => url}) do
-    unless String.starts_with?(url, ["http://", "https://"]) do
-      {:error, "URL must start with http:// or https://"}
-    else
-      Logger.info("[Kyber.ToolExecutor] web_fetch: #{url}")
+    cond do
+      not String.starts_with?(url, ["http://", "https://"]) ->
+        {:error, "URL must start with http:// or https://"}
 
-      case Req.get(url, receive_timeout: 10_000, decode_body: false) do
-        {:ok, %{status: status, body: body}} when status in 200..299 ->
-          text = extract_text(body)
+      not ssrf_safe?(url) ->
+        {:error, "blocked: private/internal address"}
 
-          truncated =
-            if byte_size(text) > @web_fetch_max_bytes do
-              String.slice(text, 0, @web_fetch_max_bytes) <>
-                "\n[response truncated to 50KB]"
-            else
-              text
-            end
+      true ->
+        Logger.info("[Kyber.ToolExecutor] web_fetch: #{url}")
 
-          {:ok, "(HTTP #{status}) #{truncated}"}
+        case Req.get(url,
+               connect_options: [timeout: 5_000],
+               receive_timeout: 10_000,
+               decode_body: false
+             ) do
+          {:ok, %{status: status, body: body}} when status in 200..299 ->
+            text = extract_text(body)
 
-        {:ok, %{status: status}} ->
-          {:error, "HTTP #{status} fetching #{url}"}
+            truncated =
+              if byte_size(text) > @web_fetch_max_bytes do
+                String.slice(text, 0, @web_fetch_max_bytes) <>
+                  "\n[response truncated to 50KB]"
+              else
+                text
+              end
 
-        {:error, reason} ->
-          {:error, "web_fetch failed: #{inspect(reason)}"}
-      end
+            {:ok, "(HTTP #{status}) #{truncated}"}
+
+          {:ok, %{status: status}} ->
+            {:error, "HTTP #{status} fetching #{url}"}
+
+          {:error, reason} ->
+            {:error, "web_fetch failed: #{inspect(reason)}"}
+        end
     end
   rescue
     e -> {:error, "web_fetch error: #{inspect(e)}"}
@@ -415,6 +433,28 @@ defmodule Kyber.ToolExecutor do
   # Returns true if the expanded path is under one of the allowed write roots.
   defp path_allowed?(expanded) do
     Enum.any?(@allowed_write_roots, &String.starts_with?(expanded, &1))
+  end
+
+  # Returns true if the URL host is not a private/internal address (SSRF guard).
+  defp ssrf_safe?(url) do
+    case URI.parse(url) do
+      %URI{host: nil} ->
+        false
+
+      %URI{host: host} ->
+        # Strip IPv6 brackets if present (e.g. "[::1]" -> "::1")
+        host =
+          host
+          |> String.downcase()
+          |> String.trim_leading("[")
+          |> String.trim_trailing("]")
+
+        not (host in @blocked_hosts or
+               String.starts_with?(host, "10.") or
+               String.starts_with?(host, "192.168.") or
+               String.ends_with?(host, ".internal") or
+               Regex.match?(~r/^172\.(1[6-9]|2[0-9]|3[01])\./, host))
+    end
   end
 
   # Truncate command output to 100KB to prevent OOM and API rejections.
