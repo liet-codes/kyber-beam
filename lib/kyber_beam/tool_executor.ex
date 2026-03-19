@@ -7,12 +7,15 @@ defmodule Kyber.ToolExecutor do
   back to the LLM.
 
   Phase 4 tools: read_file, write_file, edit_file, exec, list_dir
+  Phase 5 tools: memory_read, memory_write, memory_list, web_fetch
 
   ## Security
 
   - write_file and edit_file are restricted to @allowed_write_roots.
+  - memory_write is restricted to the vault path.
   - exec commands are logged before execution (no denylist; personal machine).
   - exec output is truncated to 100KB to prevent OOM / API rejections.
+  - web_fetch responses are truncated to 50KB.
   """
 
   require Logger
@@ -24,6 +27,9 @@ defmodule Kyber.ToolExecutor do
     Path.expand("~/kyber-beam"),
     System.tmp_dir!()
   ]
+
+  @vault_path Path.expand("~/.kyber/vault")
+  @web_fetch_max_bytes 50_000
 
   @doc """
   Execute a tool by name with its input map.
@@ -164,6 +170,242 @@ defmodule Kyber.ToolExecutor do
     end
   end
 
+  # ── memory_read ──────────────────────────────────────────────────────────
+
+  def execute("memory_read", %{"path" => path} = input) do
+    tier_str = Map.get(input, "tier", "l2")
+
+    tier =
+      case tier_str do
+        "l0" -> :l0
+        "l1" -> :l1
+        _ -> :l2
+      end
+
+    case Kyber.Knowledge.get_tiered(Kyber.Knowledge, path, tier) do
+      {:ok, content} ->
+        formatted = format_tiered_content(content, tier)
+        {:ok, formatted}
+
+      {:error, :not_found} ->
+        {:error, "Note not found in vault: #{path}"}
+    end
+  rescue
+    e -> {:error, "memory_read failed: #{inspect(e)}"}
+  end
+
+  # ── memory_write ─────────────────────────────────────────────────────────
+
+  def execute("memory_write", %{"path" => path, "content" => content}) do
+    # Normalize path (strip leading slash)
+    normalized = String.trim_leading(path, "/")
+    abs_path = Path.join(@vault_path, normalized)
+
+    unless String.starts_with?(abs_path, @vault_path) do
+      {:error, "path escapes vault directory: #{path}"}
+    else
+      with :ok <- File.mkdir_p(Path.dirname(abs_path)),
+           :ok <- File.write(abs_path, content) do
+        # Trigger async vault reload by touching the file
+        {:ok, "Written #{byte_size(content)} bytes to vault/#{normalized}"}
+      else
+        {:error, reason} -> {:error, "memory_write failed: #{inspect(reason)}"}
+      end
+    end
+  end
+
+  # ── memory_list ──────────────────────────────────────────────────────────
+
+  def execute("memory_list", input) do
+    subdir = Map.get(input, "subdir")
+
+    search_root =
+      if subdir && subdir != "" do
+        Path.join(@vault_path, String.trim_leading(subdir, "/"))
+      else
+        @vault_path
+      end
+
+    if File.dir?(search_root) do
+      paths =
+        Path.wildcard(Path.join([search_root, "**", "*.md"]))
+        |> Enum.map(&Path.relative_to(&1, @vault_path))
+        |> Enum.sort()
+        |> Enum.join("\n")
+
+      count = length(String.split(paths, "\n", trim: true))
+      {:ok, "(#{count} notes)\n#{paths}"}
+    else
+      {:error, "Vault directory not found: #{search_root}"}
+    end
+  end
+
+  # ── web_fetch ─────────────────────────────────────────────────────────────
+
+  def execute("web_fetch", %{"url" => url}) do
+    unless String.starts_with?(url, ["http://", "https://"]) do
+      {:error, "URL must start with http:// or https://"}
+    else
+      Logger.info("[Kyber.ToolExecutor] web_fetch: #{url}")
+
+      case Req.get(url, receive_timeout: 10_000, decode_body: false) do
+        {:ok, %{status: status, body: body}} when status in 200..299 ->
+          text = extract_text(body)
+
+          truncated =
+            if byte_size(text) > @web_fetch_max_bytes do
+              String.slice(text, 0, @web_fetch_max_bytes) <>
+                "\n[response truncated to 50KB]"
+            else
+              text
+            end
+
+          {:ok, "(HTTP #{status}) #{truncated}"}
+
+        {:ok, %{status: status}} ->
+          {:error, "HTTP #{status} fetching #{url}"}
+
+        {:error, reason} ->
+          {:error, "web_fetch failed: #{inspect(reason)}"}
+      end
+    end
+  rescue
+    e -> {:error, "web_fetch error: #{inspect(e)}"}
+  end
+
+  # ── Phase 6: BEAM Introspection ───────────────────────────────────────────
+
+  def execute("beam_memory", _input) do
+    {:ok, Kyber.Introspection.memory_summary() |> format_map()}
+  end
+
+  def execute("beam_system", _input) do
+    {:ok, Kyber.Introspection.system_info() |> format_map()}
+  end
+
+  def execute("beam_processes", input) do
+    limit = Map.get(input, "limit", 20)
+    results = Kyber.Introspection.top_processes(limit)
+    {:ok, format_list(results)}
+  end
+
+  def execute("beam_inspect_process", %{"name" => name}) do
+    atom = String.to_existing_atom(name)
+
+    case Kyber.Introspection.inspect_process(atom) do
+      {:error, msg} -> {:error, msg}
+      info -> {:ok, format_map(info)}
+    end
+  rescue
+    ArgumentError -> {:error, "Unknown process name: #{name}"}
+  end
+
+  def execute("beam_genserver_state", %{"name" => name}) do
+    atom = String.to_existing_atom(name)
+
+    case Kyber.Introspection.genserver_state(atom) do
+      {:ok, state_str} -> {:ok, state_str}
+      {:error, msg} -> {:error, msg}
+    end
+  rescue
+    ArgumentError -> {:error, "Unknown module: #{name}"}
+  end
+
+  def execute("beam_supervision_tree", %{"supervisor" => sup} = input) do
+    depth = Map.get(input, "depth", 2)
+    atom = String.to_existing_atom(sup)
+
+    case Kyber.Introspection.supervision_tree(atom, depth) do
+      {:error, msg} -> {:error, msg}
+      tree -> {:ok, format_map(tree)}
+    end
+  rescue
+    ArgumentError -> {:error, "Unknown supervisor: #{sup}"}
+  end
+
+  def execute("beam_ets", _input) do
+    {:ok, Kyber.Introspection.ets_tables() |> format_list()}
+  end
+
+  def execute("beam_ets_inspect", %{"table" => table}) do
+    atom = String.to_existing_atom(table)
+
+    case Kyber.Introspection.ets_inspect(atom) do
+      {:error, msg} -> {:error, msg}
+      info -> {:ok, format_map(info)}
+    end
+  rescue
+    ArgumentError -> {:error, "Unknown table: #{table}"}
+  end
+
+  def execute("beam_deltas", _input) do
+    case Kyber.Introspection.delta_store_stats() do
+      {:error, msg} -> {:error, msg}
+      stats -> {:ok, format_map(stats)}
+    end
+  end
+
+  def execute("beam_queue_health", input) do
+    threshold = Map.get(input, "threshold", 5)
+    results = Kyber.Introspection.queue_health(threshold)
+
+    if results == [] do
+      {:ok, "All message queues healthy (all below threshold #{threshold})"}
+    else
+      {:ok,
+       "#{length(results)} processes with queues >= #{threshold}:\n#{format_list(results)}"}
+    end
+  end
+
+  def execute("beam_gc", %{"target" => "all"}) do
+    {:ok, Kyber.Introspection.gc_process(:all) |> format_map()}
+  end
+
+  def execute("beam_gc", %{"target" => name}) do
+    atom = String.to_existing_atom(name)
+
+    case Kyber.Introspection.gc_process(atom) do
+      {:error, msg} -> {:error, msg}
+      result -> {:ok, format_map(result)}
+    end
+  rescue
+    ArgumentError -> {:error, "Unknown process: #{name}"}
+  end
+
+  def execute("beam_reload_module", %{"module" => mod}) do
+    # Try with Elixir. prefix first (for Elixir modules), fall back to bare atom
+    atom =
+      try do
+        String.to_existing_atom("Elixir." <> mod)
+      rescue
+        ArgumentError ->
+          try do
+            String.to_existing_atom(mod)
+          rescue
+            ArgumentError -> nil
+          end
+      end
+
+    if atom do
+      case Kyber.Introspection.reload_module(atom) do
+        {:ok, msg} -> {:ok, msg}
+        {:error, msg} -> {:error, msg}
+      end
+    else
+      {:error, "Unknown module: #{mod}"}
+    end
+  end
+
+  def execute("beam_io_stats", _input) do
+    {:ok, Kyber.Introspection.io_stats() |> format_map()}
+  end
+
+  def execute("beam_ports", _input) do
+    {:ok, Kyber.Introspection.port_info() |> format_map()}
+  end
+
+  # ── Catch-all ─────────────────────────────────────────────────────────────
+
   def execute(name, _input) do
     {:error, "Unknown tool: #{name}"}
   end
@@ -185,4 +427,76 @@ defmodule Kyber.ToolExecutor do
       output
     end
   end
+
+  # Format tiered knowledge content as readable text.
+  defp format_tiered_content(%{path: path, frontmatter: fm, body: body}, :l2) do
+    fm_text =
+      if map_size(fm) > 0 do
+        pairs = Enum.map_join(fm, "\n", fn {k, v} -> "  #{k}: #{inspect(v)}" end)
+        "Frontmatter:\n#{pairs}\n\n"
+      else
+        ""
+      end
+
+    "# #{path}\n#{fm_text}#{body}"
+  end
+
+  defp format_tiered_content(%{frontmatter: fm, first_paragraph: para}, :l1) do
+    fm_text =
+      if map_size(fm) > 0 do
+        pairs = Enum.map_join(fm, "\n", fn {k, v} -> "  #{k}: #{inspect(v)}" end)
+        "Frontmatter:\n#{pairs}\n\n"
+      else
+        ""
+      end
+
+    "#{fm_text}#{para}"
+  end
+
+  defp format_tiered_content(%{title: title, type: type, tags: tags}, :l0) do
+    "Title: #{title}\nType: #{type}\nTags: #{Enum.join(tags, ", ")}"
+  end
+
+  defp format_tiered_content(other, _tier) do
+    inspect(other)
+  end
+
+  # Format a map as readable key: value lines for LLM tool results.
+  defp format_map(map) when is_map(map) do
+    map
+    |> Enum.map(fn {k, v} -> "#{k}: #{inspect(v)}" end)
+    |> Enum.join("\n")
+  end
+
+  defp format_map(other), do: inspect(other)
+
+  # Format a list of maps as numbered entries.
+  defp format_list(list) when is_list(list) do
+    list
+    |> Enum.with_index(1)
+    |> Enum.map(fn
+      {item, i} when is_map(item) -> "#{i}. #{format_map(item)}"
+      {item, i} -> "#{i}. #{inspect(item)}"
+    end)
+    |> Enum.join("\n\n")
+  end
+
+  defp format_list(other), do: inspect(other)
+
+  # Best-effort text extraction from an HTTP response body.
+  # Strips HTML tags if content looks like HTML; otherwise returns as-is.
+  defp extract_text(body) when is_binary(body) do
+    if String.contains?(body, "<html") or String.contains?(body, "<HTML") do
+      body
+      |> String.replace(~r/<script[^>]*>.*?<\/script>/si, " ")
+      |> String.replace(~r/<style[^>]*>.*?<\/style>/si, " ")
+      |> String.replace(~r/<[^>]+>/, " ")
+      |> String.replace(~r/\s{2,}/, " ")
+      |> String.trim()
+    else
+      body
+    end
+  end
+
+  defp extract_text(body), do: inspect(body)
 end
