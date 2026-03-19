@@ -146,42 +146,33 @@ defmodule Kyber.Tools do
       }
     },
     %{
-      "name" => "memory_pool_list",
-      "description" =>
-        "List all memories in the memory pool with their salience scores, tags, and pin status. Use this to understand what you remember and manage your memory.",
-      "input_schema" => %{
-        "type" => "object",
-        "properties" => %{}
-      }
-    },
-    %{
       "name" => "memory_pin",
       "description" =>
-        "Pin a memory so it never decays or gets garbage collected. Use for things you decide are permanently important. Requires the memory ID from memory_pool_list.",
+        "Pin a memory so it never decays or gets garbage collected. Describe what you want to pin — searches your memory pool by tags and summary. Use for things you decide are permanently important.",
       "input_schema" => %{
         "type" => "object",
         "properties" => %{
-          "memory_id" => %{
+          "query" => %{
             "type" => "string",
-            "description" => "The ID of the memory to pin"
+            "description" => "Description of the memory to pin (e.g. 'pure reducer', 'night owl boundary')"
           }
         },
-        "required" => ["memory_id"]
+        "required" => ["query"]
       }
     },
     %{
       "name" => "memory_unpin",
       "description" =>
-        "Unpin a memory, allowing it to decay naturally. Use when something is no longer permanently important.",
+        "Unpin a memory, allowing it to decay naturally. Describe which memory to unpin.",
       "input_schema" => %{
         "type" => "object",
         "properties" => %{
-          "memory_id" => %{
+          "query" => %{
             "type" => "string",
-            "description" => "The ID of the memory to unpin"
+            "description" => "Description of the memory to unpin"
           }
         },
-        "required" => ["memory_id"]
+        "required" => ["query"]
       }
     },
     %{

@@ -251,44 +251,80 @@ defmodule Kyber.ToolExecutor do
 
   # ── memory pool management ────────────────────────────────────────────────
 
-  def execute("memory_pool_list", _input) do
+  def execute("memory_pin", %{"query" => query}) do
     try do
-      memories = Kyber.Memory.Consolidator.list_memories()
+      case find_memory_by_query(query) do
+        {:ok, mem} ->
+          case Kyber.Memory.Consolidator.pin_memory(mem.id) do
+            :ok -> {:ok, "📌 Pinned: #{mem.summary}"}
+            {:error, :not_found} -> {:error, "Memory vanished during pin"}
+          end
 
-      formatted =
-        memories
-        |> Enum.sort_by(& &1.salience, :desc)
-        |> Enum.map(fn mem ->
-          pin = if Map.get(mem, :pinned, false), do: "📌 ", else: ""
-          tags = Enum.join(Map.get(mem, :tags, []), ", ")
-          reinforced = Map.get(mem, :reinforcement_count, 0)
+        {:error, :no_match} ->
+          {:error, "No memory matching '#{query}'. This searches your memory pool by tags and summary text."}
 
-          "#{pin}[#{mem.id}] salience=#{Float.round(mem.salience, 3)} reinforced=#{reinforced} tags=[#{tags}]\n  #{mem.summary}"
-        end)
-        |> Enum.join("\n\n")
-
-      {:ok, "(#{length(memories)} memories)\n\n#{formatted}"}
+        {:error, :ambiguous, matches} ->
+          summaries = Enum.map_join(matches, "\n- ", & &1.summary)
+          {:error, "Multiple matches — be more specific:\n- #{summaries}"}
+      end
     catch
       :exit, _ -> {:error, "Memory.Consolidator not running"}
     end
   end
 
-  def execute("memory_pin", %{"memory_id" => id}) do
-    case Kyber.Memory.Consolidator.pin_memory(id) do
-      :ok -> {:ok, "Pinned memory #{id}"}
-      {:error, :not_found} -> {:error, "Memory not found: #{id}"}
+  def execute("memory_unpin", %{"query" => query}) do
+    try do
+      case find_memory_by_query(query) do
+        {:ok, mem} ->
+          case Kyber.Memory.Consolidator.unpin_memory(mem.id) do
+            :ok -> {:ok, "Unpinned: #{mem.summary}"}
+            {:error, :not_found} -> {:error, "Memory vanished during unpin"}
+          end
+
+        {:error, :no_match} ->
+          {:error, "No memory matching '#{query}'."}
+
+        {:error, :ambiguous, matches} ->
+          summaries = Enum.map_join(matches, "\n- ", & &1.summary)
+          {:error, "Multiple matches — be more specific:\n- #{summaries}"}
+      end
+    catch
+      :exit, _ -> {:error, "Memory.Consolidator not running"}
     end
-  catch
-    :exit, _ -> {:error, "Memory.Consolidator not running"}
   end
 
-  def execute("memory_unpin", %{"memory_id" => id}) do
-    case Kyber.Memory.Consolidator.unpin_memory(id) do
-      :ok -> {:ok, "Unpinned memory #{id}"}
-      {:error, :not_found} -> {:error, "Memory not found: #{id}"}
+  defp find_memory_by_query(query) do
+    memories = Kyber.Memory.Consolidator.list_memories()
+    query_lower = String.downcase(query)
+    query_words = String.split(query_lower, ~r/\s+/, trim: true)
+
+    scored =
+      memories
+      |> Enum.map(fn mem ->
+        summary_lower = String.downcase(mem.summary)
+        tags = Enum.map(Map.get(mem, :tags, []), &String.downcase/1)
+
+        # Score: tag matches worth 2, summary word matches worth 1
+        tag_score = Enum.count(query_words, fn w -> Enum.any?(tags, &String.contains?(&1, w)) end) * 2
+        summary_score = Enum.count(query_words, fn w -> String.contains?(summary_lower, w) end)
+        total = tag_score + summary_score
+
+        {mem, total}
+      end)
+      |> Enum.filter(fn {_mem, score} -> score > 0 end)
+      |> Enum.sort_by(fn {_mem, score} -> score end, :desc)
+
+    case scored do
+      [] -> {:error, :no_match}
+      [{best, best_score} | rest] ->
+        # If the top match is clearly better (2x score), use it
+        if rest == [] or best_score > elem(hd(rest), 1) * 1.5 do
+          {:ok, best}
+        else
+          top_matches = Enum.take([{best, best_score} | rest], 3) |> Enum.map(&elem(&1, 0))
+          {:error, :ambiguous, top_matches}
+        end
     end
-  catch
-    :exit, _ -> {:error, "Memory.Consolidator not running"}
   end
 
   # ── web_fetch ─────────────────────────────────────────────────────────────
