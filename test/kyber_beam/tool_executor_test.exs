@@ -122,8 +122,11 @@ defmodule Kyber.ToolExecutorTest do
     end
 
     test "returns error for missing file" do
+      # Use a path in an allowed directory that doesn't actually exist
+      path = tmp_path("edit_nonexistent_#{System.unique_integer([:positive])}")
+
       assert {:error, msg} = ToolExecutor.execute("edit_file", %{
-        "path" => "/nonexistent/file.txt",
+        "path" => path,
         "old_string" => "x",
         "new_string" => "y"
       })
@@ -141,6 +144,19 @@ defmodule Kyber.ToolExecutorTest do
         "new_string" => "bbb"
       })
       assert File.read!(path) == "bbb aaa aaa"
+    end
+
+    test "returns error when old_string is empty" do
+      path = tmp_path("edit_empty")
+      File.write!(path, "some content")
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:error, msg} = ToolExecutor.execute("edit_file", %{
+        "path" => path,
+        "old_string" => "",
+        "new_string" => "injected"
+      })
+      assert String.contains?(msg, "old_string cannot be empty")
     end
   end
 

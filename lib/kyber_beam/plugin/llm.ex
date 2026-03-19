@@ -304,10 +304,12 @@ defmodule Kyber.Plugin.LLM do
     # Derive chat_id from origin for session keying
     chat_id = chat_id_from_origin(origin)
 
-    # Get conversation history from session — preserving proper roles
+    # Get conversation history from session — preserving proper roles.
+    # Cap to the last 20 messages to prevent unbounded history growth and API failures.
     history =
       if chat_id && process_alive?(session) do
         Kyber.Session.get_history(session, chat_id)
+        |> Enum.take(-20)
         |> Enum.map(fn delta ->
           role = Map.get(delta.payload, "role", "user")
           content = Map.get(delta.payload, "content", "")
