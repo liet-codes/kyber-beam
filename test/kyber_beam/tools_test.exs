@@ -29,6 +29,30 @@ defmodule Kyber.ToolsTest do
       assert "list_dir" in names
     end
 
+    test "includes all Phase 5 tools" do
+      names = Tools.names()
+      assert "memory_read" in names
+      assert "memory_write" in names
+      assert "memory_list" in names
+      assert "web_fetch" in names
+    end
+
+    test "memory_read has required path property" do
+      tool = Enum.find(Tools.definitions(), &(&1["name"] == "memory_read"))
+      assert "path" in tool["input_schema"]["required"]
+    end
+
+    test "memory_write requires path and content" do
+      tool = Enum.find(Tools.definitions(), &(&1["name"] == "memory_write"))
+      assert "path" in tool["input_schema"]["required"]
+      assert "content" in tool["input_schema"]["required"]
+    end
+
+    test "web_fetch requires url" do
+      tool = Enum.find(Tools.definitions(), &(&1["name"] == "web_fetch"))
+      assert "url" in tool["input_schema"]["required"]
+    end
+
     test "read_file has required path property" do
       read_file = Enum.find(Tools.definitions(), &(&1["name"] == "read_file"))
       assert "path" in read_file["input_schema"]["required"]

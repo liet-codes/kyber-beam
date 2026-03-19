@@ -342,8 +342,8 @@ defmodule Kyber.Plugin.LLM do
         history ++ [%{"role" => "user", "content" => text}]
       end
 
-    # Load system prompt: explicit payload > SOUL.md from vault
-    system_prompt = payload["system"] || load_soul()
+    # Load system prompt: explicit payload > vault knowledge context
+    system_prompt = payload["system"] || build_system_prompt(chat_id)
 
     case auth_config do
       nil ->
@@ -512,7 +512,49 @@ defmodule Kyber.Plugin.LLM do
 
   defp extract_content(_), do: ""
 
-  defp load_soul do
+  # Build the system prompt by combining SOUL.md with vault context.
+  # Loads:
+  #   1. SOUL.md identity (from vault or file fallback)
+  #   2. Today's memory note (if present in vault)
+  #
+  # Falls back gracefully if Kyber.Knowledge is not running.
+  defp build_system_prompt(_chat_id) do
+    # Step 1: Load SOUL.md — prefer vault, fall back to file
+    soul_content =
+      case safe_knowledge_call({:get_tiered, "identity/SOUL.md", :l2}) do
+        {:ok, %{body: body}} when is_binary(body) and body != "" -> body
+        _ -> load_soul_from_file()
+      end
+
+    # Step 2: Today's memory note
+    today = Date.to_string(Date.utc_today())
+
+    memory_context =
+      case safe_knowledge_call({:get_tiered, "memory/#{today}.md", :l2}) do
+        {:ok, %{body: body}} when is_binary(body) and body != "" ->
+          "\n\n## Today's Notes\n#{body}"
+
+        _ ->
+          ""
+      end
+
+    (soul_content || "") <> memory_context
+  end
+
+  # Call Kyber.Knowledge safely — returns nil if not running.
+  defp safe_knowledge_call(request) do
+    if Process.whereis(Kyber.Knowledge) do
+      try do
+        GenServer.call(Kyber.Knowledge, request, 2_000)
+      catch
+        :exit, _ -> nil
+      end
+    else
+      nil
+    end
+  end
+
+  defp load_soul_from_file do
     # Try vault path first, then fallback to priv/vault
     paths = [
       Path.expand("~/.kyber/vault/identity/SOUL.md"),

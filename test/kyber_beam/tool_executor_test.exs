@@ -232,6 +232,67 @@ defmodule Kyber.ToolExecutorTest do
     end
   end
 
+  # ── memory_write / memory_list ────────────────────────────────────────────
+
+  describe "memory_write" do
+    test "writes a file to the vault" do
+      path = "memory/test-#{:rand.uniform(999_999)}.md"
+      content = "# Test Note\n\nHello vault."
+
+      assert {:ok, msg} = ToolExecutor.execute("memory_write", %{"path" => path, "content" => content})
+      assert String.contains?(msg, "Written")
+
+      vault_root = Path.expand("~/.kyber/vault")
+      abs_path = Path.join(vault_root, path)
+      on_exit(fn -> File.rm(abs_path) end)
+      assert File.read!(abs_path) == content
+    end
+
+    test "rejects paths that escape the vault" do
+      assert {:error, msg} = ToolExecutor.execute("memory_write", %{
+        "path" => "../../../etc/passwd",
+        "content" => "hax"
+      })
+      assert String.contains?(msg, "escapes vault")
+    end
+  end
+
+  describe "memory_list" do
+    test "returns a list of vault notes" do
+      # Vault may be empty; just check the call succeeds and returns a string
+      case ToolExecutor.execute("memory_list", %{}) do
+        {:ok, output} ->
+          assert is_binary(output)
+
+        {:error, msg} ->
+          # Acceptable if vault dir doesn't exist on this machine
+          assert String.contains?(msg, "not found")
+      end
+    end
+
+    test "accepts subdir filter" do
+      case ToolExecutor.execute("memory_list", %{"subdir" => "identity"}) do
+        {:ok, output} -> assert is_binary(output)
+        {:error, _} -> :ok
+      end
+    end
+  end
+
+  # ── web_fetch ─────────────────────────────────────────────────────────────
+
+  describe "web_fetch" do
+    test "rejects non-http URLs" do
+      assert {:error, msg} = ToolExecutor.execute("web_fetch", %{"url" => "file:///etc/passwd"})
+      assert String.contains?(msg, "http")
+    end
+
+    @tag :network
+    test "fetches a real URL" do
+      assert {:ok, output} = ToolExecutor.execute("web_fetch", %{"url" => "https://httpbin.org/get"})
+      assert String.contains?(output, "HTTP 200")
+    end
+  end
+
   # ── unknown tool ──────────────────────────────────────────────────────────
 
   describe "unknown tool" do

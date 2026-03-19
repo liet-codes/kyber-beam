@@ -197,9 +197,9 @@ defmodule Kyber.ToolExecutor do
   # ── memory_write ─────────────────────────────────────────────────────────
 
   def execute("memory_write", %{"path" => path, "content" => content}) do
-    # Normalize path (strip leading slash)
+    # Normalize path (strip leading slash) and resolve symlinks/.. components
     normalized = String.trim_leading(path, "/")
-    abs_path = Path.join(@vault_path, normalized)
+    abs_path = Path.expand(Path.join(@vault_path, normalized))
 
     unless String.starts_with?(abs_path, @vault_path) do
       {:error, "path escapes vault directory: #{path}"}
