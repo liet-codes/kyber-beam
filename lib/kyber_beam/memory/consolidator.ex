@@ -161,7 +161,7 @@ defmodule Kyber.Memory.Consolidator do
     table =
       case :ets.whereis(table_name) do
         :undefined ->
-          :ets.new(table_name, [:named_table, :set, :public, read_concurrency: true])
+          :ets.new(table_name, [:named_table, :set, :protected, read_concurrency: true])
 
         existing ->
           :ets.delete_all_objects(existing)
@@ -171,10 +171,15 @@ defmodule Kyber.Memory.Consolidator do
     # Populate ETS from loaded pool
     Enum.each(pool, fn mem -> :ets.insert(table, {mem.id, mem}) end)
 
-    # Subscribe to vault changes (graceful if Knowledge not yet running)
-    if Process.whereis(knowledge) do
-      Kyber.Knowledge.subscribe(knowledge)
-    end
+    # Subscribe to vault changes and monitor Knowledge (graceful if not yet running)
+    knowledge_monitored =
+      if pid = Process.whereis(knowledge) do
+        Process.monitor(pid)
+        Kyber.Knowledge.subscribe(knowledge)
+        true
+      else
+        false
+      end
 
     state = %{
       config: config,
@@ -184,7 +189,10 @@ defmodule Kyber.Memory.Consolidator do
       knowledge: knowledge,
       table: table,
       last_consolidated: nil,
-      pending_reinforcements: []
+      pending_reinforcements: [],
+      knowledge_monitored: knowledge_monitored,
+      scoring_in_progress: false,
+      pending_paths: []
     }
 
     schedule_consolidation(config.consolidation_interval_ms)
@@ -244,10 +252,82 @@ defmodule Kyber.Memory.Consolidator do
   end
 
   @impl true
+  # Scoring already in progress — buffer paths for the next batch (debounce)
+  def handle_info({:vault_changed, paths}, %{scoring_in_progress: true} = state) do
+    pending = Enum.uniq(state.pending_paths ++ paths)
+    {:noreply, %{state | pending_paths: pending}}
+  end
+
+  # Start async scoring Task; GenServer remains responsive during HTTP calls
   def handle_info({:vault_changed, paths}, state) do
-    # Event-driven scoring: only score notes that actually changed
-    new_state = score_vault_notes(paths, state)
-    {:noreply, new_state}
+    server = self()
+    knowledge = state.knowledge
+    model = state.config.salience_model
+
+    case load_auth_config() do
+      {:ok, auth} ->
+        Task.start(fn ->
+          results = score_paths_for_task(paths, auth, knowledge, model)
+          send(server, {:scoring_complete, results})
+        end)
+
+        {:noreply, %{state | scoring_in_progress: true, pending_paths: []}}
+
+      {:error, reason} ->
+        Logger.debug("[Kyber.Memory.Consolidator] no auth for vault note scoring: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
+
+  # Task finished — merge results into ETS (GenServer owns all writes)
+  def handle_info({:scoring_complete, results}, state) do
+    Enum.each(results, fn {vault_ref, salience, tags} ->
+      merge_vault_scored(vault_ref, salience, tags, state.table)
+    end)
+
+    # If paths accumulated while scoring was in progress, start the next batch
+    if state.pending_paths != [] do
+      server = self()
+      pending = state.pending_paths
+      knowledge = state.knowledge
+      model = state.config.salience_model
+
+      case load_auth_config() do
+        {:ok, auth} ->
+          Task.start(fn ->
+            results = score_paths_for_task(pending, auth, knowledge, model)
+            send(server, {:scoring_complete, results})
+          end)
+
+          {:noreply, %{state | scoring_in_progress: true, pending_paths: []}}
+
+        {:error, _} ->
+          {:noreply, %{state | scoring_in_progress: false, pending_paths: []}}
+      end
+    else
+      {:noreply, %{state | scoring_in_progress: false}}
+    end
+  end
+
+  # Knowledge process went down — clear monitor flag and schedule resubscribe
+  def handle_info({:DOWN, _ref, :process, _pid, _reason}, state) do
+    Logger.info("[Kyber.Memory.Consolidator] Knowledge went down — will resubscribe on restart")
+    Process.send_after(self(), :resubscribe_knowledge, 5_000)
+    {:noreply, %{state | knowledge_monitored: false}}
+  end
+
+  # Retry subscribing to Knowledge (handles late-start and restart scenarios)
+  def handle_info(:resubscribe_knowledge, state) do
+    if pid = Process.whereis(state.knowledge) do
+      Process.monitor(pid)
+      Kyber.Knowledge.subscribe(state.knowledge)
+      Logger.info("[Kyber.Memory.Consolidator] re-subscribed to Knowledge after restart")
+      {:noreply, %{state | knowledge_monitored: true}}
+    else
+      # Still not running — retry in 5 seconds
+      Process.send_after(self(), :resubscribe_knowledge, 5_000)
+      {:noreply, state}
+    end
   end
 
   def handle_info(:consolidate, state) do
@@ -262,6 +342,21 @@ defmodule Kyber.Memory.Consolidator do
 
   defp run_consolidation(state) do
     Logger.info("[Kyber.Memory.Consolidator] starting consolidation cycle")
+
+    # Opportunistically resubscribe to Knowledge if not currently monitoring
+    state =
+      if not state.knowledge_monitored do
+        if pid = Process.whereis(state.knowledge) do
+          Process.monitor(pid)
+          Kyber.Knowledge.subscribe(state.knowledge)
+          Logger.info("[Kyber.Memory.Consolidator] subscribed to Knowledge during consolidation cycle")
+          %{state | knowledge_monitored: true}
+        else
+          state
+        end
+      else
+        state
+      end
 
     # 0. Apply buffered reinforcements FIRST (single-process, no race)
     state = apply_pending_reinforcements(state)
@@ -379,28 +474,24 @@ defmodule Kyber.Memory.Consolidator do
 
   # ── Vault Change Scoring ───────────────────────────────────────────────────
 
-  # Event-driven: called when vault files change. Scores each changed note.
-  defp score_vault_notes(paths, state) do
-    auth_config = load_auth_config()
-
-    case auth_config do
-      {:ok, auth} ->
-        Enum.each(paths, fn path ->
-          score_and_merge_vault_note(path, auth, state)
-        end)
-        state
-
-      {:error, reason} ->
-        Logger.debug("[Kyber.Memory.Consolidator] no auth for vault note scoring: #{inspect(reason)}")
-        state
-    end
+  # Called from a background Task — scores all paths and returns a list of
+  # {vault_ref, salience, tags} tuples. No ETS writes happen here.
+  defp score_paths_for_task(paths, auth, knowledge, model) do
+    paths
+    |> Enum.uniq()
+    |> Enum.flat_map(fn path ->
+      case score_path_to_result(path, auth, knowledge, model) do
+        {:ok, vault_ref, salience, tags} -> [{vault_ref, salience, tags}]
+        _ -> []
+      end
+    end)
   end
 
-  # Score a single vault note and merge the result into the pool.
-  defp score_and_merge_vault_note(vault_ref, auth, state) do
-    # Use L1 content (frontmatter + first paragraph) for richer scoring context
+  # Score a single vault note; returns {:ok, vault_ref, salience, tags} or :error.
+  # Safe to call from a Task — only reads from Knowledge, no ETS writes.
+  defp score_path_to_result(vault_ref, auth, knowledge, model) do
     l1_content =
-      case safe_knowledge_get_tiered(state.knowledge, vault_ref, :l1) do
+      case safe_knowledge_get_tiered(knowledge, vault_ref, :l1) do
         {:ok, %{frontmatter: fm, first_paragraph: para}} ->
           title = Map.get(fm, "title", Path.basename(vault_ref, ".md"))
           tags = Map.get(fm, "tags", [])
@@ -412,13 +503,16 @@ defmodule Kyber.Memory.Consolidator do
       end
 
     if l1_content do
-      case score_vault_note(vault_ref, l1_content, auth, state.config.salience_model) do
+      case score_vault_note(vault_ref, l1_content, auth, model) do
         {:ok, %{salience: salience, tags: tags}} ->
-          merge_vault_scored(vault_ref, salience, tags, state.table)
+          {:ok, vault_ref, salience, tags}
 
         {:error, reason} ->
           Logger.warning("[Kyber.Memory.Consolidator] failed to score #{vault_ref}: #{inspect(reason)}")
+          :error
       end
+    else
+      :error
     end
   end
 
@@ -540,37 +634,41 @@ defmodule Kyber.Memory.Consolidator do
   # ── MEMORY.md Generation ──────────────────────────────────────────────────
 
   defp write_memory_md(pool, path, config, knowledge) do
-    now = System.system_time(:second)
+    if Process.whereis(knowledge) do
+      now = System.system_time(:second)
 
-    sorted_pool =
-      pool
-      |> Enum.map(fn mem ->
-        recency_weight = compute_recency_weight(mem.created_at, now)
-        score = mem.salience * recency_weight
-        {score, mem}
-      end)
-      |> Enum.sort_by(fn {score, _} -> score end, :desc)
+      sorted_pool =
+        pool
+        |> Enum.map(fn mem ->
+          recency_weight = compute_recency_weight(mem.created_at, now)
+          score = mem.salience * recency_weight
+          {score, mem}
+        end)
+        |> Enum.sort_by(fn {score, _} -> score end, :desc)
 
-    {top_n, rest} = Enum.split(sorted_pool, config.max_persistent)
+      {top_n, rest} = Enum.split(sorted_pool, config.max_persistent)
 
-    persistent_mems = Enum.map(top_n, fn {_, mem} -> mem end)
-    drifting_mems = sample_drifting(rest, config.max_drifting)
+      persistent_mems = Enum.map(top_n, fn {_, mem} -> mem end)
+      drifting_mems = sample_drifting(rest, config.max_drifting)
 
-    content = render_memory_md(persistent_mems, drifting_mems, knowledge)
-    final_content = enforce_token_budget(content, drifting_mems, persistent_mems, knowledge)
+      content = render_memory_md(persistent_mems, drifting_mems, knowledge)
+      final_content = enforce_token_budget(content, drifting_mems, persistent_mems, knowledge)
 
-    case File.mkdir_p(Path.dirname(path)) do
-      :ok ->
-        case File.write(path, final_content) do
-          :ok ->
-            Logger.debug("[Kyber.Memory.Consolidator] MEMORY.md written (#{byte_size(final_content)} chars)")
+      case File.mkdir_p(Path.dirname(path)) do
+        :ok ->
+          case File.write(path, final_content) do
+            :ok ->
+              Logger.debug("[Kyber.Memory.Consolidator] MEMORY.md written (#{byte_size(final_content)} chars)")
 
-          {:error, reason} ->
-            Logger.error("[Kyber.Memory.Consolidator] failed to write MEMORY.md: #{inspect(reason)}")
-        end
+            {:error, reason} ->
+              Logger.error("[Kyber.Memory.Consolidator] failed to write MEMORY.md: #{inspect(reason)}")
+          end
 
-      {:error, reason} ->
-        Logger.error("[Kyber.Memory.Consolidator] failed to create vault dir: #{inspect(reason)}")
+        {:error, reason} ->
+          Logger.error("[Kyber.Memory.Consolidator] failed to create vault dir: #{inspect(reason)}")
+      end
+    else
+      Logger.warning("[Kyber.Memory.Consolidator] Knowledge not running — skipping MEMORY.md regeneration to preserve previous version")
     end
   end
 
@@ -771,7 +869,15 @@ defmodule Kyber.Memory.Consolidator do
         pinned: Map.get(map, "pinned", false)
       }
     else
-      _ -> nil
+      _ ->
+        if Map.has_key?(map, "summary") do
+          Logger.warning(
+            "[Kyber.Memory.Consolidator] dropping legacy pool entry #{Map.get(map, "id", "?")} — " <>
+              "has 'summary' but no 'vault_ref'. Run migration."
+          )
+        end
+
+        nil
     end
   end
 
