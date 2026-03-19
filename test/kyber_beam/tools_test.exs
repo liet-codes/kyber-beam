@@ -1,0 +1,61 @@
+defmodule Kyber.ToolsTest do
+  use ExUnit.Case, async: true
+
+  alias Kyber.Tools
+
+  describe "definitions/0" do
+    test "returns a list of tool maps" do
+      defs = Tools.definitions()
+      assert is_list(defs)
+      assert length(defs) > 0
+    end
+
+    test "each tool has required Anthropic format fields" do
+      for tool <- Tools.definitions() do
+        assert is_binary(tool["name"]), "tool name must be a string"
+        assert is_binary(tool["description"]), "tool description must be a string"
+        assert is_map(tool["input_schema"]), "tool input_schema must be a map"
+        assert tool["input_schema"]["type"] == "object"
+        assert is_map(tool["input_schema"]["properties"])
+      end
+    end
+
+    test "includes all Phase 4 tools" do
+      names = Tools.names()
+      assert "read_file" in names
+      assert "write_file" in names
+      assert "edit_file" in names
+      assert "exec" in names
+      assert "list_dir" in names
+    end
+
+    test "read_file has required path property" do
+      read_file = Enum.find(Tools.definitions(), &(&1["name"] == "read_file"))
+      assert "path" in read_file["input_schema"]["required"]
+      assert Map.has_key?(read_file["input_schema"]["properties"], "path")
+    end
+
+    test "write_file requires path and content" do
+      write_file = Enum.find(Tools.definitions(), &(&1["name"] == "write_file"))
+      assert "path" in write_file["input_schema"]["required"]
+      assert "content" in write_file["input_schema"]["required"]
+    end
+
+    test "exec requires command" do
+      exec_tool = Enum.find(Tools.definitions(), &(&1["name"] == "exec"))
+      assert "command" in exec_tool["input_schema"]["required"]
+    end
+  end
+
+  describe "names/0" do
+    test "returns list of strings" do
+      names = Tools.names()
+      assert is_list(names)
+      assert Enum.all?(names, &is_binary/1)
+    end
+
+    test "count matches definitions count" do
+      assert length(Tools.names()) == length(Tools.definitions())
+    end
+  end
+end

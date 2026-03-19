@@ -1,0 +1,228 @@
+defmodule Kyber.ToolExecutorTest do
+  use ExUnit.Case, async: true
+
+  alias Kyber.ToolExecutor
+
+  @tmp_dir System.tmp_dir!()
+
+  defp tmp_path(name) do
+    Path.join(@tmp_dir, "tool_executor_test_#{name}_#{:rand.uniform(999_999)}")
+  end
+
+  # ── read_file ──────────────────────────────────────────────────────────────
+
+  describe "read_file" do
+    test "reads an existing file" do
+      path = tmp_path("read")
+      File.write!(path, "hello\nworld\n")
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:ok, result} = ToolExecutor.execute("read_file", %{"path" => path})
+      assert String.contains?(result, "hello")
+      assert String.contains?(result, "world")
+    end
+
+    test "returns error for missing file" do
+      assert {:error, msg} = ToolExecutor.execute("read_file", %{"path" => "/nonexistent/file.txt"})
+      assert String.contains?(msg, "not found")
+    end
+
+    test "respects offset and limit" do
+      path = tmp_path("offset")
+      content = Enum.map_join(1..10, "\n", fn i -> "line #{i}" end)
+      File.write!(path, content)
+      on_exit(fn -> File.rm(path) end)
+
+      # offset=3, limit=2 should give lines 3 and 4
+      assert {:ok, result} = ToolExecutor.execute("read_file", %{"path" => path, "offset" => 3, "limit" => 2})
+      assert String.contains?(result, "line 3")
+      assert String.contains?(result, "line 4")
+      refute String.contains?(result, "line 1")
+      refute String.contains?(result, "line 5")
+    end
+
+    test "includes line count header" do
+      path = tmp_path("header")
+      File.write!(path, "a\nb\nc\n")
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:ok, result} = ToolExecutor.execute("read_file", %{"path" => path})
+      assert String.starts_with?(result, "(")
+      assert String.contains?(result, "lines total")
+    end
+  end
+
+  # ── write_file ─────────────────────────────────────────────────────────────
+
+  describe "write_file" do
+    test "creates a new file" do
+      path = tmp_path("write")
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:ok, msg} = ToolExecutor.execute("write_file", %{"path" => path, "content" => "new content"})
+      assert String.contains?(msg, "Written")
+      assert File.read!(path) == "new content"
+    end
+
+    test "overwrites an existing file" do
+      path = tmp_path("overwrite")
+      File.write!(path, "old content")
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:ok, _} = ToolExecutor.execute("write_file", %{"path" => path, "content" => "new content"})
+      assert File.read!(path) == "new content"
+    end
+
+    test "creates parent directories" do
+      nested_path = tmp_path("nested/deep/dir/file.txt")
+      on_exit(fn -> File.rm_rf(Path.dirname(nested_path) |> Path.dirname() |> Path.dirname()) end)
+
+      assert {:ok, _} = ToolExecutor.execute("write_file", %{"path" => nested_path, "content" => "nested"})
+      assert File.read!(nested_path) == "nested"
+    end
+
+    test "reports bytes written" do
+      path = tmp_path("bytes")
+      on_exit(fn -> File.rm(path) end)
+
+      content = "hello world"
+      assert {:ok, msg} = ToolExecutor.execute("write_file", %{"path" => path, "content" => content})
+      assert String.contains?(msg, "#{byte_size(content)} bytes")
+    end
+  end
+
+  # ── edit_file ──────────────────────────────────────────────────────────────
+
+  describe "edit_file" do
+    test "applies a successful edit" do
+      path = tmp_path("edit")
+      File.write!(path, "foo bar baz")
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:ok, msg} = ToolExecutor.execute("edit_file", %{
+        "path" => path,
+        "old_string" => "bar",
+        "new_string" => "QUX"
+      })
+      assert String.contains?(msg, "applied")
+      assert File.read!(path) == "foo QUX baz"
+    end
+
+    test "returns error when old_string not found" do
+      path = tmp_path("edit_miss")
+      File.write!(path, "foo bar baz")
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:error, msg} = ToolExecutor.execute("edit_file", %{
+        "path" => path,
+        "old_string" => "nothere",
+        "new_string" => "x"
+      })
+      assert String.contains?(msg, "not found")
+    end
+
+    test "returns error for missing file" do
+      assert {:error, msg} = ToolExecutor.execute("edit_file", %{
+        "path" => "/nonexistent/file.txt",
+        "old_string" => "x",
+        "new_string" => "y"
+      })
+      assert String.contains?(msg, "not found")
+    end
+
+    test "replaces only first occurrence" do
+      path = tmp_path("edit_first")
+      File.write!(path, "aaa aaa aaa")
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:ok, _} = ToolExecutor.execute("edit_file", %{
+        "path" => path,
+        "old_string" => "aaa",
+        "new_string" => "bbb"
+      })
+      assert File.read!(path) == "bbb aaa aaa"
+    end
+  end
+
+  # ── exec ──────────────────────────────────────────────────────────────────
+
+  describe "exec" do
+    test "runs a simple command and returns stdout" do
+      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "echo hello"})
+      assert String.contains?(output, "hello")
+    end
+
+    test "captures non-zero exit codes" do
+      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "exit 1"})
+      assert String.contains?(output, "[exit 1]")
+    end
+
+    test "runs in specified working directory" do
+      workdir = @tmp_dir
+      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "pwd", "workdir" => workdir})
+      assert String.contains?(output, Path.expand(workdir))
+    end
+
+    test "captures stderr via stderr_to_stdout" do
+      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "echo errout >&2"})
+      assert String.contains?(output, "errout")
+    end
+
+    test "returns error on timeout" do
+      # Very short timeout should cause timeout on a sleep
+      assert {:error, msg} = ToolExecutor.execute("exec", %{
+        "command" => "sleep 10",
+        "timeout_ms" => 100
+      })
+      assert String.contains?(msg, "timed out")
+    end
+  end
+
+  # ── list_dir ──────────────────────────────────────────────────────────────
+
+  describe "list_dir" do
+    test "lists files in a directory" do
+      dir = tmp_path("listdir")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "file_a.txt"), "a")
+      File.write!(Path.join(dir, "file_b.txt"), "b")
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      assert {:ok, output} = ToolExecutor.execute("list_dir", %{"path" => dir})
+      assert String.contains?(output, "file_a.txt")
+      assert String.contains?(output, "file_b.txt")
+    end
+
+    test "marks subdirectories with trailing slash" do
+      dir = tmp_path("listdir_dirs")
+      File.mkdir_p!(dir)
+      File.mkdir_p!(Path.join(dir, "subdir"))
+      File.write!(Path.join(dir, "file.txt"), "x")
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      assert {:ok, output} = ToolExecutor.execute("list_dir", %{"path" => dir})
+      assert String.contains?(output, "subdir/")
+      assert String.contains?(output, "file.txt")
+      refute String.contains?(output, "file.txt/")
+    end
+
+    test "returns error for missing directory" do
+      assert {:error, msg} = ToolExecutor.execute("list_dir", %{"path" => "/nonexistent/dir"})
+      assert String.contains?(msg, "not found")
+    end
+
+    test "expands ~ in path" do
+      assert {:ok, _output} = ToolExecutor.execute("list_dir", %{"path" => "~"})
+    end
+  end
+
+  # ── unknown tool ──────────────────────────────────────────────────────────
+
+  describe "unknown tool" do
+    test "returns error for unrecognized tool name" do
+      assert {:error, msg} = ToolExecutor.execute("no_such_tool", %{})
+      assert String.contains?(msg, "Unknown tool")
+      assert String.contains?(msg, "no_such_tool")
+    end
+  end
+end

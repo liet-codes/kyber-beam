@@ -13,10 +13,17 @@ defmodule Kyber.Plugin.LLM do
 
   ## Effect handler
   When a `:llm_call` effect fires, the handler:
-  1. Retrieves conversation history from `Kyber.Session`
-  2. Builds a messages list from the effect payload
-  3. POSTs to `https://api.anthropic.com/v1/messages`
-  4. Emits `"llm.response"` or `"llm.error"` delta back into Core
+  1. Stores the user message in `Kyber.Session` before the API call
+  2. Retrieves conversation history from `Kyber.Session`
+  3. Runs a multi-turn tool loop (up to 10 iterations)
+  4. Stores the assistant response in `Kyber.Session` after completion
+  5. Emits `"llm.response"` or `"llm.error"` delta back into Core
+
+  ## Tool loop
+  The tool loop calls the API with tool definitions. If the model responds
+  with `stop_reason == "tool_use"`, each tool call is executed via
+  `Kyber.ToolExecutor` and results are fed back as `tool_result` blocks.
+  Repeats until `stop_reason == "end_turn"` or max iterations (10).
   """
 
   use GenServer
@@ -81,7 +88,8 @@ defmodule Kyber.Plugin.LLM do
     [
       {"Authorization", "Bearer #{token}"},
       {"anthropic-version", "2023-06-01"},
-      {"anthropic-beta", "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"},
+      {"anthropic-beta",
+       "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"},
       {"user-agent", "claude-cli/2.1.62"},
       {"x-app", "cli"},
       {"content-type", "application/json"}
@@ -134,6 +142,16 @@ defmodule Kyber.Plugin.LLM do
       "messages" => params["messages"] || []
     }
 
+    # Include tools if provided
+    body =
+      case params["tools"] do
+        tools when is_list(tools) and length(tools) > 0 ->
+          Map.put(body, "tools", tools)
+
+        _ ->
+          body
+      end
+
     body =
       case {auth_config.type, params["system"]} do
         {:oauth, system} when is_binary(system) ->
@@ -155,13 +173,25 @@ defmodule Kyber.Plugin.LLM do
           body
       end
 
-    system_info = case body["system"] do
-      list when is_list(list) -> "yes (#{length(list)} blocks)"
-      str when is_binary(str) -> "yes (#{String.length(str)} chars)"
-      _ -> "no"
-    end
-    Logger.info("[Kyber.Plugin.LLM] calling API: model=#{body["model"]}, messages=#{length(body["messages"] || [])}, system=#{system_info}")
-    case Req.post(@anthropic_url, headers: headers, json: body, receive_timeout: 30_000) do
+    system_info =
+      case body["system"] do
+        list when is_list(list) -> "yes (#{length(list)} blocks)"
+        str when is_binary(str) -> "yes (#{String.length(str)} chars)"
+        _ -> "no"
+      end
+
+    tools_info =
+      case body["tools"] do
+        tools when is_list(tools) -> "#{length(tools)} tools"
+        _ -> "none"
+      end
+
+    Logger.info(
+      "[Kyber.Plugin.LLM] calling API: model=#{body["model"]}, " <>
+        "messages=#{length(body["messages"] || [])}, system=#{system_info}, tools=#{tools_info}"
+    )
+
+    case Req.post(@anthropic_url, headers: headers, json: body, receive_timeout: 60_000) do
       {:ok, %{status: 200, body: response}} ->
         {:ok, response}
 
@@ -201,7 +231,10 @@ defmodule Kyber.Plugin.LLM do
         {:ok, state}
 
       {:error, reason} ->
-        Logger.warning("[Kyber.Plugin.LLM] auth load failed: #{inspect(reason)} — plugin will run without auth")
+        Logger.warning(
+          "[Kyber.Plugin.LLM] auth load failed: #{inspect(reason)} — plugin will run without auth"
+        )
+
         send(self(), :register_handlers)
         {:ok, state}
     end
@@ -252,9 +285,14 @@ defmodule Kyber.Plugin.LLM do
       Kyber.Core.register_effect_handler(core, :llm_call, handler)
     catch
       :exit, reason ->
-        Logger.warning("[Kyber.Plugin.LLM] could not register handler (core not ready): #{inspect(reason)}")
+        Logger.warning(
+          "[Kyber.Plugin.LLM] could not register handler (core not ready): #{inspect(reason)}"
+        )
+
       kind, reason ->
-        Logger.error("[Kyber.Plugin.LLM] failed to register handler: #{kind} #{inspect(reason)}")
+        Logger.error(
+          "[Kyber.Plugin.LLM] failed to register handler: #{kind} #{inspect(reason)}"
+        )
     end
   end
 
@@ -263,87 +301,197 @@ defmodule Kyber.Plugin.LLM do
     origin = Map.get(effect, :origin)
     parent_id = Map.get(effect, :delta_id)
 
-    # Get conversation history from session
+    # Derive chat_id from origin for session keying
     chat_id = chat_id_from_origin(origin)
+
+    # Get conversation history from session — preserving proper roles
     history =
-      if chat_id && Process.whereis(session) do
+      if chat_id && process_alive?(session) do
         Kyber.Session.get_history(session, chat_id)
         |> Enum.map(fn delta ->
-          %{"role" => "user", "content" => Map.get(delta.payload, "text", "")}
+          role = Map.get(delta.payload, "role", "user")
+          content = Map.get(delta.payload, "content", "")
+          %{"role" => role, "content" => content}
         end)
       else
         []
       end
 
-    # Build messages
+    # Build current user message
+    text = payload["text"] || ""
+
+    # Store user message in session BEFORE API call
+    if chat_id && process_alive?(session) do
+      user_delta =
+        Kyber.Delta.new(
+          "session.user",
+          %{"role" => "user", "content" => text},
+          origin
+        )
+
+      Kyber.Session.add_message(session, chat_id, user_delta)
+    end
+
+    # Build messages list for the API call
     messages =
       if is_list(payload["messages"]) do
         payload["messages"]
       else
-        text = payload["text"] || ""
         history ++ [%{"role" => "user", "content" => text}]
       end
 
     # Load system prompt: explicit payload > SOUL.md from vault
     system_prompt = payload["system"] || load_soul()
 
-    params = %{
-      "model" => payload["model"] || @default_model,
-      "max_tokens" => payload["max_tokens"] || @default_max_tokens,
-      "messages" => messages,
-      "system" => system_prompt
-    }
-
     case auth_config do
       nil ->
         emit_error(core, "no auth config", 0, origin, parent_id)
 
       config ->
-        case call_api(config, params) do
+        case run_tool_loop(messages, system_prompt, config) do
           {:ok, response} ->
             content = extract_content(response)
 
-            # Derive channel from original origin for routing the response back
-            channel_id = case origin do
-              {:channel, "discord", cid, _} -> cid
-              _ -> nil
+            # Store assistant response in session AFTER successful API call
+            if chat_id && process_alive?(session) do
+              asst_delta =
+                Kyber.Delta.new(
+                  "session.assistant",
+                  %{"role" => "assistant", "content" => content},
+                  origin
+                )
+
+              Kyber.Session.add_message(session, chat_id, asst_delta)
             end
 
-            response_payload = %{
-              "content" => content,
-              "model" => response["model"],
-              "usage" => response["usage"],
-              "stop_reason" => response["stop_reason"]
-            }
-            |> then(fn p -> if channel_id, do: Map.put(p, "channel_id", channel_id), else: p end)
+            # Derive channel from original origin for routing the response back
+            channel_id =
+              case origin do
+                {:channel, "discord", cid, _} -> cid
+                _ -> nil
+              end
+
+            response_payload =
+              %{
+                "content" => content,
+                "model" => response["model"],
+                "usage" => response["usage"],
+                "stop_reason" => response["stop_reason"]
+              }
+              |> then(fn p ->
+                if channel_id, do: Map.put(p, "channel_id", channel_id), else: p
+              end)
 
             # Preserve the original origin so the reducer can route the response
-            delta = Kyber.Delta.new(
-              "llm.response",
-              response_payload,
-              origin || {:system, "llm"},
-              parent_id
-            )
+            delta =
+              Kyber.Delta.new(
+                "llm.response",
+                response_payload,
+                origin || {:system, "llm"},
+                parent_id
+              )
 
             try do
               Kyber.Core.emit(core, delta)
             rescue
-              e -> Logger.error("[Kyber.Plugin.LLM] failed to emit response: #{inspect(e)}")
+              e ->
+                Logger.error("[Kyber.Plugin.LLM] failed to emit response: #{inspect(e)}")
             end
 
           {:error, %{error: error_msg, status: status}} ->
             emit_error(core, error_msg, status, origin, parent_id)
+
+          {:error, reason} when is_binary(reason) ->
+            emit_error(core, reason, 0, origin, parent_id)
         end
     end
   end
 
+  # Multi-turn tool loop. Calls the API, executes any tool_use blocks,
+  # and repeats until stop_reason is end_turn (or max iterations reached).
+  defp run_tool_loop(messages, system_prompt, auth_config, remaining \\ 10)
+
+  defp run_tool_loop(_messages, _system_prompt, _auth_config, 0) do
+    {:error, "tool loop limit reached (max 10 iterations)"}
+  end
+
+  defp run_tool_loop(messages, system_prompt, auth_config, remaining) do
+    params = %{
+      "model" => @default_model,
+      "max_tokens" => @default_max_tokens,
+      "messages" => messages,
+      "system" => system_prompt,
+      "tools" => Kyber.Tools.definitions()
+    }
+
+    case call_api(auth_config, params) do
+      {:ok, %{"stop_reason" => "tool_use", "content" => content_blocks} = _response} ->
+        # Extract all tool_use blocks from the response
+        tool_uses = Enum.filter(content_blocks, &(&1["type"] == "tool_use"))
+
+        Logger.info(
+          "[Kyber.Plugin.LLM] tool_use: #{length(tool_uses)} call(s): " <>
+            Enum.map_join(tool_uses, ", ", & &1["name"])
+        )
+
+        # Build assistant turn with all content blocks (preserves tool_use blocks)
+        assistant_msg = %{"role" => "assistant", "content" => content_blocks}
+
+        # Execute each tool and build tool_result blocks
+        tool_results =
+          Enum.map(tool_uses, fn tu ->
+            tool_name = tu["name"]
+            tool_input = tu["input"] || %{}
+
+            Logger.debug("[Kyber.Plugin.LLM] executing tool: #{tool_name} #{inspect(tool_input)}")
+
+            case Kyber.ToolExecutor.execute(tool_name, tool_input) do
+              {:ok, output} ->
+                %{
+                  "type" => "tool_result",
+                  "tool_use_id" => tu["id"],
+                  "content" => output
+                }
+
+              {:error, err} ->
+                Logger.warning("[Kyber.Plugin.LLM] tool error (#{tool_name}): #{err}")
+
+                %{
+                  "type" => "tool_result",
+                  "tool_use_id" => tu["id"],
+                  "content" => "Error: #{err}",
+                  "is_error" => true
+                }
+            end
+          end)
+
+        user_result_msg = %{"role" => "user", "content" => tool_results}
+
+        # Continue loop with updated message history
+        run_tool_loop(
+          messages ++ [assistant_msg, user_result_msg],
+          system_prompt,
+          auth_config,
+          remaining - 1
+        )
+
+      {:ok, response} ->
+        # end_turn or any other stop_reason — we're done
+        {:ok, response}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
   defp emit_error(core, error_msg, status, origin, parent_id) do
-    delta = Kyber.Delta.new(
-      "llm.error",
-      %{"error" => error_msg, "status" => status},
-      origin || {:system, "llm"},
-      parent_id
-    )
+    delta =
+      Kyber.Delta.new(
+        "llm.error",
+        %{"error" => error_msg, "status" => status},
+        origin || {:system, "llm"},
+        parent_id
+      )
 
     try do
       Kyber.Core.emit(core, delta)
@@ -353,11 +501,13 @@ defmodule Kyber.Plugin.LLM do
   end
 
   defp extract_content(%{"content" => [%{"text" => text} | _]}), do: text
+
   defp extract_content(%{"content" => content}) when is_list(content) do
     content
     |> Enum.filter(&is_map/1)
     |> Enum.map_join("\n", &Map.get(&1, "text", ""))
   end
+
   defp extract_content(_), do: ""
 
   defp load_soul do
@@ -378,6 +528,11 @@ defmodule Kyber.Plugin.LLM do
   defp chat_id_from_origin({:channel, _ch, chat_id, _sender}), do: chat_id
   defp chat_id_from_origin({:human, user_id}), do: user_id
   defp chat_id_from_origin(_), do: nil
+
+  # Safe process existence check — works with both atoms and pids
+  defp process_alive?(name) when is_atom(name), do: Process.whereis(name) != nil
+  defp process_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
+  defp process_alive?(_), do: false
 
   defp build_history_messages(history) when is_list(history) do
     Enum.map(history, fn
@@ -401,10 +556,14 @@ defmodule Kyber.Plugin.LLM do
     # Search recursively for any key that looks like a token
     Enum.find_value(data, fn {_k, v} ->
       case v do
-        %{} -> extract_token(v)
+        %{} ->
+          extract_token(v)
+
         str when is_binary(str) and byte_size(str) > 20 ->
           if String.starts_with?(str, "sk-ant-"), do: str, else: nil
-        _ -> nil
+
+        _ ->
+          nil
       end
     end)
   end
