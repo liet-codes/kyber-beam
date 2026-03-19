@@ -17,10 +17,11 @@ defmodule Kyber.Memory.ConsolidatorTest do
         id: :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower),
         summary: "Test memory: something happened",
         salience: 0.7,
-        tags: ["test", "memory", "architecture"],
+        tags: ["recall", "memory", "architecture"],
         created_at: now - 3_600,
         last_reinforced: nil,
-        reinforcement_count: 0
+        reinforcement_count: 0,
+        pinned: false
       },
       overrides
     )
@@ -63,7 +64,8 @@ defmodule Kyber.Memory.ConsolidatorTest do
         tags: ["oauth", "auth", "important"],
         created_at: now - 7200,
         last_reinforced: now - 300,
-        reinforcement_count: 3
+        reinforcement_count: 3,
+        pinned: true
       }
 
       Consolidator.save_pool([mem], path)
@@ -76,6 +78,7 @@ defmodule Kyber.Memory.ConsolidatorTest do
       assert loaded.created_at == mem.created_at
       assert loaded.last_reinforced == mem.last_reinforced
       assert loaded.reinforcement_count == mem.reinforcement_count
+      assert loaded.pinned == mem.pinned
     end
 
     test "returns empty list for missing file" do

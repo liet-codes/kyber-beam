@@ -592,20 +592,56 @@ defmodule Kyber.Plugin.LLM do
   end
 
   # Extract tags from LLM response text and reinforce matching memories.
-  # Looks for key technical terms / topics that overlap with memory tags.
+  # Only matches words that are at least 5 chars and not in the stopword list.
   # Intentionally lightweight: no LLM call, just simple word extraction.
+
+  @tag_stopwords ~w(
+    about after again also another archive around based batch because before being
+    below build called change changes check class clause common complete config contains
+    context create current cycle datum debug defined delta depends depth detail
+    direct doing elixir error event example false found function given group guard handle
+    handler have here include index inject input inside issue items just keep kind later
+    layer level limit local logic match maybe means memory message might model module
+    needs never might often only other output parse pattern place point process query
+    quite reason reply reset response result return rules serve should since skill some
+    stack state still store string struct system table target test their these thing
+    this three through times token total toward under until update using value where while
+    which within without would write
+  )
+
   defp reinforce_memories(content) when is_binary(content) and content != "" do
-    tags =
+    # Get existing memory tags from ETS so we only match real memory tags
+    existing_tags =
+      case :ets.whereis(:memory_pool) do
+        :undefined ->
+          MapSet.new()
+
+        _table ->
+          :ets.tab2list(:memory_pool)
+          |> Enum.flat_map(fn {_, mem} -> mem.tags || [] end)
+          |> MapSet.new()
+      end
+
+    words =
       content
       |> String.downcase()
-      |> String.split(~r/[\s,.\-:;!?()\"']+/)
+      |> String.split(~r/[\s,.\-:;!?()\"'\[\]{}|<>\/\\]+/)
       |> Enum.filter(fn word ->
-        # Keep meaningful words likely to match memory tags (length >= 4, not common stopwords)
         len = String.length(word)
-        len >= 4 and word not in ~w(that this with from have been will when what your they were also into over some more about)
+        # Minimum 5 chars, not a stopword
+        len >= 5 and word not in @tag_stopwords
       end)
       |> Enum.uniq()
-      |> Enum.take(20)
+
+    # Prefer words that match actual memory tags; fall back to any qualifying word
+    matched =
+      if MapSet.size(existing_tags) > 0 do
+        Enum.filter(words, &MapSet.member?(existing_tags, &1))
+      else
+        words
+      end
+
+    tags = Enum.take(matched, 20)
 
     if tags != [] do
       Kyber.Memory.Consolidator.reinforce(tags)

@@ -21,14 +21,18 @@ defmodule Kyber.Memory.Consolidator do
   - `created_at` — Unix timestamp
   - `last_reinforced` — Unix timestamp of last reinforcement (nil if never)
   - `reinforcement_count` — how many times this memory has been reinforced
+  - `pinned` — if true, never decays and never gets GC'd
 
   ## Reinforcement
   When a memory's tags appear in an LLM response, call `reinforce/1` with
-  the matched tag list. Salience bumps by 0.1 (capped at 1.0).
+  the matched tag list. Reinforcements are buffered and applied at the start
+  of each consolidation cycle (single GenServer process — no ETS race).
 
   ## Decay
   Each consolidation cycle, unreinforced memories decay: `salience *= 0.95`.
-  Memories below 0.05 salience are GC'd unless `reinforcement_count > 5`.
+  Memories reinforced within the last 2 cycles are skipped.
+  Pinned memories never decay.
+  Memories below 0.05 salience are GC'd unless `reinforcement_count > 5` or pinned.
 
   ## Token Budget
   MEMORY.md is capped at ~8000 chars (~2000 tokens). If over budget, the
@@ -60,6 +64,12 @@ defmodule Kyber.Memory.Consolidator do
   @anthropic_url "https://api.anthropic.com/v1/messages"
   @max_memory_chars 8_000
 
+  # Keys to strip from delta payloads before sending to LLM
+  @sensitive_keys ~w(
+    auth_config token api_key secret password authorization
+    cookie session_id access_token refresh_token private_key
+  )
+
   # ── Public API ─────────────────────────────────────────────────────────────
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -71,13 +81,13 @@ defmodule Kyber.Memory.Consolidator do
   @doc """
   Reinforce memories whose tags overlap with the given tag list.
 
-  Called after each LLM response to bump salience of memories that
-  were referenced in the conversation. Lightweight — no LLM call.
+  Tags are buffered in GenServer state and applied at the start of the next
+  consolidation cycle (single-process read-modify-write, no ETS race).
   """
   @spec reinforce([String.t()]) :: :ok
   def reinforce(tags) when is_list(tags) and tags != [] do
     if Process.whereis(__MODULE__) do
-      GenServer.cast(__MODULE__, {:reinforce, tags})
+      GenServer.cast(__MODULE__, {:buffer_reinforcement, tags})
     end
     :ok
   end
@@ -102,6 +112,15 @@ defmodule Kyber.Memory.Consolidator do
     GenServer.call(server, :get_config)
   end
 
+  @doc """
+  Pin a memory by ID so it never decays or gets GC'd.
+  Returns :ok or {:error, :not_found}.
+  """
+  @spec pin_memory(String.t(), GenServer.server()) :: :ok | {:error, :not_found}
+  def pin_memory(memory_id, server \\ __MODULE__) do
+    GenServer.call(server, {:pin_memory, memory_id})
+  end
+
   # ── GenServer callbacks ────────────────────────────────────────────────────
 
   @impl true
@@ -115,13 +134,11 @@ defmodule Kyber.Memory.Consolidator do
     pool = load_pool(pool_path)
 
     # Initialize ETS table — name derived from GenServer name so multiple instances don't conflict.
-    # The globally-accessible named table is always :memory_pool (from the primary instance).
     server_name = Keyword.get(opts, :name, __MODULE__)
     table_name =
       if server_name == __MODULE__ do
         :memory_pool
       else
-        # Build a safe atom from the server name without using inspect
         suffix = server_name |> Atom.to_string() |> String.replace(~r/[^a-zA-Z0-9_]/, "_")
         :"memory_pool_#{suffix}"
       end
@@ -132,7 +149,6 @@ defmodule Kyber.Memory.Consolidator do
           :ets.new(table_name, [:named_table, :set, :public, read_concurrency: true])
 
         existing ->
-          # Table already exists (e.g. restart after crash) — reuse it
           :ets.delete_all_objects(existing)
           existing
       end
@@ -140,16 +156,21 @@ defmodule Kyber.Memory.Consolidator do
     # Populate ETS from loaded pool
     Enum.each(pool, fn mem -> :ets.insert(table, {mem.id, mem}) end)
 
+    # Seed pinned memories if pool is empty
+    if pool == [] do
+      seed_pinned_memories(table)
+    end
+
     state = %{
       config: config,
       pool_path: pool_path,
       memory_md_path: memory_md_path,
       core: core,
       table: table,
-      last_consolidated: nil
+      last_consolidated: nil,
+      pending_reinforcements: []
     }
 
-    # Schedule first consolidation
     schedule_consolidation(config.consolidation_interval_ms)
 
     Logger.info("[Kyber.Memory.Consolidator] started (#{length(pool)} memories loaded)")
@@ -171,8 +192,72 @@ defmodule Kyber.Memory.Consolidator do
     {:reply, state.config, state}
   end
 
+  def handle_call({:pin_memory, id}, _from, state) do
+    case :ets.lookup(state.table, id) do
+      [{^id, mem}] ->
+        :ets.insert(state.table, {id, %{mem | pinned: true}})
+        Logger.info("[Kyber.Memory.Consolidator] pinned memory #{id}")
+        {:reply, :ok, state}
+
+      [] ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
   @impl true
-  def handle_cast({:reinforce, tags}, state) do
+  def handle_cast({:buffer_reinforcement, tags}, state) do
+    # Buffer tags — will be applied atomically at the start of the next cycle
+    {:noreply, %{state | pending_reinforcements: state.pending_reinforcements ++ tags}}
+  end
+
+  @impl true
+  def handle_info(:consolidate, state) do
+    new_state = run_consolidation(state)
+    schedule_consolidation(state.config.consolidation_interval_ms)
+    {:noreply, new_state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  # ── Consolidation Cycle ────────────────────────────────────────────────────
+
+  defp run_consolidation(state) do
+    Logger.info("[Kyber.Memory.Consolidator] starting consolidation cycle")
+
+    # 0. Apply buffered reinforcements FIRST (single-process, no race)
+    state = apply_pending_reinforcements(state)
+
+    # 1. Apply decay to all existing memories (skipping pinned + recently reinforced)
+    state = apply_decay(state)
+
+    # 2. Query recent deltas and score them (if auth available)
+    {state, scoring_succeeded} = score_and_merge_deltas(state)
+
+    # 3. Garbage collect low-salience memories
+    state = gc_memories(state)
+
+    # 4. Rebuild MEMORY.md from pool
+    pool = read_pool_from_ets(state.table)
+    write_memory_md(pool, state.memory_md_path, state.config)
+
+    # 5. Persist pool to JSONL
+    save_pool(read_pool_from_ets(state.table), state.pool_path)
+
+    # 6. Only advance last_consolidated if LLM scoring was attempted and succeeded.
+    #    On failure, the same delta window is re-queried next cycle.
+    if scoring_succeeded do
+      %{state | last_consolidated: DateTime.utc_now()}
+    else
+      Logger.info("[Kyber.Memory.Consolidator] not advancing last_consolidated (scoring failed)")
+      state
+    end
+  end
+
+  # Apply buffered reinforcements atomically in the GenServer process.
+  defp apply_pending_reinforcements(%{pending_reinforcements: []} = state), do: state
+
+  defp apply_pending_reinforcements(state) do
+    tags = Enum.uniq(state.pending_reinforcements)
     now = System.system_time(:second)
     bump = state.config.reinforcement_bump
 
@@ -191,63 +276,39 @@ defmodule Kyber.Memory.Consolidator do
       end
     end)
 
-    {:noreply, state}
+    %{state | pending_reinforcements: []}
   end
 
-  @impl true
-  def handle_info(:consolidate, state) do
-    new_state = run_consolidation(state)
-    schedule_consolidation(state.config.consolidation_interval_ms)
-    {:noreply, new_state}
-  end
-
-  def handle_info(_msg, state), do: {:noreply, state}
-
-  # ── Consolidation Cycle ────────────────────────────────────────────────────
-
-  defp run_consolidation(state) do
-    Logger.info("[Kyber.Memory.Consolidator] starting consolidation cycle")
-
-    # 1. Apply decay to all existing memories
-    state = apply_decay(state)
-
-    # 2. Query recent deltas and score them (if auth available)
-    state = score_and_merge_deltas(state)
-
-    # 3. Garbage collect low-salience memories
-    state = gc_memories(state)
-
-    # 4. Rebuild MEMORY.md from pool
-    pool = read_pool_from_ets(state.table)
-    write_memory_md(pool, state.memory_md_path, state.config)
-
-    # 5. Persist pool to JSONL
-    save_pool(read_pool_from_ets(state.table), state.pool_path)
-
-    %{state | last_consolidated: DateTime.utc_now()}
-  end
-
-  # Apply salience decay to all memories. Memories not reinforced this cycle
-  # have their salience multiplied by decay_rate.
+  # Apply salience decay. Skips pinned memories and recently-reinforced ones
+  # (reinforced within the last 2 consolidation cycles = 2 hours by default).
   defp apply_decay(state) do
     rate = state.config.decay_rate
+    now = System.system_time(:second)
+    # Grace period = 2 cycles
+    grace_period = div(state.config.consolidation_interval_ms, 1000) * 2
 
     :ets.tab2list(state.table)
     |> Enum.each(fn {id, mem} ->
-      new_salience = mem.salience * rate
-      :ets.insert(state.table, {id, %{mem | salience: new_salience}})
+      skip =
+        Map.get(mem, :pinned, false) or
+          (mem.last_reinforced != nil and now - mem.last_reinforced < grace_period)
+
+      unless skip do
+        new_salience = mem.salience * rate
+        :ets.insert(state.table, {id, %{mem | salience: new_salience}})
+      end
     end)
 
     state
   end
 
   # Query recent deltas, send to LLM for scoring, merge into pool.
+  # Returns {state, scoring_succeeded?} — on LLM failure scoring_succeeded = false.
   defp score_and_merge_deltas(state) do
     auth_config = load_auth_config()
 
     case auth_config do
       {:ok, auth} ->
-        # Query deltas from last consolidation (or last 2 hours if first run)
         since_seconds =
           case state.last_consolidated do
             nil -> System.system_time(:second) - 7_200
@@ -261,27 +322,34 @@ defmodule Kyber.Memory.Consolidator do
             {:ok, scored} ->
               merge_scored_memories(scored, state.table)
               Logger.info("[Kyber.Memory.Consolidator] merged #{length(scored)} scored memories")
+              {state, true}
 
             {:error, reason} ->
               Logger.warning("[Kyber.Memory.Consolidator] scoring failed: #{inspect(reason)}")
+              # Do NOT advance last_consolidated — retry same window next cycle
+              {state, false}
           end
+        else
+          # No deltas to score — that's fine, still advance the window
+          {state, true}
         end
 
       {:error, reason} ->
         Logger.warning("[Kyber.Memory.Consolidator] no auth config for scoring: #{inspect(reason)}")
+        # No auth is not an LLM failure; advance the window
+        {state, true}
     end
-
-    state
   end
 
-  # Garbage collect memories whose salience has fallen below min_salience,
-  # unless they've been reinforced frequently.
+  # Garbage collect memories below min_salience (unless pinned or high-reinforcement).
   defp gc_memories(state) do
     min_sal = state.config.min_salience
 
     :ets.tab2list(state.table)
     |> Enum.each(fn {id, mem} ->
-      if mem.salience < min_sal and mem.reinforcement_count <= 5 do
+      pinned = Map.get(mem, :pinned, false)
+
+      if not pinned and mem.salience < min_sal and mem.reinforcement_count <= 5 do
         :ets.delete(state.table, id)
         Logger.debug("[Kyber.Memory.Consolidator] GC'd memory #{id} (salience #{Float.round(mem.salience, 3)})")
       end
@@ -292,11 +360,10 @@ defmodule Kyber.Memory.Consolidator do
 
   # Query Kyber.Delta.Store for deltas since the given Unix timestamp.
   defp query_recent_deltas(core, _since_seconds) do
-    # Try to get deltas from the store. Falls back to empty list if unavailable.
     try do
       store = GenServer.call(core, :get_store_name, 1_000)
       all = Kyber.Delta.Store.query(store, [])
-      # Filter to recent (last 2 hours worth of meaningful deltas)
+
       Enum.filter(all, fn delta ->
         delta.kind not in ["cron.fired", "system.heartbeat"] and
           byte_size(inspect(delta.payload)) > 20
@@ -312,12 +379,18 @@ defmodule Kyber.Memory.Consolidator do
   # Send deltas to LLM (Haiku) for salience scoring.
   # Returns {:ok, [%{summary, salience, tags}]} or {:error, reason}.
   defp score_deltas(deltas, auth_config, model) do
+    # Sanitize and cap each delta before building the prompt
     delta_summaries =
       deltas
       |> Enum.map(fn delta ->
-        "kind=#{delta.kind} payload=#{inspect(delta.payload, limit: 50)}"
+        safe_payload = sanitize_delta(delta.payload)
+        summary = "kind=#{delta.kind} payload=#{inspect(safe_payload, limit: 10)}"
+        # Cap each delta's contribution to 500 chars
+        String.slice(summary, 0, 500)
       end)
       |> Enum.join("\n")
+      # Hard cap on total prompt input: ~8000 chars
+      |> String.slice(0, 8_000)
 
     prompt = """
     You are reviewing a list of events from an AI agent's delta log.
@@ -367,9 +440,33 @@ defmodule Kyber.Memory.Consolidator do
     end
   end
 
+  # Deep-walk a delta payload, stripping sensitive keys and capping string lengths.
+  defp sanitize_delta(payload) when is_map(payload) do
+    payload
+    |> Map.drop(@sensitive_keys)
+    |> Map.drop(Enum.map(@sensitive_keys, &String.to_atom/1))
+    |> Map.new(fn {k, v} ->
+      key_str = k |> to_string() |> String.downcase()
+      if Enum.any?(@sensitive_keys, &String.contains?(key_str, &1)) do
+        {k, "[REDACTED]"}
+      else
+        {k, sanitize_delta(v)}
+      end
+    end)
+  end
+
+  defp sanitize_delta(v) when is_binary(v) and byte_size(v) > 200 do
+    String.slice(v, 0, 200) <> "..."
+  end
+
+  defp sanitize_delta(v) when is_list(v) do
+    Enum.map(v, &sanitize_delta/1)
+  end
+
+  defp sanitize_delta(v), do: v
+
   # Parse the LLM's JSON response into a list of memory maps.
   defp parse_scored_memories(content) do
-    # Strip any markdown code fences
     cleaned =
       content
       |> String.replace(~r/```(?:json)?\n?/, "")
@@ -416,18 +513,59 @@ defmodule Kyber.Memory.Consolidator do
         tags: mem.tags,
         created_at: now,
         last_reinforced: nil,
-        reinforcement_count: 0
+        reinforcement_count: 0,
+        pinned: false
       }
       :ets.insert(table, {id, entry})
     end)
   end
 
+  # Seed critical pinned memories on first run (empty pool).
+  defp seed_pinned_memories(table) do
+    now = System.system_time(:second)
+
+    seeds = [
+      %{
+        id: generate_id(),
+        summary: "Agent started on 2026-03-18. Born as Liet, a chiral reflection of Kurtz.",
+        salience: 1.0,
+        tags: ["birth", "identity", "origin"],
+        created_at: now,
+        last_reinforced: nil,
+        reinforcement_count: 0,
+        pinned: true
+      },
+      %{
+        id: generate_id(),
+        summary: "OAuth tokens (sk-ant-oat prefix) require Claude Code system prompt prefix for API calls.",
+        salience: 1.0,
+        tags: ["oauth", "claude-code", "auth", "prefix"],
+        created_at: now,
+        last_reinforced: nil,
+        reinforcement_count: 0,
+        pinned: true
+      },
+      %{
+        id: generate_id(),
+        summary: "Kyber reducer is a pure function: same inputs always produce same outputs. No side effects in reducers.",
+        salience: 1.0,
+        tags: ["reducer", "purity", "kyber", "architecture"],
+        created_at: now,
+        last_reinforced: nil,
+        reinforcement_count: 0,
+        pinned: true
+      }
+    ]
+
+    Enum.each(seeds, fn mem ->
+      :ets.insert(table, {mem.id, mem})
+    end)
+
+    Logger.info("[Kyber.Memory.Consolidator] seeded #{length(seeds)} pinned memories")
+  end
+
   # ── MEMORY.md Generation ──────────────────────────────────────────────────
 
-  # Rebuild MEMORY.md from the pool, respecting the token budget.
-  # Layout:
-  #   - Persistent section: top `max_persistent` by salience × recency_weight
-  #   - Drifting section: random sample from remaining, weighted toward age diversity
   defp write_memory_md(pool, path, config) do
     now = System.system_time(:second)
 
@@ -444,13 +582,9 @@ defmodule Kyber.Memory.Consolidator do
 
     persistent_mems = Enum.map(top_n, fn {_, mem} -> mem end)
 
-    drifting_mems =
-      rest
-      |> sample_drifting(config.max_drifting)
+    drifting_mems = sample_drifting(rest, config.max_drifting)
 
     content = render_memory_md(persistent_mems, drifting_mems)
-
-    # Enforce token budget: trim drifting section if over limit
     final_content = enforce_token_budget(content, drifting_mems, persistent_mems)
 
     case File.mkdir_p(Path.dirname(path)) do
@@ -467,15 +601,12 @@ defmodule Kyber.Memory.Consolidator do
     end
   end
 
-  # Sample `n` memories from the rest, weighted toward age diversity.
-  # Older memories (low recency) are included to ensure they don't starve.
   defp sample_drifting(scored_pool, n) do
     pool = Enum.map(scored_pool, fn {_, mem} -> mem end)
 
     if length(pool) <= n do
       pool
     else
-      # Split into age quartiles, take from each
       quartile = max(1, div(length(pool), 4))
       by_age = Enum.sort_by(pool, & &1.created_at, :asc)
 
@@ -514,8 +645,9 @@ defmodule Kyber.Memory.Consolidator do
       else
         persistent
         |> Enum.map_join("\n", fn mem ->
+          pin_flag = if Map.get(mem, :pinned, false), do: " 📌", else: ""
           tags = if mem.tags != [], do: " [#{Enum.join(mem.tags, ", ")}]", else: ""
-          "- #{mem.summary}#{tags}"
+          "- #{mem.summary}#{tags}#{pin_flag}"
         end)
       end
 
@@ -536,7 +668,6 @@ defmodule Kyber.Memory.Consolidator do
   end
 
   defp enforce_token_budget(content, drifting, persistent) when byte_size(content) > @max_memory_chars do
-    # Drop lowest-salience drifting memories one by one until under budget
     trimmed_drifting =
       drifting
       |> Enum.sort_by(& &1.salience, :asc)
@@ -607,7 +738,8 @@ defmodule Kyber.Memory.Consolidator do
       "tags" => mem.tags || [],
       "created_at" => mem.created_at,
       "last_reinforced" => mem.last_reinforced,
-      "reinforcement_count" => mem.reinforcement_count
+      "reinforcement_count" => mem.reinforcement_count,
+      "pinned" => Map.get(mem, :pinned, false)
     }
   end
 
@@ -624,7 +756,8 @@ defmodule Kyber.Memory.Consolidator do
         tags: tags,
         created_at: created_at,
         last_reinforced: Map.get(map, "last_reinforced"),
-        reinforcement_count: Map.get(map, "reinforcement_count", 0)
+        reinforcement_count: Map.get(map, "reinforcement_count", 0),
+        pinned: Map.get(map, "pinned", false)
       }
     else
       _ -> nil
@@ -681,7 +814,6 @@ defmodule Kyber.Memory.Consolidator do
     val |> max(min_val) |> min(max_val)
   end
 
-  # Recency weight: 1.0 for brand new, decays toward 0.3 over 30 days
   defp compute_recency_weight(created_at, now) do
     age_days = (now - created_at) / 86_400
     max(0.3, 1.0 - age_days / 30.0)
