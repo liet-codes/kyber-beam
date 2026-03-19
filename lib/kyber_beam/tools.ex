@@ -146,6 +146,45 @@ defmodule Kyber.Tools do
       }
     },
     %{
+      "name" => "memory_pool_list",
+      "description" =>
+        "List all memories in the memory pool with their salience scores, tags, and pin status. Use this to understand what you remember and manage your memory.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{}
+      }
+    },
+    %{
+      "name" => "memory_pin",
+      "description" =>
+        "Pin a memory so it never decays or gets garbage collected. Use for things you decide are permanently important. Requires the memory ID from memory_pool_list.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "memory_id" => %{
+            "type" => "string",
+            "description" => "The ID of the memory to pin"
+          }
+        },
+        "required" => ["memory_id"]
+      }
+    },
+    %{
+      "name" => "memory_unpin",
+      "description" =>
+        "Unpin a memory, allowing it to decay naturally. Use when something is no longer permanently important.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "memory_id" => %{
+            "type" => "string",
+            "description" => "The ID of the memory to unpin"
+          }
+        },
+        "required" => ["memory_id"]
+      }
+    },
+    %{
       "name" => "web_fetch",
       "description" =>
         "Fetch a URL and return its text content. Useful for reading documentation, articles, or any web resource. Response is truncated to 50KB.",

@@ -249,6 +249,48 @@ defmodule Kyber.ToolExecutor do
     end
   end
 
+  # ── memory pool management ────────────────────────────────────────────────
+
+  def execute("memory_pool_list", _input) do
+    try do
+      memories = Kyber.Memory.Consolidator.list_memories()
+
+      formatted =
+        memories
+        |> Enum.sort_by(& &1.salience, :desc)
+        |> Enum.map(fn mem ->
+          pin = if Map.get(mem, :pinned, false), do: "📌 ", else: ""
+          tags = Enum.join(Map.get(mem, :tags, []), ", ")
+          reinforced = Map.get(mem, :reinforcement_count, 0)
+
+          "#{pin}[#{mem.id}] salience=#{Float.round(mem.salience, 3)} reinforced=#{reinforced} tags=[#{tags}]\n  #{mem.summary}"
+        end)
+        |> Enum.join("\n\n")
+
+      {:ok, "(#{length(memories)} memories)\n\n#{formatted}"}
+    catch
+      :exit, _ -> {:error, "Memory.Consolidator not running"}
+    end
+  end
+
+  def execute("memory_pin", %{"memory_id" => id}) do
+    case Kyber.Memory.Consolidator.pin_memory(id) do
+      :ok -> {:ok, "Pinned memory #{id}"}
+      {:error, :not_found} -> {:error, "Memory not found: #{id}"}
+    end
+  catch
+    :exit, _ -> {:error, "Memory.Consolidator not running"}
+  end
+
+  def execute("memory_unpin", %{"memory_id" => id}) do
+    case Kyber.Memory.Consolidator.unpin_memory(id) do
+      :ok -> {:ok, "Unpinned memory #{id}"}
+      {:error, :not_found} -> {:error, "Memory not found: #{id}"}
+    end
+  catch
+    :exit, _ -> {:error, "Memory.Consolidator not running"}
+  end
+
   # ── web_fetch ─────────────────────────────────────────────────────────────
 
   def execute("web_fetch", %{"url" => url}) do

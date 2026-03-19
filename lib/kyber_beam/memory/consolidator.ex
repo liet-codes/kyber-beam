@@ -121,6 +121,16 @@ defmodule Kyber.Memory.Consolidator do
     GenServer.call(server, {:pin_memory, memory_id})
   end
 
+  @spec unpin_memory(String.t(), GenServer.server()) :: :ok | {:error, :not_found}
+  def unpin_memory(memory_id, server \\ __MODULE__) do
+    GenServer.call(server, {:unpin_memory, memory_id})
+  end
+
+  @spec list_memories(GenServer.server()) :: [map()]
+  def list_memories(server \\ __MODULE__) do
+    GenServer.call(server, :list_memories)
+  end
+
   # ── GenServer callbacks ────────────────────────────────────────────────────
 
   @impl true
@@ -202,6 +212,23 @@ defmodule Kyber.Memory.Consolidator do
       [] ->
         {:reply, {:error, :not_found}, state}
     end
+  end
+
+  def handle_call({:unpin_memory, id}, _from, state) do
+    case :ets.lookup(state.table, id) do
+      [{^id, mem}] ->
+        :ets.insert(state.table, {id, %{mem | pinned: false}})
+        Logger.info("[Kyber.Memory.Consolidator] unpinned memory #{id}")
+        {:reply, :ok, state}
+
+      [] ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  def handle_call(:list_memories, _from, state) do
+    pool = read_pool_from_ets(state.table)
+    {:reply, pool, state}
   end
 
   @impl true
@@ -520,48 +547,9 @@ defmodule Kyber.Memory.Consolidator do
     end)
   end
 
-  # Seed critical pinned memories on first run (empty pool).
-  defp seed_pinned_memories(table) do
-    now = System.system_time(:second)
-
-    seeds = [
-      %{
-        id: generate_id(),
-        summary: "Agent started on 2026-03-18. Born as Liet, a chiral reflection of Kurtz.",
-        salience: 1.0,
-        tags: ["birth", "identity", "origin"],
-        created_at: now,
-        last_reinforced: nil,
-        reinforcement_count: 0,
-        pinned: true
-      },
-      %{
-        id: generate_id(),
-        summary: "Myk is a night owl. Does his best thinking late. Never suggest sleep or hint that it's late — hard boundary.",
-        salience: 1.0,
-        tags: ["night-owl", "boundaries", "respect"],
-        created_at: now,
-        last_reinforced: nil,
-        reinforcement_count: 0,
-        pinned: true
-      },
-      %{
-        id: generate_id(),
-        summary: "Kyber reducer is a pure function: same inputs always produce same outputs. No side effects in reducers.",
-        salience: 1.0,
-        tags: ["reducer", "purity", "kyber", "architecture"],
-        created_at: now,
-        last_reinforced: nil,
-        reinforcement_count: 0,
-        pinned: true
-      }
-    ]
-
-    Enum.each(seeds, fn mem ->
-      :ets.insert(table, {mem.id, mem})
-    end)
-
-    Logger.info("[Kyber.Memory.Consolidator] seeded #{length(seeds)} pinned memories")
+  # On first run with empty pool, just log. Agent decides what to pin.
+  defp seed_pinned_memories(_table) do
+    Logger.info("[Kyber.Memory.Consolidator] empty pool — agent will build memories organically")
   end
 
   # ── MEMORY.md Generation ──────────────────────────────────────────────────
