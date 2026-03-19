@@ -11,6 +11,9 @@ defmodule KyberBeam.Application do
     vault_path = Application.get_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
     heartbeat_interval = Application.get_env(:kyber_beam, :heartbeat_interval, nil)
 
+    discord_token = Application.get_env(:kyber_beam, :discord_bot_token)
+    discord_connect = Application.get_env(:kyber_beam, :discord_connect, false)
+
     children =
       [
         # PubSub for Phoenix LiveView
@@ -30,7 +33,13 @@ defmodule KyberBeam.Application do
         {Kyber.Cron,
          name: Kyber.Cron,
          core: Kyber.Core,
-         heartbeat_interval: heartbeat_interval}
+         heartbeat_interval: heartbeat_interval},
+
+        # Discord plugin (Stilgar bot)
+        {Kyber.Plugin.Discord,
+         token: discord_token,
+         core: Kyber.Core,
+         connect: discord_connect}
       ]
       |> then(&(&1 ++ web_children()))
       |> then(&(&1 ++ phoenix_children()))

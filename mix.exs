@@ -30,6 +30,7 @@ defmodule KyberBeam.MixProject do
       {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
       {:websock, "~> 0.5"},
+      {:mint_web_socket, "~> 1.0"},
 
       # Phoenix + LiveView (Phase 2)
       {:phoenix, "~> 1.7"},

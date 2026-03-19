@@ -24,7 +24,6 @@ defmodule Kyber.Plugin.Discord do
   use GenServer
   require Logger
 
-  @gateway_url "wss://gateway.discord.gg/?v=10&encoding=json"
   @discord_api_base "https://discord.com/api/v10"
 
   # Discord Gateway opcodes
@@ -47,7 +46,8 @@ defmodule Kyber.Plugin.Discord do
   @doc "Start the Discord plugin."
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    {name, opts} = Keyword.pop(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @doc "Send a message to a Discord channel via REST API."
@@ -122,9 +122,9 @@ defmodule Kyber.Plugin.Discord do
         "token" => token,
         "intents" => @gateway_intents,
         "properties" => %{
-          "$os" => "linux",
-          "$browser" => "kyber",
-          "$device" => "kyber"
+          "os" => "beam",
+          "browser" => "kyber",
+          "device" => "kyber"
         }
       }
     }
@@ -138,13 +138,12 @@ defmodule Kyber.Plugin.Discord do
 
     token = get_token(opts)
     core = Keyword.get(opts, :core, Kyber.Core)
+    connect = Keyword.get(opts, :connect, Application.get_env(:kyber_beam, :discord_connect, false))
 
     state = %{
       token: token,
       core: core,
-      ws_pid: nil,
-      heartbeat_ref: nil,
-      heartbeat_interval: nil,
+      gateway_pid: nil,
       sequence: nil,
       session_id: nil,
       connected: false
@@ -153,37 +152,25 @@ defmodule Kyber.Plugin.Discord do
     if token do
       Logger.info("[Kyber.Plugin.Discord] token found, registering effect handler")
       register_send_handler(core, token)
-      # Only attempt WS connection if not in test mode
-      if Application.get_env(:kyber_beam, :discord_connect, false) do
-        send(self(), :connect)
+
+      if connect do
+        {:ok, gateway_pid} = Kyber.Plugin.Discord.Gateway.start_link(
+          token: token,
+          handler_pid: self()
+        )
+        Process.link(gateway_pid)
+        {:ok, %{state | gateway_pid: gateway_pid}}
+      else
+        Logger.info("[Kyber.Plugin.Discord] discord_connect is false — gateway not started")
+        {:ok, state}
       end
     else
       Logger.warning("[Kyber.Plugin.Discord] no DISCORD_BOT_TOKEN set — running without gateway")
+      {:ok, state}
     end
-
-    {:ok, state}
   end
 
   @impl true
-  def handle_info(:connect, state) do
-    Logger.info("[Kyber.Plugin.Discord] connecting to gateway...")
-    # In a real implementation, we'd use a WebSocket client library here.
-    # For now, log the intent (actual WS connection requires a WS client process).
-    {:noreply, state}
-  end
-
-  def handle_info(:heartbeat, %{ws_pid: nil} = state) do
-    {:noreply, state}
-  end
-
-  def handle_info(:heartbeat, state) do
-    heartbeat = Jason.encode!(%{"op" => @op_heartbeat, "d" => state.sequence})
-    send_ws(state.ws_pid, heartbeat)
-
-    ref = Process.send_after(self(), :heartbeat, state.heartbeat_interval)
-    {:noreply, %{state | heartbeat_ref: ref}}
-  end
-
   def handle_info({:discord_event, raw_json}, state) do
     with {:ok, msg} <- Jason.decode(raw_json) do
       state = handle_gateway_message(msg, state)
@@ -191,17 +178,6 @@ defmodule Kyber.Plugin.Discord do
     else
       _ -> {:noreply, state}
     end
-  end
-
-  def handle_info({:ws_closed, reason}, state) do
-    Logger.warning("[Kyber.Plugin.Discord] WebSocket closed: #{inspect(reason)} — will reconnect")
-    cancel_heartbeat(state.heartbeat_ref)
-
-    if Application.get_env(:kyber_beam, :discord_connect, false) do
-      Process.send_after(self(), :connect, 5_000)
-    end
-
-    {:noreply, %{state | ws_pid: nil, connected: false}}
   end
 
   def handle_info(msg, state) do
@@ -212,7 +188,12 @@ defmodule Kyber.Plugin.Discord do
   @impl true
   def terminate(reason, state) do
     Logger.info("[Kyber.Plugin.Discord] terminating: #{inspect(reason)}")
-    cancel_heartbeat(state.heartbeat_ref)
+
+    if state.gateway_pid && Process.alive?(state.gateway_pid) do
+      Process.unlink(state.gateway_pid)
+      GenServer.stop(state.gateway_pid, :shutdown)
+    end
+
     :ok
   end
 
@@ -253,22 +234,16 @@ defmodule Kyber.Plugin.Discord do
     end
   end
 
-  defp handle_gateway_message(%{"op" => @op_hello, "d" => %{"heartbeat_interval" => interval}}, state) do
-    Logger.info("[Kyber.Plugin.Discord] HELLO received, heartbeat interval: #{interval}ms")
-    cancel_heartbeat(state.heartbeat_ref)
-    ref = Process.send_after(self(), :heartbeat, interval)
+  # Protocol-level opcodes (HELLO, HEARTBEAT_ACK) are handled by Gateway.
+  # Discord plugin only cares about application-level events.
 
-    # Send IDENTIFY
-    if state.token do
-      identify = Jason.encode!(build_identify(state.token))
-      send_ws(state.ws_pid, identify)
-    end
-
-    %{state | heartbeat_interval: interval, heartbeat_ref: ref, connected: true}
+  defp handle_gateway_message(%{"op" => @op_hello}, state) do
+    # Gateway handles HELLO/IDENTIFY/heartbeat — no-op here
+    state
   end
 
   defp handle_gateway_message(%{"op" => @op_heartbeat_ack}, state) do
-    Logger.debug("[Kyber.Plugin.Discord] heartbeat ACK")
+    # Gateway handles heartbeat acks — no-op here
     state
   end
 
@@ -292,21 +267,13 @@ defmodule Kyber.Plugin.Discord do
     %{state | sequence: seq}
   end
 
-  defp handle_gateway_message(%{"op" => @op_dispatch, "s" => seq}, state) do
+  defp handle_gateway_message(%{"op" => @op_dispatch, "s" => seq}, state) when not is_nil(seq) do
     %{state | sequence: seq}
   end
 
   defp handle_gateway_message(_msg, state) do
     state
   end
-
-  defp send_ws(nil, _data), do: :ok
-  defp send_ws(ws_pid, data) when is_pid(ws_pid) do
-    send(ws_pid, {:send, data})
-  end
-
-  defp cancel_heartbeat(nil), do: :ok
-  defp cancel_heartbeat(ref), do: Process.cancel_timer(ref)
 
   defp channel_from_origin({:channel, "discord", channel_id, _}), do: channel_id
   defp channel_from_origin(_), do: nil
