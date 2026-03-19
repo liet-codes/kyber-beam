@@ -2,16 +2,22 @@ defmodule Kyber.Plugin.Discord.Gateway do
   @moduledoc """
   Discord Gateway WebSocket client using Mint.WebSocket.
 
-  Handles the full lifecycle of a Discord Gateway connection:
-  - Fetches gateway URL via REST
-  - Connects via Mint.HTTP + upgrades to WebSocket
-  - Receives HELLO → starts heartbeat, sends IDENTIFY
-  - Receives READY → stores session_id
-  - Receives MESSAGE_CREATE and other DISPATCHes → forwards to handler_pid
-  - Heartbeat timer → sends heartbeat, resets timer
-  - On disconnect → reconnects with exponential backoff (1s, 2s, 4s, max 30s)
+  Implements a non-blocking state machine for the Discord Gateway lifecycle:
+  - :disconnected → :upgrading → :connected
 
-  The handler_pid receives `{:discord_event, raw_json_binary}` messages.
+  State transitions:
+  1. :connect message → opens Mint.HTTP connection + sends WebSocket upgrade request
+  2. TCP messages while :upgrading → accumulate HTTP upgrade response until :done
+     → call Mint.WebSocket.new → transition to :connected
+     → process any buffered WebSocket data (HELLO may arrive with upgrade response)
+  3. TCP messages while :connected → decode WebSocket frames
+     → HELLO: start heartbeat + send IDENTIFY
+     → READY: store session_id
+     → DISPATCH: forward to handler_pid
+  4. :heartbeat → send heartbeat frame, reschedule
+  5. Error / close → schedule reconnect with exponential backoff
+
+  The handler_pid receives `{:discord_event, json_binary}` messages.
   """
 
   use GenServer
@@ -54,16 +60,26 @@ defmodule Kyber.Plugin.Discord.Gateway do
     state = %{
       token: token,
       handler_pid: handler_pid,
+      # Connection state machine: :disconnected | :upgrading | :connected
+      status: :disconnected,
       conn: nil,
       websocket: nil,
       ref: nil,
+      # Accumulated HTTP upgrade responses
+      upgrade_status: nil,
+      upgrade_headers: nil,
+      # WebSocket data buffered during upgrade phase (Discord sends HELLO immediately)
+      buffered_data: [],
+      # Sequence and session
       sequence: nil,
       session_id: nil,
+      # Heartbeat
       heartbeat_ref: nil,
       heartbeat_interval: nil,
+      # Zlib streaming context
       zlib_context: nil,
-      backoff: @backoff_initial,
-      status: :disconnected
+      # Reconnect backoff
+      backoff: @backoff_initial
     }
 
     send(self(), :connect)
@@ -74,44 +90,47 @@ defmodule Kyber.Plugin.Discord.Gateway do
   def handle_info(:connect, state) do
     Logger.info("[Discord.Gateway] connecting to #{@gateway_host}...")
 
-    # Clean up any existing zlib context
+    # Clean up old state
     state = cleanup_zlib(state)
+    state = cancel_heartbeat(state)
 
-    case do_connect(state.token) do
-      {:ok, conn, websocket, ref} ->
-        # Initialize a new zlib inflate context for this connection
-        z = :zlib.open()
-        :zlib.inflateInit(z)
-
-        new_state = %{state |
+    case start_connection(state.token) do
+      {:ok, conn, ref} ->
+        # Connection started and upgrade request sent; now wait for HTTP 101 response
+        {:noreply, %{state |
           conn: conn,
-          websocket: websocket,
           ref: ref,
-          zlib_context: z,
-          status: :connected,
+          status: :upgrading,
+          upgrade_status: nil,
+          upgrade_headers: nil,
+          websocket: nil,
           backoff: @backoff_initial
-        }
-
-        {:noreply, new_state}
+        }}
 
       {:error, reason} ->
         Logger.error("[Discord.Gateway] connection failed: #{inspect(reason)}, retrying in #{state.backoff}ms")
         Process.send_after(self(), :connect, state.backoff)
-        new_backoff = min(state.backoff * 2, @backoff_max)
-        {:noreply, %{state | status: :disconnected, backoff: new_backoff}}
+        {:noreply, %{state | status: :disconnected, backoff: min(state.backoff * 2, @backoff_max)}}
+    end
+  end
+
+  def handle_info(:heartbeat, %{status: :connected} = state) do
+    payload = Jason.encode!(%{"op" => @op_heartbeat, "d" => state.sequence})
+
+    case send_ws_frame(state, {:text, payload}) do
+      {:ok, state} ->
+        ref = Process.send_after(self(), :heartbeat, state.heartbeat_interval)
+        {:noreply, %{state | heartbeat_ref: ref}}
+
+      {:error, reason, state} ->
+        Logger.error("[Discord.Gateway] heartbeat failed: #{inspect(reason)}, reconnecting")
+        {:noreply, schedule_reconnect(state)}
     end
   end
 
   def handle_info(:heartbeat, state) do
-    case send_frame(state, {:text, Jason.encode!(%{"op" => @op_heartbeat, "d" => state.sequence})}) do
-      {:ok, new_state} ->
-        ref = Process.send_after(self(), :heartbeat, new_state.heartbeat_interval)
-        {:noreply, %{new_state | heartbeat_ref: ref}}
-
-      {:error, reason, new_state} ->
-        Logger.error("[Discord.Gateway] heartbeat send failed: #{inspect(reason)}")
-        {:noreply, schedule_reconnect(new_state)}
-    end
+    # Not connected — discard stale heartbeat
+    {:noreply, state}
   end
 
   # Handle Mint TCP/SSL messages
@@ -119,25 +138,19 @@ defmodule Kyber.Plugin.Discord.Gateway do
     case Mint.WebSocket.stream(conn, message) do
       {:ok, conn, responses} ->
         state = %{state | conn: conn}
-        state = Enum.reduce(responses, state, &handle_response/2)
+        state = process_responses(responses, state)
         {:noreply, state}
 
-      {:error, conn, %Mint.WebSocketError{} = error, _responses} ->
-        Logger.error("[Discord.Gateway] WebSocket error: #{inspect(error)}")
-        {:noreply, schedule_reconnect(%{state | conn: conn})}
-
       {:error, conn, error, _responses} ->
-        Logger.error("[Discord.Gateway] stream error: #{inspect(error)}")
+        Logger.error("[Discord.Gateway] stream error: #{inspect(error)}, reconnecting")
         {:noreply, schedule_reconnect(%{state | conn: conn})}
 
       :unknown ->
-        Logger.debug("[Discord.Gateway] unhandled message: #{inspect(message)}")
         {:noreply, state}
     end
   end
 
-  def handle_info(message, state) do
-    Logger.debug("[Discord.Gateway] unhandled message (no conn): #{inspect(message)}")
+  def handle_info(_message, state) do
     {:noreply, state}
   end
 
@@ -146,30 +159,30 @@ defmodule Kyber.Plugin.Discord.Gateway do
     cleanup_zlib(state)
 
     if state.conn do
-      Mint.HTTP.close(state.conn)
+      try do
+        Mint.HTTP.close(state.conn)
+      rescue
+        _ -> :ok
+      end
     end
 
     :ok
   end
 
-  # ── Private: Connection ───────────────────────────────────────────────────
+  # ── Private: Connection setup ─────────────────────────────────────────────
 
-  defp do_connect(token) do
-    with {:ok, _url} <- fetch_gateway_url(token),
-         {:ok, conn} <- Mint.HTTP.connect(:https, @gateway_host, @gateway_port),
-         {:ok, conn, ref} <- upgrade_to_websocket(conn) do
-      # Wait for the HTTP upgrade response
-      receive_upgrade_response(conn, ref)
-    else
-      {:error, _conn, error} -> {:error, error}
-      {:error, reason} -> {:error, reason}
-    end
-  end
+  defp start_connection(token) do
+    _ = fetch_gateway_url(token)
 
-  defp upgrade_to_websocket(conn) do
-    case Mint.WebSocket.upgrade(:wss, conn, @gateway_path, []) do
-      {:ok, conn, ref} -> {:ok, conn, ref}
-      {:error, conn, error} -> {:error, conn, error}
+    case Mint.HTTP.connect(:https, @gateway_host, @gateway_port, protocols: [:http1]) do
+      {:ok, conn} ->
+        case Mint.WebSocket.upgrade(:wss, conn, @gateway_path, []) do
+          {:ok, conn, ref} -> {:ok, conn, ref}
+          {:error, _conn, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -183,9 +196,8 @@ defmodule Kyber.Plugin.Discord.Gateway do
         Logger.info("[Discord.Gateway] gateway URL: #{gateway_url}")
         {:ok, gateway_url}
 
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("[Discord.Gateway] /gateway/bot returned #{status}: #{inspect(body)}")
-        # Fall back to default gateway — Discord allows this
+      {:ok, %{status: status}} ->
+        Logger.warning("[Discord.Gateway] /gateway/bot returned #{status}, using default")
         {:ok, "wss://#{@gateway_host}"}
 
       {:error, reason} ->
@@ -194,155 +206,119 @@ defmodule Kyber.Plugin.Discord.Gateway do
     end
   end
 
-  defp receive_upgrade_response(conn, ref) do
-    receive do
-      message ->
-        case Mint.WebSocket.stream(conn, message) do
-          {:ok, conn, responses} ->
-            status = Enum.find_value(responses, fn
-              {:status, ^ref, s} -> s
-              _ -> nil
-            end)
+  # ── Private: Response processing state machine ────────────────────────────
 
-            headers = Enum.find_value(responses, fn
-              {:headers, ^ref, h} -> h
-              _ -> nil
-            end)
+  defp process_responses(responses, state) do
+    Enum.reduce(responses, state, &process_response/2)
+  end
 
-            done? = Enum.any?(responses, fn
-              {:done, ^ref} -> true
-              _ -> false
-            end)
+  # ── Upgrading phase: accumulate HTTP response ─────────────────────────────
 
-            if done? && status && headers do
-              case Mint.WebSocket.new(conn, ref, status, headers) do
-                {:ok, conn, websocket} ->
-                  Logger.info("[Discord.Gateway] WebSocket upgrade successful")
-                  {:ok, conn, websocket, ref}
+  defp process_response({:status, ref, status}, %{status: :upgrading, ref: ref} = state) do
+    %{state | upgrade_status: status}
+  end
 
-                {:error, _conn, reason} ->
-                  Logger.error("[Discord.Gateway] WebSocket upgrade failed: #{inspect(reason)}")
-                  {:error, reason}
-              end
-            else
-              # Keep accumulating until we get :done
-              receive_upgrade_response_continue(conn, ref, status, headers)
-            end
+  defp process_response({:headers, ref, headers}, %{status: :upgrading, ref: ref} = state) do
+    %{state | upgrade_headers: headers}
+  end
 
-          {:error, _conn, reason, _} ->
-            {:error, reason}
+  defp process_response({:done, ref}, %{status: :upgrading, ref: ref} = state) do
+    # HTTP upgrade response complete — create WebSocket
+    case Mint.WebSocket.new(state.conn, ref, state.upgrade_status, state.upgrade_headers) do
+      {:ok, conn, websocket} ->
+        Logger.info("[Discord.Gateway] WebSocket established — waiting for HELLO")
 
-          :unknown ->
-            receive_upgrade_response(conn, ref)
-        end
-    after
-      10_000 -> {:error, :upgrade_timeout}
+        # Initialize zlib inflate context for this session
+        z = :zlib.open()
+        :zlib.inflateInit(z)
+
+        state = %{state |
+          conn: conn,
+          websocket: websocket,
+          status: :connected,
+          zlib_context: z,
+          upgrade_status: nil,
+          upgrade_headers: nil
+        }
+
+        # Drain any buffered WebSocket data that arrived during the upgrade phase.
+        # Discord often sends HELLO in the same TCP segment as the HTTP 101 response,
+        # arriving as :data responses before :done.
+        buffered = Map.get(state, :buffered_data, [])
+        state = Enum.reduce(buffered, state, fn data, acc ->
+          process_response({:data, ref, data}, acc)
+        end)
+        %{state | buffered_data: []}
+
+      {:error, _conn, reason} ->
+        Logger.error("[Discord.Gateway] WebSocket upgrade failed: #{inspect(reason)}")
+        schedule_reconnect(state)
     end
   end
 
-  defp receive_upgrade_response_continue(conn, ref, acc_status, acc_headers) do
-    receive do
-      message ->
-        case Mint.WebSocket.stream(conn, message) do
-          {:ok, conn, responses} ->
-            status = acc_status || Enum.find_value(responses, fn
-              {:status, ^ref, s} -> s
-              _ -> nil
-            end)
+  # ── Connected phase: WebSocket data ───────────────────────────────────────
 
-            headers = acc_headers || Enum.find_value(responses, fn
-              {:headers, ^ref, h} -> h
-              _ -> nil
-            end)
-
-            done? = Enum.any?(responses, fn
-              {:done, ^ref} -> true
-              _ -> false
-            end)
-
-            if done? && status && headers do
-              case Mint.WebSocket.new(conn, ref, status, headers) do
-                {:ok, conn, websocket} ->
-                  Logger.info("[Discord.Gateway] WebSocket upgrade successful")
-                  {:ok, conn, websocket, ref}
-
-                {:error, _conn, reason} ->
-                  {:error, reason}
-              end
-            else
-              receive_upgrade_response_continue(conn, ref, status, headers)
-            end
-
-          {:error, _conn, reason, _} ->
-            {:error, reason}
-
-          :unknown ->
-            receive_upgrade_response_continue(conn, ref, acc_status, acc_headers)
-        end
-    after
-      10_000 -> {:error, :upgrade_timeout}
-    end
-  end
-
-  # ── Private: Frame handling ───────────────────────────────────────────────
-
-  defp handle_response({:data, _ref, data}, state) do
+  defp process_response({:data, ref, data}, %{status: :connected, ref: ref} = state) do
     case Mint.WebSocket.decode(state.websocket, data) do
       {:ok, websocket, frames} ->
         state = %{state | websocket: websocket}
-        Enum.reduce(frames, state, &handle_frame/2)
+        Enum.reduce(frames, state, &handle_ws_frame/2)
 
       {:error, websocket, reason} ->
-        Logger.error("[Discord.Gateway] decode error: #{inspect(reason)}")
+        Logger.error("[Discord.Gateway] WebSocket decode error: #{inspect(reason)}")
         %{state | websocket: websocket}
     end
   end
 
-  defp handle_response({:error, _ref, reason}, state) do
-    Logger.error("[Discord.Gateway] response error: #{inspect(reason)}")
-    schedule_reconnect(state)
+  # Buffer :data responses that arrive during the upgrade phase.
+  # Discord frequently sends HELLO in the same TCP segment as the HTTP 101,
+  # so the binary data arrives before Mint has signalled :done.
+  defp process_response({:data, _ref, data}, %{status: :upgrading} = state) do
+    Logger.debug("[Discord.Gateway] buffering #{byte_size(data)} bytes of WS data during upgrade")
+    buffered = Map.get(state, :buffered_data, [])
+    %{state | buffered_data: buffered ++ [data]}
   end
 
-  defp handle_response(_other, state), do: state
+  defp process_response(_response, state), do: state
 
-  # Binary frame (possibly zlib-compressed)
-  defp handle_frame({:binary, data}, state) do
-    case inflate_zlib(state.zlib_context, data) do
-      {:ok, json} ->
-        dispatch_event(json, state)
+  # ── Private: WebSocket frame handling ─────────────────────────────────────
 
+  defp handle_ws_frame({:binary, data}, state) do
+    # Discord zlib-stream compressed frame
+    case inflate_frame(state.zlib_context, data) do
+      {:ok, json} -> dispatch_json(json, state)
+      {:error, :partial} -> state  # accumulate more data
       {:error, reason} ->
-        Logger.error("[Discord.Gateway] zlib inflate failed: #{inspect(reason)}")
+        Logger.error("[Discord.Gateway] zlib error: #{inspect(reason)}")
         state
     end
   end
 
-  # Text frame (uncompressed JSON)
-  defp handle_frame({:text, json}, state) do
-    dispatch_event(json, state)
+  defp handle_ws_frame({:text, json}, state) do
+    dispatch_json(json, state)
   end
 
-  # Ping frame — respond with pong
-  defp handle_frame({:ping, data}, state) do
-    case send_frame(state, {:pong, data}) do
-      {:ok, new_state} -> new_state
-      {:error, _, new_state} -> new_state
+  defp handle_ws_frame({:ping, data}, state) do
+    case send_ws_frame(state, {:pong, data}) do
+      {:ok, state} -> state
+      {:error, _, state} -> state
     end
   end
 
-  # Close frame
-  defp handle_frame({:close, code, reason}, state) do
-    Logger.warning("[Discord.Gateway] server closed connection: #{code} #{reason}")
+  defp handle_ws_frame({:close, code, reason}, state) do
+    Logger.warning("[Discord.Gateway] server closed: #{code} #{inspect(reason)}")
     schedule_reconnect(state)
   end
 
-  defp handle_frame(_frame, state), do: state
+  defp handle_ws_frame(_frame, state), do: state
 
-  defp dispatch_event(json, state) do
+  # ── Private: JSON dispatch ────────────────────────────────────────────────
+
+  defp dispatch_json(json, state) do
     case Jason.decode(json) do
       {:ok, msg} ->
-        state = handle_gateway_op(msg, state)
-        # Forward raw JSON to handler for any processing it needs
+        state = handle_op(msg, state)
+        # Forward raw JSON to the Discord plugin for application-level handling
         send(state.handler_pid, {:discord_event, json})
         state
 
@@ -352,53 +328,54 @@ defmodule Kyber.Plugin.Discord.Gateway do
     end
   end
 
-  # ── Private: Gateway opcode handling ─────────────────────────────────────
+  # ── Private: Discord opcode handling ─────────────────────────────────────
 
-  defp handle_gateway_op(%{"op" => @op_hello, "d" => %{"heartbeat_interval" => interval}}, state) do
-    Logger.info("[Discord.Gateway] HELLO received, heartbeat_interval: #{interval}ms")
+  defp handle_op(%{"op" => @op_hello, "d" => %{"heartbeat_interval" => interval}}, state) do
+    Logger.info("[Discord.Gateway] HELLO — interval: #{interval}ms, sending IDENTIFY")
 
-    # Cancel old heartbeat if any
-    if state.heartbeat_ref, do: Process.cancel_timer(state.heartbeat_ref)
+    state = cancel_heartbeat(state)
 
-    # Send IDENTIFY immediately
-    identify_payload = build_identify(state.token)
+    # Send IDENTIFY
+    identify = build_identify(state.token)
 
-    case send_frame(state, {:text, Jason.encode!(identify_payload)}) do
-      {:ok, new_state} ->
-        ref = Process.send_after(self(), :heartbeat, interval)
-        %{new_state | heartbeat_interval: interval, heartbeat_ref: ref}
+    state =
+      case send_ws_frame(state, {:text, Jason.encode!(identify)}) do
+        {:ok, state} -> state
+        {:error, reason, state} ->
+          Logger.error("[Discord.Gateway] IDENTIFY failed: #{inspect(reason)}")
+          state
+      end
 
-      {:error, reason, new_state} ->
-        Logger.error("[Discord.Gateway] failed to send IDENTIFY: #{inspect(reason)}")
-        new_state
-    end
+    # Schedule first heartbeat
+    ref = Process.send_after(self(), :heartbeat, interval)
+    %{state | heartbeat_interval: interval, heartbeat_ref: ref}
   end
 
-  defp handle_gateway_op(%{"op" => @op_heartbeat_ack}, state) do
+  defp handle_op(%{"op" => @op_heartbeat_ack}, state) do
     Logger.debug("[Discord.Gateway] heartbeat ACK")
     state
   end
 
-  defp handle_gateway_op(%{"op" => 0, "t" => "READY", "d" => data, "s" => seq}, state) do
+  defp handle_op(%{"op" => 0, "t" => "READY", "d" => data, "s" => seq}, state) do
     session_id = data["session_id"]
-    Logger.info("[Discord.Gateway] READY — session_id: #{session_id}")
+    Logger.info("[Discord.Gateway] READY — bot online, session: #{session_id}")
     %{state | session_id: session_id, sequence: seq}
   end
 
-  defp handle_gateway_op(%{"op" => 0, "s" => seq}, state) when not is_nil(seq) do
+  defp handle_op(%{"op" => 0, "s" => seq}, state) when not is_nil(seq) do
     %{state | sequence: seq}
   end
 
-  defp handle_gateway_op(_msg, state), do: state
+  defp handle_op(_msg, state), do: state
 
-  # ── Private: Sending frames ───────────────────────────────────────────────
+  # ── Private: Send WebSocket frame ─────────────────────────────────────────
 
-  defp send_frame(%{conn: nil} = state, _frame), do: {:error, :not_connected, state}
+  defp send_ws_frame(%{conn: nil} = state, _frame), do: {:error, :not_connected, state}
 
-  defp send_frame(state, frame) do
+  defp send_ws_frame(state, frame) do
     case Mint.WebSocket.encode(state.websocket, frame) do
       {:ok, websocket, data} ->
-        case Mint.WebSocket.stream_request_body(conn_from_state(state), state.ref, data) do
+        case Mint.WebSocket.stream_request_body(state.conn, state.ref, data) do
           {:ok, conn} ->
             {:ok, %{state | websocket: websocket, conn: conn}}
 
@@ -411,32 +388,31 @@ defmodule Kyber.Plugin.Discord.Gateway do
     end
   end
 
-  defp conn_from_state(%{conn: conn}), do: conn
-
   # ── Private: Zlib ─────────────────────────────────────────────────────────
 
-  defp inflate_zlib(nil, _data), do: {:error, :no_zlib_context}
+  defp inflate_frame(nil, _data), do: {:error, :no_context}
 
-  defp inflate_zlib(z, data) do
-    # Discord uses zlib-stream compression: each message ends with 0x00 0x00 0xFF 0xFF
-    # We need to check if this is a complete message boundary
-    if :binary.longest_common_suffix([data, @zlib_suffix]) == byte_size(@zlib_suffix) do
+  defp inflate_frame(z, data) do
+    # Discord zlib-stream: each complete message ends with 0x00 0x00 0xFF 0xFF
+    complete? = byte_size(data) >= 4 and
+      binary_part(data, byte_size(data) - 4, 4) == @zlib_suffix
+
+    if complete? do
       try do
         inflated = :zlib.inflate(z, data)
         {:ok, IO.iodata_to_binary(inflated)}
       catch
         kind, reason ->
-          Logger.error("[Discord.Gateway] zlib inflate error: #{kind} #{inspect(reason)}")
+          Logger.error("[Discord.Gateway] inflate error: #{kind} #{inspect(reason)}")
           {:error, {kind, reason}}
       end
     else
-      # Partial message — accumulate (Discord shouldn't send partial WS frames but just in case)
+      # Partial frame — inflate anyway to keep zlib context state consistent
       try do
-        _inflated = :zlib.inflate(z, data)
-        {:error, :partial_message}
+        :zlib.inflate(z, data)
+        {:error, :partial}
       catch
-        kind, reason ->
-          {:error, {kind, reason}}
+        _, _ -> {:error, :partial}
       end
     end
   end
@@ -446,7 +422,8 @@ defmodule Kyber.Plugin.Discord.Gateway do
   defp schedule_reconnect(state) do
     Logger.warning("[Discord.Gateway] scheduling reconnect in #{state.backoff}ms")
 
-    if state.heartbeat_ref, do: Process.cancel_timer(state.heartbeat_ref)
+    state = cancel_heartbeat(state)
+    state = cleanup_zlib(state)
 
     if state.conn do
       try do
@@ -456,34 +433,46 @@ defmodule Kyber.Plugin.Discord.Gateway do
       end
     end
 
-    state = cleanup_zlib(state)
     Process.send_after(self(), :connect, state.backoff)
-    new_backoff = min(state.backoff * 2, @backoff_max)
 
     %{state |
       conn: nil,
       websocket: nil,
       ref: nil,
-      heartbeat_ref: nil,
-      backoff: new_backoff,
-      status: :disconnected
+      status: :disconnected,
+      buffered_data: [],
+      backoff: min(state.backoff * 2, @backoff_max)
     }
+  end
+
+  defp cancel_heartbeat(%{heartbeat_ref: nil} = state), do: state
+  defp cancel_heartbeat(%{heartbeat_ref: ref} = state) do
+    Process.cancel_timer(ref)
+    %{state | heartbeat_ref: nil}
   end
 
   defp cleanup_zlib(%{zlib_context: nil} = state), do: state
   defp cleanup_zlib(%{zlib_context: z} = state) do
     try do
       :zlib.inflateEnd(z)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+
+    try do
       :zlib.close(z)
     rescue
       _ -> :ok
     catch
       _, _ -> :ok
     end
+
     %{state | zlib_context: nil}
   end
 
-  # ── Private: Protocol ─────────────────────────────────────────────────────
+  # ── Private: IDENTIFY payload ─────────────────────────────────────────────
 
   defp build_identify(token) do
     %{
