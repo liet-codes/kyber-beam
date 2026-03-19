@@ -112,9 +112,9 @@ defmodule Kyber.Plugin.DiscordTest do
     end
 
     test "includes required gateway intents" do
-      # 34307 = GUILDS(1) + GUILD_MESSAGES(512) + MESSAGE_CONTENT(32768) + others
+      # 37377 = GUILDS(1) + GUILD_MESSAGES(512) + DIRECT_MESSAGES(4096) + MESSAGE_CONTENT(32768)
       identify = Discord.build_identify("token")
-      assert identify["d"]["intents"] == 34307
+      assert identify["d"]["intents"] == 37377
     end
   end
 

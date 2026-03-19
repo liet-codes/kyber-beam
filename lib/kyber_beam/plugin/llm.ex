@@ -23,7 +23,7 @@ defmodule Kyber.Plugin.LLM do
   require Logger
 
   @anthropic_url "https://api.anthropic.com/v1/messages"
-  @default_model "claude-sonnet-4-6"
+  @default_model "claude-sonnet-4-20250514"
   @default_max_tokens 8192
   @auth_profiles_path "~/.openclaw/agents/main/agent/auth-profiles.json"
 
@@ -80,7 +80,8 @@ defmodule Kyber.Plugin.LLM do
   def build_headers(%{type: :oauth, token: token}) do
     [
       {"Authorization", "Bearer #{token}"},
-      {"anthropic-beta", "claude-code-20250219,oauth-2025-04-20"},
+      {"anthropic-version", "2023-06-01"},
+      {"anthropic-beta", "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"},
       {"user-agent", "claude-cli/2.1.62"},
       {"x-app", "cli"},
       {"content-type", "application/json"}
@@ -134,16 +135,39 @@ defmodule Kyber.Plugin.LLM do
     }
 
     body =
-      if params["system"],
-        do: Map.put(body, "system", params["system"]),
-        else: body
+      case {auth_config.type, params["system"]} do
+        {:oauth, system} when is_binary(system) ->
+          # OAuth tokens require Claude Code identity prefix and system as array
+          Map.put(body, "system", [
+            %{"type" => "text", "text" => "You are Claude Code, Anthropic's official CLI for Claude."},
+            %{"type" => "text", "text" => system}
+          ])
 
+        {:oauth, nil} ->
+          Map.put(body, "system", [
+            %{"type" => "text", "text" => "You are Claude Code, Anthropic's official CLI for Claude."}
+          ])
+
+        {_, system} when is_binary(system) ->
+          Map.put(body, "system", system)
+
+        _ ->
+          body
+      end
+
+    system_info = case body["system"] do
+      list when is_list(list) -> "yes (#{length(list)} blocks)"
+      str when is_binary(str) -> "yes (#{String.length(str)} chars)"
+      _ -> "no"
+    end
+    Logger.info("[Kyber.Plugin.LLM] calling API: model=#{body["model"]}, messages=#{length(body["messages"] || [])}, system=#{system_info}")
     case Req.post(@anthropic_url, headers: headers, json: body, receive_timeout: 30_000) do
       {:ok, %{status: 200, body: response}} ->
         {:ok, response}
 
       {:ok, %{status: status, body: body}} ->
-        error_msg = get_in(body, ["error", "message"]) || "API error"
+        Logger.error("[Kyber.Plugin.LLM] API error #{status}: #{inspect(body)}")
+        error_msg = get_in(body, ["error", "message"]) || inspect(body)
         {:error, %{error: error_msg, status: status}}
 
       {:error, reason} ->
@@ -194,14 +218,14 @@ defmodule Kyber.Plugin.LLM do
     {:noreply, %{state | auth_config: auth_config}}
   end
 
-  @impl true
-  def handle_call(:get_auth_config, _from, state) do
-    {:reply, state.auth_config, state}
-  end
-
   def handle_info(msg, state) do
     Logger.warning("[Kyber.Plugin.LLM] unexpected message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_call(:get_auth_config, _from, state) do
+    {:reply, state.auth_config, state}
   end
 
   @impl true
@@ -260,11 +284,14 @@ defmodule Kyber.Plugin.LLM do
         history ++ [%{"role" => "user", "content" => text}]
       end
 
+    # Load system prompt: explicit payload > SOUL.md from vault
+    system_prompt = payload["system"] || load_soul()
+
     params = %{
       "model" => payload["model"] || @default_model,
       "max_tokens" => payload["max_tokens"] || @default_max_tokens,
       "messages" => messages,
-      "system" => payload["system"]
+      "system" => system_prompt
     }
 
     case auth_config do
@@ -275,15 +302,26 @@ defmodule Kyber.Plugin.LLM do
         case call_api(config, params) do
           {:ok, response} ->
             content = extract_content(response)
+
+            # Derive channel from original origin for routing the response back
+            channel_id = case origin do
+              {:channel, "discord", cid, _} -> cid
+              _ -> nil
+            end
+
+            response_payload = %{
+              "content" => content,
+              "model" => response["model"],
+              "usage" => response["usage"],
+              "stop_reason" => response["stop_reason"]
+            }
+            |> then(fn p -> if channel_id, do: Map.put(p, "channel_id", channel_id), else: p end)
+
+            # Preserve the original origin so the reducer can route the response
             delta = Kyber.Delta.new(
               "llm.response",
-              %{
-                "content" => content,
-                "model" => response["model"],
-                "usage" => response["usage"],
-                "stop_reason" => response["stop_reason"]
-              },
-              {:subagent, parent_id || "llm"},
+              response_payload,
+              origin || {:system, "llm"},
               parent_id
             )
 
@@ -321,6 +359,21 @@ defmodule Kyber.Plugin.LLM do
     |> Enum.map_join("\n", &Map.get(&1, "text", ""))
   end
   defp extract_content(_), do: ""
+
+  defp load_soul do
+    # Try vault path first, then fallback to priv/vault
+    paths = [
+      Path.expand("~/.kyber/vault/identity/SOUL.md"),
+      Path.join(:code.priv_dir(:kyber_beam), "vault/identity/SOUL.md")
+    ]
+
+    Enum.find_value(paths, fn path ->
+      case File.read(path) do
+        {:ok, content} -> content
+        _ -> nil
+      end
+    end)
+  end
 
   defp chat_id_from_origin({:channel, _ch, chat_id, _sender}), do: chat_id
   defp chat_id_from_origin({:human, user_id}), do: user_id

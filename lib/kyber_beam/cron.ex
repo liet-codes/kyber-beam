@@ -245,7 +245,7 @@ defmodule Kyber.Cron do
     Process.send_after(self(), :check_jobs, interval)
   end
 
-  defp check_and_fire(jobs, now, check_interval) do
+  defp check_and_fire(jobs, now, _check_interval) do
     Enum.reduce(jobs, {%{}, []}, fn {name, job}, {new_jobs, fired} ->
       if DateTime.compare(job.next_run, now) != :gt do
         # Determine if this job was missed (late by more than threshold)
@@ -323,19 +323,15 @@ defmodule Kyber.Cron do
   end
 
   defp job_to_json(job) do
-    case serialize_schedule(job.schedule) do
-      {:ok, sched_map} ->
-        %{
-          "name" => job.name,
-          "schedule" => sched_map,
-          "next_run" => DateTime.to_iso8601(job.next_run),
-          "fired_count" => job.fired_count,
-          "metadata" => job.metadata || %{}
-        }
+    {:ok, sched_map} = serialize_schedule(job.schedule)
 
-      :skip ->
-        nil
-    end
+    %{
+      "name" => job.name,
+      "schedule" => sched_map,
+      "next_run" => DateTime.to_iso8601(job.next_run),
+      "fired_count" => job.fired_count,
+      "metadata" => job.metadata || %{}
+    }
   end
 
   defp serialize_schedule({:every, ms}),

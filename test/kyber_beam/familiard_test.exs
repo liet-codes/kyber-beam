@@ -75,7 +75,8 @@ defmodule Kyber.FamiliardTest do
 
   describe "emit_escalation/2" do
     test "emits a familiard.escalation delta when core is set" do
-      {:ok, core} = Kyber.Core.start_link(name: :"TestFamCore#{:rand.uniform(99999)}")
+      tmp_path = Path.join(System.tmp_dir!(), "kyber_fam_test_#{:rand.uniform(99999)}.jsonl")
+      {:ok, core} = Kyber.Core.start_link(name: :"TestFamCore#{:rand.uniform(99999)}", store_path: tmp_path)
 
       {:ok, pid} = Familiard.start_link(name: nil, core: core)
 

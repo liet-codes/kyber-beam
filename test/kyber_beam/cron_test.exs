@@ -201,7 +201,8 @@ defmodule Kyber.CronTest do
     end
 
     test "emits cron.fired delta when core is set" do
-      {:ok, core} = Kyber.Core.start_link(name: :"TestCronCore#{:rand.uniform(99999)}")
+      tmp_path = Path.join(System.tmp_dir!(), "kyber_cron_test_#{:rand.uniform(99999)}.jsonl")
+      {:ok, core} = Kyber.Core.start_link(name: :"TestCronCore#{:rand.uniform(99999)}", store_path: tmp_path)
       test_pid = self()
 
       # Subscribe to core's delta store
@@ -229,9 +230,9 @@ defmodule Kyber.CronTest do
       deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
       assert length(deltas) >= 1
 
-      fired = hd(deltas)
+      fired = Enum.find(deltas, fn d -> d.payload["job_name"] == "emit-test" end)
+      assert fired != nil, "Expected a cron.fired delta with job_name 'emit-test', got: #{inspect(Enum.map(deltas, & &1.payload["job_name"]))}"
       assert fired.kind == "cron.fired"
-      assert fired.payload["job_name"] == "emit-test"
       assert fired.origin == {:cron, "emit-test"}
 
       GenServer.stop(pid)

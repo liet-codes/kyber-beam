@@ -218,6 +218,8 @@ defmodule Kyber.Core.PipelineWirer do
 
     unsubscribe_fn =
       Kyber.Delta.Store.subscribe(store, fn delta ->
+        Logger.debug("[PipelineWirer] processing delta: #{delta.kind} (#{delta.id})")
+
         effects =
           try do
             Kyber.State.get_and_update(state_server, fn current_state ->
@@ -234,11 +236,15 @@ defmodule Kyber.Core.PipelineWirer do
               []
           end
 
+        if effects != [] do
+          Logger.debug("[PipelineWirer] effects from #{delta.kind}: #{inspect(Enum.map(effects, & &1.type))}")
+        end
+
         Enum.each(effects, fn effect ->
           try do
             case Kyber.Effect.Executor.execute(executor, effect) do
               {:ok, _ref} ->
-                :ok
+                Logger.debug("[PipelineWirer] dispatched effect: #{effect.type}")
 
               {:error, reason} ->
                 Logger.warning(

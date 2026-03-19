@@ -35,6 +35,11 @@ defmodule KyberBeam.Application do
          core: Kyber.Core,
          heartbeat_interval: heartbeat_interval},
 
+        # LLM plugin (Anthropic API)
+        {Kyber.Plugin.LLM,
+         core: Kyber.Core,
+         session: Kyber.Session},
+
         # Discord plugin (Stilgar bot)
         {Kyber.Plugin.Discord,
          token: discord_token,

@@ -172,10 +172,17 @@ defmodule Kyber.Plugin.Discord do
   @impl true
   def handle_info({:discord_event, raw_json}, state) do
     with {:ok, msg} <- Jason.decode(raw_json) do
+      t = msg["t"]
+      # Only log non-noisy events; heartbeat events are handled by Gateway
+      if t && t not in ["READY", nil] do
+        Logger.debug("[Kyber.Plugin.Discord] event: #{t}")
+      end
       state = handle_gateway_message(msg, state)
       {:noreply, state}
     else
-      _ -> {:noreply, state}
+      _ ->
+        Logger.warning("[Kyber.Plugin.Discord] failed to decode event JSON")
+        {:noreply, state}
     end
   end
 
@@ -252,18 +259,43 @@ defmodule Kyber.Plugin.Discord do
     %{state | session_id: session_id, sequence: seq}
   end
 
-  defp handle_gateway_message(%{"op" => @op_dispatch, "t" => "MESSAGE_CREATE", "d" => data, "s" => seq}, state) do
-    # Ignore messages from bots (including ourselves)
-    unless get_in(data, ["author", "bot"]) do
-      delta = build_message_delta(data)
-      try do
-        Kyber.Core.emit(state.core, delta)
-      rescue
-        e -> Logger.error("[Kyber.Plugin.Discord] failed to emit delta: #{inspect(e)}")
-      end
-    end
+  # Bot user ID for mention detection / self-ignore
+  @bot_user_id "1483371308606816316"
+  # Liet's bot ID — treat as a peer, not a bot to ignore
+  @liet_user_id "1466660860582821995"
 
-    %{state | sequence: seq}
+  defp handle_gateway_message(%{"op" => @op_dispatch, "t" => "MESSAGE_CREATE", "d" => data, "s" => seq}, state) do
+    author_id = get_in(data, ["author", "id"]) || ""
+    is_bot = get_in(data, ["author", "bot"]) || false
+    content = data["content"] || ""
+    guild_id = data["guild_id"]
+
+    # Ignore our own messages. Allow Liet (sibling bot). Ignore other bots.
+    is_self = author_id == @bot_user_id
+    is_liet = author_id == @liet_user_id
+    skip = is_self || (is_bot && !is_liet)
+
+    if skip do
+      %{state | sequence: seq}
+    else
+      # Only respond to @mentions or DMs (no guild_id = DM)
+      is_dm = is_nil(guild_id)
+      is_mentioned = String.contains?(content, "<@#{@bot_user_id}>") or String.contains?(content, "<@!#{@bot_user_id}>")
+
+      if is_dm or is_mentioned do
+        delta = build_message_delta(data)
+        Logger.debug("[Kyber.Plugin.Discord] emitting message.received delta: #{delta.id}")
+        try do
+          Kyber.Core.emit(state.core, delta)
+        rescue
+          e -> Logger.error("[Kyber.Plugin.Discord] failed to emit delta: #{inspect(e)}")
+        end
+      else
+        Logger.debug("[Kyber.Plugin.Discord] ignoring message (no mention, not DM)")
+      end
+
+      %{state | sequence: seq}
+    end
   end
 
   defp handle_gateway_message(%{"op" => @op_dispatch, "s" => seq}, state) when not is_nil(seq) do

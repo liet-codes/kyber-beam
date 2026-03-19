@@ -56,15 +56,15 @@ defmodule Kyber.Reducer do
   end
 
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "llm.response"} = delta) do
-    # Extract the channel from the parent delta's origin (stored in the effect)
+    # Extract the channel from the delta origin or payload (fallback)
     # Emit a :send_message effect so the response gets routed back to the caller
     content = Map.get(delta.payload, "content", "")
 
-    # Derive channel_id from the delta origin (if it's a channel origin)
+    # Derive channel_id from origin first, then payload fallback
     channel_id =
       case delta.origin do
         {:channel, "discord", cid, _} -> cid
-        _ -> nil
+        _ -> Map.get(delta.payload, "channel_id")
       end
 
     effects =
