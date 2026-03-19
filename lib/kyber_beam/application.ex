@@ -35,6 +35,11 @@ defmodule KyberBeam.Application do
          core: Kyber.Core,
          heartbeat_interval: heartbeat_interval},
 
+        # Memory consolidator — must start after Delta.Store and Knowledge
+        {Kyber.Memory.Consolidator,
+         name: Kyber.Memory.Consolidator,
+         core: Kyber.Core},
+
         # LLM plugin (Anthropic API)
         {Kyber.Plugin.LLM,
          core: Kyber.Core,
