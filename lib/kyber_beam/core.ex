@@ -56,8 +56,23 @@ defmodule Kyber.Core do
   @spec emit(Supervisor.supervisor(), Kyber.Delta.t()) :: :ok
   def emit(core \\ __MODULE__, %Kyber.Delta{} = delta) do
     store = store_name(core)
-    Kyber.Delta.Store.append(store, delta)
+
+    if persist_delta?(delta) do
+      Kyber.Delta.Store.append(store, delta)
+    else
+      # Ephemeral deltas skip disk persistence but still broadcast to
+      # subscribers (PipelineWirer → reducer → effects). This keeps the
+      # pipeline live without bloating the JSONL log.
+      Kyber.Delta.Store.broadcast_only(store, delta)
+    end
   end
+
+  # Deltas that should NOT be persisted to the JSONL store.
+  # cron.fired deltas accumulate at ~2.6/sec and overwhelm the store
+  # (400K+ in 42 hours). They still need to reach the reducer for
+  # heartbeat triggers, so we broadcast without writing to disk.
+  @ephemeral_kinds ~w(cron.fired)
+  defp persist_delta?(%Kyber.Delta{kind: kind}), do: kind not in @ephemeral_kinds
 
   @doc "Register an effect handler with the executor."
   @spec register_effect_handler(Supervisor.supervisor(), atom(), (map() -> any())) :: :ok

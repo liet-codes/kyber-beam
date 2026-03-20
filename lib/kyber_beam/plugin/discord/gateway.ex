@@ -31,6 +31,7 @@ defmodule Kyber.Plugin.Discord.Gateway do
   # Discord opcodes
   @op_heartbeat 1
   @op_identify 2
+  @op_presence_update 3
   @op_hello 10
   @op_heartbeat_ack 11
 
@@ -49,6 +50,44 @@ defmodule Kyber.Plugin.Discord.Gateway do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts)
+  end
+
+  @doc "Send a presence/status update via the Gateway WebSocket."
+  @spec send_presence_update(pid(), map()) :: :ok
+  def send_presence_update(pid, presence) do
+    GenServer.cast(pid, {:presence_update, presence})
+  end
+
+  @doc """
+  Build an OP 3 STATUS_UPDATE payload.
+
+  ## Keys in presence map
+    * `:status` - "online", "idle", "dnd", "invisible" (default: "online")
+    * `:game_name` - activity name (optional)
+    * `:game_type` - activity type: 0=Playing, 1=Streaming, 2=Listening, 3=Watching, 5=Competing (default: 0)
+  """
+  @spec build_presence_update(map()) :: map()
+  def build_presence_update(presence) do
+    status = Map.get(presence, :status, "online")
+    game_name = Map.get(presence, :game_name)
+    game_type = Map.get(presence, :game_type, 0)
+
+    activities =
+      if game_name do
+        [%{"name" => game_name, "type" => game_type}]
+      else
+        []
+      end
+
+    %{
+      "op" => @op_presence_update,
+      "d" => %{
+        "since" => nil,
+        "activities" => activities,
+        "status" => status,
+        "afk" => false
+      }
+    }
   end
 
   # ── GenServer callbacks ───────────────────────────────────────────────────
@@ -131,6 +170,23 @@ defmodule Kyber.Plugin.Discord.Gateway do
 
   def handle_info(:heartbeat, state) do
     # Not connected — discard stale heartbeat
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_cast({:presence_update, presence}, %{status: :connected} = state) do
+    payload = build_presence_update(presence)
+
+    case send_ws_frame(state, {:text, Jason.encode!(payload)}) do
+      {:ok, state} -> {:noreply, state}
+      {:error, reason, state} ->
+        Logger.error("[Discord.Gateway] presence update failed: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
+
+  def handle_cast({:presence_update, _presence}, state) do
+    Logger.warning("[Discord.Gateway] cannot update presence: not connected")
     {:noreply, state}
   end
 

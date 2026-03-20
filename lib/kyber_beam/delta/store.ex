@@ -39,10 +39,16 @@ defmodule Kyber.Delta.Store do
     )
   end
 
-  @doc "Append a delta to the store. Broadcasts to all subscribers."
+  @doc "Append a delta to the store. Persists to disk and broadcasts to all subscribers."
   @spec append(GenServer.server(), Kyber.Delta.t()) :: :ok
   def append(pid, %Kyber.Delta{} = delta) do
     GenServer.call(pid, {:append, delta})
+  end
+
+  @doc "Broadcast a delta to subscribers without persisting to disk."
+  @spec broadcast_only(GenServer.server(), Kyber.Delta.t()) :: :ok
+  def broadcast_only(pid, %Kyber.Delta{} = delta) do
+    GenServer.call(pid, {:broadcast_only, delta})
   end
 
   @doc """
@@ -104,6 +110,14 @@ defmodule Kyber.Delta.Store do
     new_deltas = trim_memory(state.deltas ++ [delta], state.max_memory_deltas)
     state = %{state | deltas: new_deltas}
 
+    broadcast(state, delta)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:broadcast_only, delta}, _from, state) do
+    # Broadcast to subscribers (PipelineWirer etc.) without writing to disk
+    # or adding to in-memory list. Used for ephemeral deltas like cron.fired.
     broadcast(state, delta)
     {:reply, :ok, state}
   end

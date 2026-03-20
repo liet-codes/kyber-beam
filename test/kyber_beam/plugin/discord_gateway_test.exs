@@ -192,4 +192,44 @@ defmodule Kyber.Plugin.Discord.GatewayTest do
       assert {:hello, 41250} = Kyber.Plugin.Discord.parse_gateway_message(hello)
     end
   end
+
+  # ── Feature 6: Presence/status ───────────────────────────────────────────
+
+  describe "presence update payload" do
+    test "build_presence_update/1 creates valid OP 3 payload" do
+      payload = Gateway.build_presence_update(%{status: "online", game_name: "Kyber", game_type: 0})
+      assert payload["op"] == 3
+      assert payload["d"]["status"] == "online"
+      assert payload["d"]["afk"] == false
+      [activity] = payload["d"]["activities"]
+      assert activity["name"] == "Kyber"
+      assert activity["type"] == 0
+    end
+
+    test "build_presence_update/1 defaults to online with no activity" do
+      payload = Gateway.build_presence_update(%{})
+      assert payload["d"]["status"] == "online"
+      assert payload["d"]["activities"] == []
+    end
+
+    test "build_presence_update/1 supports all status types" do
+      for status <- ["online", "idle", "dnd", "invisible"] do
+        payload = Gateway.build_presence_update(%{status: status})
+        assert payload["d"]["status"] == status
+      end
+    end
+
+    test "build_presence_update/1 supports activity types" do
+      for {type, name} <- [{0, "Playing"}, {1, "Streaming"}, {2, "Listening"}, {3, "Watching"}, {5, "Competing"}] do
+        payload = Gateway.build_presence_update(%{game_name: name, game_type: type})
+        [activity] = payload["d"]["activities"]
+        assert activity["type"] == type
+        assert activity["name"] == name
+      end
+    end
+
+    test "send_presence_update/2 function exists" do
+      assert function_exported?(Gateway, :send_presence_update, 2)
+    end
+  end
 end

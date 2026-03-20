@@ -33,6 +33,9 @@ defmodule Kyber.Plugin.Discord do
   @op_hello 10
   @op_heartbeat_ack 11
 
+  # Max Discord message length (characters)
+  @max_message_length 2000
+
   # Intents: GUILDS (1) | GUILD_MESSAGES (512) | DIRECT_MESSAGES (4096) | MESSAGE_CONTENT (32768)
   # = 1 + 512 + 4096 + 32768 = 37377
   # Matches the TypeScript kyber build. Do NOT include GUILD_MEMBERS (2) — it's privileged.
@@ -49,22 +52,152 @@ defmodule Kyber.Plugin.Discord do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @doc "Send a message to a Discord channel via REST API."
-  @spec send_message(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
-  def send_message(token, channel_id, content) do
-    url = "#{@discord_api_base}/channels/#{channel_id}/messages"
-    headers = [{"Authorization", "Bot #{token}"}, {"Content-Type", "application/json"}]
-    body = %{"content" => content}
+  @doc """
+  Send a message to a Discord channel via REST API.
 
-    case Req.post(url, headers: headers, json: body) do
+  Automatically chunks content >2000 characters. Supports optional reply
+  threading and embeds.
+
+  ## Options
+    * `:reply_to` - message ID to reply to (adds message_reference)
+    * `:embeds` - list of embed maps (title, description, color, fields, etc.)
+  """
+  @spec send_message(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def send_message(token, channel_id, content, opts \\ []) do
+    reply_to = Keyword.get(opts, :reply_to)
+    embeds = Keyword.get(opts, :embeds)
+    chunks = chunk_message(content)
+
+    chunks
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {chunk, idx}, :ok ->
+      # Only first chunk gets reply_to and embeds
+      chunk_opts = if idx == 0, do: [reply_to: reply_to, embeds: embeds], else: []
+      body = build_message_body(chunk, chunk_opts)
+
+      case post_message(token, channel_id, body) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  @doc "Send a typing indicator to a Discord channel."
+  @spec send_typing(String.t(), String.t()) :: :ok | {:error, term()}
+  def send_typing(token, channel_id) do
+    url = "#{@discord_api_base}/channels/#{channel_id}/typing"
+    headers = [{"Authorization", "Bot #{token}"}]
+
+    case Req.post(url, headers: headers, json: %{}) do
       {:ok, %{status: status}} when status in 200..299 -> :ok
-      {:ok, %{status: status, body: body}} ->
-        Logger.warning("[Kyber.Plugin.Discord] send_message failed: #{status} #{inspect(body)}")
-        {:error, %{status: status, body: body}}
+      {:ok, %{status: status, body: body}} -> {:error, %{status: status, body: body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Add an emoji reaction to a message."
+  @spec add_reaction(String.t(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def add_reaction(token, channel_id, message_id, emoji) do
+    url = reaction_url(channel_id, message_id, emoji)
+    headers = [{"Authorization", "Bot #{token}"}]
+
+    case Req.put(url, headers: headers, json: %{}) do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, %{status: status, body: body}} -> {:error, %{status: status, body: body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Remove the bot's emoji reaction from a message."
+  @spec remove_reaction(String.t(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def remove_reaction(token, channel_id, message_id, emoji) do
+    url = reaction_url(channel_id, message_id, emoji)
+    headers = [{"Authorization", "Bot #{token}"}]
+
+    case Req.delete(url, headers: headers) do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, %{status: status, body: body}} -> {:error, %{status: status, body: body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Build the URL for a reaction endpoint. Emoji is URL-encoded."
+  @spec reaction_url(String.t(), String.t(), String.t()) :: String.t()
+  def reaction_url(channel_id, message_id, emoji) do
+    encoded = URI.encode(emoji)
+    "#{@discord_api_base}/channels/#{channel_id}/messages/#{message_id}/reactions/#{encoded}/@me"
+  end
+
+  @doc "Fetch message history from a Discord channel."
+  @spec fetch_messages(String.t(), String.t(), keyword()) :: {:ok, list()} | {:error, term()}
+  def fetch_messages(token, channel_id, opts \\ []) do
+    url = fetch_messages_url(channel_id, opts)
+    headers = [{"Authorization", "Bot #{token}"}]
+
+    case Req.get(url, headers: headers) do
+      {:ok, %{status: 200, body: body}} -> {:ok, body}
+      {:ok, %{status: status, body: body}} -> {:error, %{status: status, body: body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Build the URL for fetching channel messages with query params."
+  @spec fetch_messages_url(String.t(), keyword()) :: String.t()
+  def fetch_messages_url(channel_id, opts) do
+    limit = min(Keyword.get(opts, :limit, 50), 100)
+    params = [{"limit", to_string(limit)}]
+    params = if b = Keyword.get(opts, :before), do: params ++ [{"before", b}], else: params
+    params = if a = Keyword.get(opts, :after), do: params ++ [{"after", a}], else: params
+    query = URI.encode_query(params)
+    "#{@discord_api_base}/channels/#{channel_id}/messages?#{query}"
+  end
+
+  @doc "Edit an existing Discord message."
+  @spec edit_message(String.t(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def edit_message(token, channel_id, message_id, new_content) do
+    url = "#{@discord_api_base}/channels/#{channel_id}/messages/#{message_id}"
+    headers = [{"Authorization", "Bot #{token}"}, {"Content-Type", "application/json"}]
+    body = %{"content" => new_content}
+
+    case Req.patch(url, headers: headers, json: body) do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, %{status: status, body: body}} -> {:error, %{status: status, body: body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Send a file/image to a Discord channel via multipart upload."
+  @spec send_file(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def send_file(token, channel_id, file_path, opts \\ []) do
+    url = "#{@discord_api_base}/channels/#{channel_id}/messages"
+    headers = [{"Authorization", "Bot #{token}"}]
+    content = Keyword.get(opts, :content)
+
+    file_content = File.read!(file_path)
+    filename = Path.basename(file_path)
+
+    payload_json = if content, do: %{"content" => content}, else: %{}
+
+    form_multipart = [
+      {"files[0]", {file_content, filename: filename, content_type: "application/octet-stream"}},
+      {"payload_json", Jason.encode!(payload_json)}
+    ]
+
+    case Req.post(url, headers: headers, form_multipart: form_multipart) do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, %{status: status, body: resp_body}} ->
+        Logger.warning("[Kyber.Plugin.Discord] send_file failed: #{status} #{inspect(resp_body)}")
+        {:error, %{status: status, body: resp_body}}
       {:error, reason} ->
-        Logger.error("[Kyber.Plugin.Discord] send_message HTTP error: #{inspect(reason)}")
+        Logger.error("[Kyber.Plugin.Discord] send_file HTTP error: #{inspect(reason)}")
         {:error, reason}
     end
+  end
+
+  @doc "Update the bot's presence/status. Forwards to Gateway."
+  @spec update_presence(GenServer.server(), map()) :: :ok
+  def update_presence(server \\ __MODULE__, presence) do
+    GenServer.cast(server, {:update_presence, presence})
   end
 
   @doc "Parse a raw Discord Gateway message (JSON map) into a structured event."
@@ -96,13 +229,16 @@ defmodule Kyber.Plugin.Discord do
     guild_id = data["guild_id"]
     author_username = get_in(data, ["author", "username"])
 
+    attachments = extract_attachments(data["attachments"])
+
     payload = %{
       "text" => content,
       "channel_id" => channel_id,
       "author_id" => author_id,
       "guild_id" => guild_id,
       "username" => author_username,
-      "message_id" => data["id"]
+      "message_id" => data["id"],
+      "attachments" => attachments
     }
 
     Kyber.Delta.new(
@@ -110,6 +246,43 @@ defmodule Kyber.Plugin.Discord do
       payload,
       {:channel, "discord", channel_id, author_id}
     )
+  end
+
+  @doc """
+  Build the JSON body for a Discord message POST.
+
+  ## Options
+    * `:reply_to` - message ID to reply to
+    * `:embeds` - list of embed maps
+  """
+  @spec build_message_body(String.t(), keyword()) :: map()
+  def build_message_body(content, opts \\ []) do
+    body = %{"content" => content}
+
+    body =
+      case Keyword.get(opts, :reply_to) do
+        nil -> body
+        msg_id -> Map.put(body, "message_reference", %{"message_id" => msg_id})
+      end
+
+    case Keyword.get(opts, :embeds) do
+      nil -> body
+      [] -> body
+      embeds -> Map.put(body, "embeds", embeds)
+    end
+  end
+
+  @doc "Split content into <=2000 character chunks, breaking at newlines when possible."
+  @spec chunk_message(nil | String.t()) :: [String.t()]
+  def chunk_message(nil), do: [""]
+  def chunk_message(""), do: [""]
+
+  def chunk_message(content) when is_binary(content) do
+    if String.length(content) <= @max_message_length do
+      [content]
+    else
+      do_chunk(content, [])
+    end
   end
 
   @doc "Build the IDENTIFY payload for the Gateway."
@@ -149,8 +322,8 @@ defmodule Kyber.Plugin.Discord do
     }
 
     if token do
-      Logger.info("[Kyber.Plugin.Discord] token found, registering effect handler")
-      register_send_handler(core, token)
+      Logger.info("[Kyber.Plugin.Discord] token found, registering effect handlers")
+      register_effect_handlers(core, token)
 
       if connect do
         {:ok, gateway_pid} = Kyber.Plugin.Discord.Gateway.start_link(
@@ -192,6 +365,15 @@ defmodule Kyber.Plugin.Discord do
   end
 
   @impl true
+  def handle_cast({:update_presence, presence}, state) do
+    if state.gateway_pid && Process.alive?(state.gateway_pid) do
+      Kyber.Plugin.Discord.Gateway.send_presence_update(state.gateway_pid, presence)
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
   def terminate(reason, state) do
     Logger.info("[Kyber.Plugin.Discord] terminating: #{inspect(reason)}")
 
@@ -211,8 +393,8 @@ defmodule Kyber.Plugin.Discord do
       Application.get_env(:kyber_beam, :discord_bot_token)
   end
 
-  defp register_send_handler(core, token) do
-    handler = fn effect ->
+  defp register_effect_handlers(core, token) do
+    send_handler = fn effect ->
       channel_id = get_in(effect, [:payload, "channel_id"]) ||
                    get_in(effect, ["channel_id"]) ||
                    channel_from_origin(Map.get(effect, :origin))
@@ -221,22 +403,79 @@ defmodule Kyber.Plugin.Discord do
                 get_in(effect, [:payload, "text"]) ||
                 get_in(effect, ["content"])
 
+      reply_to = get_in(effect, [:payload, "reply_to"])
+      opts = if reply_to, do: [reply_to: reply_to], else: []
+
       if channel_id && content do
-        send_message(token, channel_id, content)
+        send_message(token, channel_id, content, opts)
       else
         Logger.warning("[Kyber.Plugin.Discord] send_message effect missing channel_id or content")
         {:error, :missing_params}
       end
     end
 
+    typing_handler = fn effect ->
+      channel_id = get_in(effect, [:payload, "channel_id"]) ||
+                   channel_from_origin(Map.get(effect, :origin))
+
+      if channel_id, do: send_typing(token, channel_id), else: {:error, :missing_channel_id}
+    end
+
+    add_reaction_handler = fn effect ->
+      channel_id = get_in(effect, [:payload, "channel_id"])
+      message_id = get_in(effect, [:payload, "message_id"])
+      emoji = get_in(effect, [:payload, "emoji"])
+
+      if channel_id && message_id && emoji do
+        add_reaction(token, channel_id, message_id, emoji)
+      else
+        {:error, :missing_params}
+      end
+    end
+
+    remove_reaction_handler = fn effect ->
+      channel_id = get_in(effect, [:payload, "channel_id"])
+      message_id = get_in(effect, [:payload, "message_id"])
+      emoji = get_in(effect, [:payload, "emoji"])
+
+      if channel_id && message_id && emoji do
+        remove_reaction(token, channel_id, message_id, emoji)
+      else
+        {:error, :missing_params}
+      end
+    end
+
+    edit_handler = fn effect ->
+      channel_id = get_in(effect, [:payload, "channel_id"])
+      message_id = get_in(effect, [:payload, "message_id"])
+      content = get_in(effect, [:payload, "content"])
+
+      if channel_id && message_id && content do
+        edit_message(token, channel_id, message_id, content)
+      else
+        {:error, :missing_params}
+      end
+    end
+
+    handlers = [
+      {:send_message, send_handler},
+      {:send_typing, typing_handler},
+      {:add_reaction, add_reaction_handler},
+      {:remove_reaction, remove_reaction_handler},
+      {:edit_message, edit_handler}
+    ]
+
     try do
-      Kyber.Core.register_effect_handler(core, :send_message, handler)
-      Logger.info("[Kyber.Plugin.Discord] :send_message handler registered")
+      for {type, handler} <- handlers do
+        Kyber.Core.register_effect_handler(core, type, handler)
+      end
+
+      Logger.info("[Kyber.Plugin.Discord] effect handlers registered: #{inspect(Enum.map(handlers, &elem(&1, 0)))}")
     catch
       :exit, reason ->
-        Logger.warning("[Kyber.Plugin.Discord] could not register handler (core not ready): #{inspect(reason)}")
+        Logger.warning("[Kyber.Plugin.Discord] could not register handlers (core not ready): #{inspect(reason)}")
       kind, reason ->
-        Logger.error("[Kyber.Plugin.Discord] failed to register handler: #{kind} #{inspect(reason)}")
+        Logger.error("[Kyber.Plugin.Discord] failed to register handlers: #{kind} #{inspect(reason)}")
     end
   end
 
@@ -308,4 +547,61 @@ defmodule Kyber.Plugin.Discord do
 
   defp channel_from_origin({:channel, "discord", channel_id, _}), do: channel_id
   defp channel_from_origin(_), do: nil
+
+  defp post_message(token, channel_id, body) do
+    url = "#{@discord_api_base}/channels/#{channel_id}/messages"
+    headers = [{"Authorization", "Bot #{token}"}, {"Content-Type", "application/json"}]
+
+    case Req.post(url, headers: headers, json: body) do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, %{status: status, body: resp_body}} ->
+        Logger.warning("[Kyber.Plugin.Discord] send_message failed: #{status} #{inspect(resp_body)}")
+        {:error, %{status: status, body: resp_body}}
+      {:error, reason} ->
+        Logger.error("[Kyber.Plugin.Discord] send_message HTTP error: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp do_chunk("", acc), do: Enum.reverse(acc)
+
+  defp do_chunk(content, acc) do
+    if String.length(content) <= @max_message_length do
+      Enum.reverse([content | acc])
+    else
+      window = String.slice(content, 0, @max_message_length)
+
+      case String.split(window, "\n") do
+        [_no_newlines] ->
+          # No newline found — hard break at max length
+          rest = String.slice(content, @max_message_length, String.length(content))
+          do_chunk(rest, [window | acc])
+
+        lines ->
+          # Drop the last (potentially incomplete) line, keep complete lines
+          chunk_lines = Enum.drop(lines, -1)
+          chunk = Enum.join(chunk_lines, "\n")
+
+          if chunk == "" do
+            # Newline only at position 0 — hard break
+            rest = String.slice(content, @max_message_length, String.length(content))
+            do_chunk(rest, [window | acc])
+          else
+            rest = String.slice(content, String.length(chunk) + 1, String.length(content))
+            do_chunk(rest, [chunk | acc])
+          end
+      end
+    end
+  end
+
+  @attachment_fields ~w(id filename content_type size url proxy_url width height)
+
+  defp extract_attachments(nil), do: []
+  defp extract_attachments([]), do: []
+
+  defp extract_attachments(attachments) when is_list(attachments) do
+    Enum.map(attachments, fn att ->
+      Map.take(att, @attachment_fields)
+    end)
+  end
 end
