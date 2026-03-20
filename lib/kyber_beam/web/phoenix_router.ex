@@ -6,6 +6,8 @@ defmodule Kyber.Web.PhoenixRouter do
   - `GET /`            → redirect to /dashboard
   - `GET /dashboard`   → Kyber.Web.DashboardLive (overview)
   - `GET /sys`         → Phoenix LiveDashboard (system metrics)
+  - `POST /api/familiard/escalate` → Kyber.Web.FamiliardController (bearer auth + sig)
+  - `GET  /api/knowledge/notes`    → Kyber.Web.KnowledgeController (bearer auth)
   """
 
   use Phoenix.Router
@@ -23,6 +25,9 @@ defmodule Kyber.Web.PhoenixRouter do
 
   pipeline :api do
     plug :accepts, ["json"]
+    # Bearer token auth — set KYBER_API_TOKEN env var or :api_token app config.
+    # When no token is configured (dev mode), all requests pass through with a warning.
+    plug Kyber.Web.Plugs.BearerAuth
   end
 
   scope "/" do

@@ -35,6 +35,14 @@ defmodule Kyber.Web.Endpoint do
     from: {:phoenix_live_dashboard, "priv/static"},
     gzip: false
 
+  # Parse request bodies. The custom body_reader caches the raw bytes in
+  # conn.private[:raw_body] for webhook signature verification (familiard).
+  plug Plug.Parsers,
+    parsers: [:urlencoded, :multipart, :json],
+    pass: ["*/*"],
+    body_reader: {Kyber.Web.Plugs.RawBodyCache, :read_body, []},
+    json_decoder: Phoenix.json_library()
+
   # Session
   plug Plug.Session,
     store: :cookie,
