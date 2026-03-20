@@ -121,6 +121,19 @@ defmodule Kyber.Plugin.Discord do
     end
   end
 
+  @doc "Delete a message. Bots can always delete their own messages; deleting others requires ManageMessages."
+  @spec delete_message(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def delete_message(token, channel_id, message_id) do
+    url = "#{@discord_api_base}/channels/#{channel_id}/messages/#{message_id}"
+    headers = [{"Authorization", "Bot #{token}"}]
+
+    case Req.delete(url, headers: headers) do
+      {:ok, %{status: 204}} -> :ok
+      {:ok, %{status: status, body: body}} -> {:error, %{status: status, body: body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @doc "Build the URL for a reaction endpoint. Emoji is URL-encoded."
   @spec reaction_url(String.t(), String.t(), String.t()) :: String.t()
   def reaction_url(channel_id, message_id, emoji) do
@@ -457,12 +470,24 @@ defmodule Kyber.Plugin.Discord do
       end
     end
 
+    delete_handler = fn effect ->
+      channel_id = get_in(effect, [:payload, "channel_id"])
+      message_id = get_in(effect, [:payload, "message_id"])
+
+      if channel_id && message_id do
+        delete_message(token, channel_id, message_id)
+      else
+        {:error, :missing_params}
+      end
+    end
+
     handlers = [
       {:send_message, send_handler},
       {:send_typing, typing_handler},
       {:add_reaction, add_reaction_handler},
       {:remove_reaction, remove_reaction_handler},
-      {:edit_message, edit_handler}
+      {:edit_message, edit_handler},
+      {:delete_message, delete_handler}
     ]
 
     try do
