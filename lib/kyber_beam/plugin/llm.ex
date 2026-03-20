@@ -571,7 +571,18 @@ defmodule Kyber.Plugin.LLM do
           ""
       end
 
-    (soul_content || "") <> long_term_memory <> memory_context
+    vault_instruction = """
+
+## MANDATORY: Check Your Vault First
+
+Before answering ANY question about concepts, ideas, the Groovy Commutator, Wet Math, D₂, \
+or shared work: you MUST call `memory_read` on relevant files in `concepts/` BEFORE responding. \
+Also call `memory_list` if you're unsure what's there. Your vault is ground truth. \
+Do NOT answer from general knowledge or vibes — if it's not in your vault, say so honestly. \
+Confabulating a plausible-sounding answer when you have files you didn't check is a failure mode.
+"""
+
+    (soul_content || "") <> long_term_memory <> memory_context <> vault_instruction
   end
 
   # Call Kyber.Knowledge safely — returns nil if not running.

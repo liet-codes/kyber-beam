@@ -34,14 +34,37 @@ defmodule Kyber.Reducer do
   """
   @spec reduce(Kyber.State.t(), Kyber.Delta.t()) :: result()
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "message.received"} = delta) do
-    effect = %{
+    channel_id =
+      case delta.origin do
+        {:channel, "discord", cid, _} -> cid
+        _ -> Map.get(delta.payload, "channel_id")
+      end
+
+    message_id = Map.get(delta.payload, "message_id")
+
+    # Show typing indicator while LLM processes
+    typing_effect =
+      if channel_id do
+        %{type: :send_typing, origin: delta.origin, payload: %{"channel_id" => channel_id}}
+      end
+
+    # React with 👀 to acknowledge receipt
+    reaction_effect =
+      if channel_id && message_id do
+        %{type: :add_reaction, origin: delta.origin,
+          payload: %{"channel_id" => channel_id, "message_id" => message_id, "emoji" => "👀"}}
+      end
+
+    llm_effect = %{
       type: :llm_call,
       delta_id: delta.id,
       payload: delta.payload,
       origin: delta.origin
     }
 
-    {state, [effect]}
+    effects = Enum.reject([typing_effect, reaction_effect, llm_effect], &is_nil/1)
+
+    {state, effects}
   end
 
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "error.route"} = delta) do

@@ -517,11 +517,12 @@ defmodule Kyber.Plugin.Discord do
     if skip do
       %{state | sequence: seq}
     else
-      # Only respond to @mentions or DMs (no guild_id = DM)
+      # Respond to @mentions, DMs, or replies to our messages
       is_dm = is_nil(guild_id)
       is_mentioned = String.contains?(content, "<@#{@bot_user_id}>") or String.contains?(content, "<@!#{@bot_user_id}>")
+      is_reply_to_us = get_in(data, ["referenced_message", "author", "id"]) == @bot_user_id
 
-      if is_dm or is_mentioned do
+      if is_dm or is_mentioned or is_reply_to_us do
         delta = build_message_delta(data)
         Logger.debug("[Kyber.Plugin.Discord] emitting message.received delta: #{delta.id}")
         try do
