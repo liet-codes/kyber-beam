@@ -124,15 +124,29 @@ defmodule Kyber.Plugin.Discord do
   @doc "Delete a message. Bots can always delete their own messages; deleting others requires ManageMessages."
   @spec delete_message(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
   def delete_message(token, channel_id, message_id) do
-    url = "#{@discord_api_base}/channels/#{channel_id}/messages/#{message_id}"
-    headers = [{"Authorization", "Bot #{token}"}]
+    with :ok <- validate_snowflake(channel_id),
+         :ok <- validate_snowflake(message_id) do
+      url = "#{@discord_api_base}/channels/#{channel_id}/messages/#{message_id}"
+      headers = [{"Authorization", "Bot #{token}"}]
 
-    case Req.delete(url, headers: headers) do
-      {:ok, %{status: 204}} -> :ok
-      {:ok, %{status: status, body: body}} -> {:error, %{status: status, body: body}}
-      {:error, reason} -> {:error, reason}
+      case Req.delete(url, headers: headers) do
+        # Discord returns 204 No Content on successful delete
+        {:ok, %{status: 204}} -> :ok
+        {:ok, %{status: status, body: body}} ->
+          Logger.warning("[Kyber.Plugin.Discord] delete_message failed: status=#{status} body=#{inspect(body)}")
+          {:error, %{status: status, body: body}}
+        {:error, reason} ->
+          Logger.warning("[Kyber.Plugin.Discord] delete_message transport error: #{inspect(reason)}")
+          {:error, reason}
+      end
     end
   end
+
+  @snowflake_pattern ~r/^[0-9]{17,20}$/
+  defp validate_snowflake(id) when is_binary(id) do
+    if Regex.match?(@snowflake_pattern, id), do: :ok, else: {:error, :invalid_snowflake_id}
+  end
+  defp validate_snowflake(_), do: {:error, :invalid_snowflake_id}
 
   @doc "Build the URL for a reaction endpoint. Emoji is URL-encoded."
   @spec reaction_url(String.t(), String.t(), String.t()) :: String.t()
@@ -477,6 +491,7 @@ defmodule Kyber.Plugin.Discord do
       if channel_id && message_id do
         delete_message(token, channel_id, message_id)
       else
+        Logger.warning("[Kyber.Plugin.Discord] delete_message effect missing channel_id or message_id")
         {:error, :missing_params}
       end
     end

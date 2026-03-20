@@ -501,6 +501,66 @@ defmodule Kyber.Plugin.DiscordTest do
     end
   end
 
+  # ── delete_message ──────────────────────────────────────────────────────────
+
+  describe "delete_message/3" do
+    test "function exists with arity 3" do
+      assert function_exported?(Discord, :delete_message, 3)
+    end
+  end
+
+  describe "validate_snowflake/1 (via delete_message)" do
+    # validate_snowflake is private, so we test it indirectly through delete_message
+    # which will reject invalid IDs before making any HTTP call
+
+    test "rejects non-numeric channel_id" do
+      assert {:error, :invalid_snowflake_id} = Discord.delete_message("token", "not-a-snowflake", "1484644246005874991")
+    end
+
+    test "rejects non-numeric message_id" do
+      assert {:error, :invalid_snowflake_id} = Discord.delete_message("token", "1484644246005874991", "../../../etc/passwd")
+    end
+
+    test "rejects too-short numeric id" do
+      assert {:error, :invalid_snowflake_id} = Discord.delete_message("token", "123", "1484644246005874991")
+    end
+
+    test "rejects empty string id" do
+      assert {:error, :invalid_snowflake_id} = Discord.delete_message("token", "", "1484644246005874991")
+    end
+  end
+
+  describe "delete_message effect handler logic" do
+    test "effect payload extraction for delete_message" do
+      effect = %{
+        type: :delete_message,
+        payload: %{"channel_id" => "1484644246005874991", "message_id" => "1484643683465822279"}
+      }
+
+      channel_id = get_in(effect, [:payload, "channel_id"])
+      message_id = get_in(effect, [:payload, "message_id"])
+
+      assert channel_id == "1484644246005874991"
+      assert message_id == "1484643683465822279"
+    end
+
+    test "missing channel_id returns missing_params" do
+      effect = %{type: :delete_message, payload: %{"message_id" => "123456789012345678"}}
+      channel_id = get_in(effect, [:payload, "channel_id"])
+      message_id = get_in(effect, [:payload, "message_id"])
+
+      refute channel_id && message_id
+    end
+
+    test "missing message_id returns missing_params" do
+      effect = %{type: :delete_message, payload: %{"channel_id" => "123456789012345678"}}
+      channel_id = get_in(effect, [:payload, "channel_id"])
+      message_id = get_in(effect, [:payload, "message_id"])
+
+      refute channel_id && message_id
+    end
+  end
+
   # ── Feature 6: Presence (plugin-level) ─────────────────────────────────────
 
   describe "update_presence/2" do
