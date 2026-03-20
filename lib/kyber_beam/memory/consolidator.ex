@@ -63,7 +63,7 @@ defmodule Kyber.Memory.Consolidator do
     consolidation_interval_ms: 3_600_000,
     max_persistent: 8,
     max_drifting: 8,
-    salience_model: "claude-haiku-4-5-20250514",
+    salience_model: "claude-sonnet-4-20250514",
     decay_rate: 0.95,
     reinforcement_bump: 0.1,
     min_salience: 0.05
@@ -267,8 +267,18 @@ defmodule Kyber.Memory.Consolidator do
     case load_auth_config() do
       {:ok, auth} ->
         Task.start(fn ->
-          results = score_paths_for_task(paths, auth, knowledge, model)
-          send(server, {:scoring_complete, results})
+          try do
+            results = score_paths_for_task(paths, auth, knowledge, model)
+            send(server, {:scoring_complete, results})
+          rescue
+            e ->
+              Logger.error("[Kyber.Memory.Consolidator] scoring task crashed: #{inspect(e)}")
+              send(server, {:scoring_complete, []})
+          catch
+            kind, reason ->
+              Logger.error("[Kyber.Memory.Consolidator] scoring task #{kind}: #{inspect(reason)}")
+              send(server, {:scoring_complete, []})
+          end
         end)
 
         {:noreply, %{state | scoring_in_progress: true, pending_paths: []}}
@@ -295,8 +305,18 @@ defmodule Kyber.Memory.Consolidator do
       case load_auth_config() do
         {:ok, auth} ->
           Task.start(fn ->
-            results = score_paths_for_task(pending, auth, knowledge, model)
-            send(server, {:scoring_complete, results})
+            try do
+              results = score_paths_for_task(pending, auth, knowledge, model)
+              send(server, {:scoring_complete, results})
+            rescue
+              e ->
+                Logger.error("[Kyber.Memory.Consolidator] pending scoring crashed: #{inspect(e)}")
+                send(server, {:scoring_complete, []})
+            catch
+              kind, reason ->
+                Logger.error("[Kyber.Memory.Consolidator] pending scoring #{kind}: #{inspect(reason)}")
+                send(server, {:scoring_complete, []})
+            end
           end)
 
           {:noreply, %{state | scoring_in_progress: true, pending_paths: []}}
@@ -477,12 +497,21 @@ defmodule Kyber.Memory.Consolidator do
   # Called from a background Task — scores all paths and returns a list of
   # {vault_ref, salience, tags} tuples. No ETS writes happen here.
   defp score_paths_for_task(paths, auth, knowledge, model) do
+    Logger.info("[Kyber.Memory.Consolidator] scoring #{length(Enum.uniq(paths))} paths: #{inspect(Enum.uniq(paths))}")
+
     paths
     |> Enum.uniq()
     |> Enum.flat_map(fn path ->
+      Logger.debug("[Kyber.Memory.Consolidator] scoring path: #{path}")
+
       case score_path_to_result(path, auth, knowledge, model) do
-        {:ok, vault_ref, salience, tags} -> [{vault_ref, salience, tags}]
-        _ -> []
+        {:ok, vault_ref, salience, tags} ->
+          Logger.info("[Kyber.Memory.Consolidator] scored #{vault_ref}: salience=#{salience}, tags=#{inspect(tags)}")
+          [{vault_ref, salience, tags}]
+
+        :error ->
+          Logger.warning("[Kyber.Memory.Consolidator] score returned :error for #{path}")
+          []
       end
     end)
   end
