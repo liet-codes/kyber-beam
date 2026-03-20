@@ -55,10 +55,15 @@ defmodule Kyber.Reducer do
           payload: %{"channel_id" => channel_id, "message_id" => message_id, "emoji" => "👀"}}
       end
 
+    # Strip "system" from the payload before forwarding to LLM.
+    # An unauthenticated POST /api/deltas could inject a "message.received"
+    # delta with "system" set to override the system prompt (M-3 Security Audit).
+    safe_payload = Map.delete(delta.payload, "system")
+
     llm_effect = %{
       type: :llm_call,
       delta_id: delta.id,
-      payload: delta.payload,
+      payload: safe_payload,
       origin: delta.origin
     }
 

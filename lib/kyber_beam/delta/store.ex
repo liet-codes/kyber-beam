@@ -89,6 +89,16 @@ defmodule Kyber.Delta.Store do
     # (rather than a MatchError mid-init that produces a confusing crash).
     case File.open(path, [:append, :binary]) do
       {:ok, io_device} ->
+        # Restrict file permissions to owner-only (0o600).
+        # The delta log contains full conversation content, LLM responses,
+        # and metadata — it should not be world-readable.
+        # We do this after open to ensure the file exists; chmod is best-effort.
+        case File.chmod(path, 0o600) do
+          :ok -> :ok
+          {:error, reason} ->
+            Logger.warning("[Kyber.Delta.Store] could not set 0o600 on #{path}: #{inspect(reason)}")
+        end
+
         state = %{
           path: path,
           io_device: io_device,

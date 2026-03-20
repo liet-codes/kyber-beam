@@ -244,7 +244,7 @@ defmodule Kyber.Familiard do
   end
 
   defp validate_level(level) when level in ["info", "warning", "critical"],
-    do: {:ok, String.to_atom(level)}
+    do: {:ok, String.to_existing_atom(level)}
 
   defp validate_level(nil), do: {:error, :missing_level}
   defp validate_level(_), do: {:error, :invalid_level}

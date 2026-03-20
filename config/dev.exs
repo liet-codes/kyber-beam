@@ -9,4 +9,6 @@ config :kyber_beam,
 config :kyber_beam, Kyber.Web.Endpoint,
   server: true,
   debug_errors: true,
-  check_origin: false
+  check_origin: false,
+  # Dev-only placeholder — safe to have in source because prod.exs overrides it.
+  secret_key_base: "kyber_beam_dev_only_secret_key_base_at_least_64_chars_long_for_security!!"

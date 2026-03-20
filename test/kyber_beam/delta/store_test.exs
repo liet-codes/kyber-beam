@@ -1,5 +1,6 @@
 defmodule Kyber.Delta.StoreTest do
-  use ExUnit.Case, async: false
+  # Each test starts its own isolated store with a unique temp file — safe to run async.
+  use ExUnit.Case, async: true
 
   alias Kyber.Delta
   alias Kyber.Delta.Store
