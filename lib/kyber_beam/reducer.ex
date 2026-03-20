@@ -90,13 +90,19 @@ defmodule Kyber.Reducer do
         _ -> Map.get(delta.payload, "channel_id")
       end
 
+    reply_to = Map.get(delta.payload, "reply_to_message_id")
+
     effects =
       if channel_id && content != "" do
+        send_payload =
+          %{"channel_id" => channel_id, "content" => content}
+          |> then(fn p -> if reply_to, do: Map.put(p, "reply_to", reply_to), else: p end)
+
         [%{
           type: :send_message,
           delta_id: delta.id,
           origin: delta.origin,
-          payload: %{"channel_id" => channel_id, "content" => content}
+          payload: send_payload
         }]
       else
         []

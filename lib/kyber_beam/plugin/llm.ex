@@ -394,6 +394,13 @@ defmodule Kyber.Plugin.LLM do
               |> then(fn p ->
                 if channel_id, do: Map.put(p, "channel_id", channel_id), else: p
               end)
+              |> then(fn p ->
+                # Carry original message_id through for reply threading
+                case payload["message_id"] do
+                  nil -> p
+                  mid -> Map.put(p, "reply_to_message_id", mid)
+                end
+              end)
 
             # Preserve the original origin so the reducer can route the response
             delta =

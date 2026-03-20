@@ -301,81 +301,6 @@ defmodule Kyber.ToolExecutor do
     end
   end
 
-  # Fetch a human-readable display name for a pool entry (vault_ref → L0 title).
-  defp memory_display_name(mem) do
-    vault_ref = Map.get(mem, :vault_ref, "")
-
-    case knowledge_l0(vault_ref) do
-      {:ok, %{title: title}} -> "#{title} (#{vault_ref})"
-      _ -> vault_ref
-    end
-  end
-
-  defp find_memory_by_query(query) do
-    memories = Kyber.Memory.Consolidator.list_memories()
-    query_lower = String.downcase(query)
-    query_words = String.split(query_lower, ~r/\s+/, trim: true)
-
-    scored =
-      memories
-      |> Enum.map(fn mem ->
-        vault_ref = Map.get(mem, :vault_ref, "")
-        mem_tags = Enum.map(Map.get(mem, :tags, []), &String.downcase/1)
-
-        # Fetch L0 title from Knowledge for content-based matching
-        title_lower =
-          case knowledge_l0(vault_ref) do
-            {:ok, %{title: title}} -> String.downcase(title)
-            _ -> ""
-          end
-
-        ref_lower = String.downcase(vault_ref)
-
-        # Score: tag matches worth 2, title/vault_ref word matches worth 1
-        tag_score =
-          Enum.count(query_words, fn w ->
-            Enum.any?(mem_tags, &String.contains?(&1, w))
-          end) * 2
-
-        title_score =
-          Enum.count(query_words, fn w ->
-            String.contains?(title_lower, w) or String.contains?(ref_lower, w)
-          end)
-
-        total = tag_score + title_score
-        {mem, total}
-      end)
-      |> Enum.filter(fn {_mem, score} -> score > 0 end)
-      |> Enum.sort_by(fn {_mem, score} -> score end, :desc)
-
-    case scored do
-      [] ->
-        {:error, :no_match}
-
-      [{best, best_score} | rest] ->
-        # If the top match is clearly better (1.5× score), use it
-        if rest == [] or best_score > elem(hd(rest), 1) * 1.5 do
-          {:ok, best}
-        else
-          top_matches = Enum.take([{best, best_score} | rest], 3) |> Enum.map(&elem(&1, 0))
-          {:error, :ambiguous, top_matches}
-        end
-    end
-  end
-
-  # Safely call Kyber.Knowledge.get_tiered at L0.
-  defp knowledge_l0(vault_ref) do
-    if Process.whereis(Kyber.Knowledge) do
-      try do
-        Kyber.Knowledge.get_tiered(Kyber.Knowledge, vault_ref, :l0)
-      catch
-        :exit, _ -> {:error, :not_running}
-      end
-    else
-      {:error, :not_running}
-    end
-  end
-
   # ── web_fetch ─────────────────────────────────────────────────────────────
 
   def execute("web_fetch", %{"url" => url}) do
@@ -666,4 +591,81 @@ defmodule Kyber.ToolExecutor do
   end
 
   defp extract_text(body), do: inspect(body)
+
+  # ── Memory helpers (grouped below all execute/2 clauses) ─────────────────
+
+  # Fetch a human-readable display name for a pool entry (vault_ref → L0 title).
+  defp memory_display_name(mem) do
+    vault_ref = Map.get(mem, :vault_ref, "")
+
+    case knowledge_l0(vault_ref) do
+      {:ok, %{title: title}} -> "#{title} (#{vault_ref})"
+      _ -> vault_ref
+    end
+  end
+
+  defp find_memory_by_query(query) do
+    memories = Kyber.Memory.Consolidator.list_memories()
+    query_lower = String.downcase(query)
+    query_words = String.split(query_lower, ~r/\s+/, trim: true)
+
+    scored =
+      memories
+      |> Enum.map(fn mem ->
+        vault_ref = Map.get(mem, :vault_ref, "")
+        mem_tags = Enum.map(Map.get(mem, :tags, []), &String.downcase/1)
+
+        # Fetch L0 title from Knowledge for content-based matching
+        title_lower =
+          case knowledge_l0(vault_ref) do
+            {:ok, %{title: title}} -> String.downcase(title)
+            _ -> ""
+          end
+
+        ref_lower = String.downcase(vault_ref)
+
+        # Score: tag matches worth 2, title/vault_ref word matches worth 1
+        tag_score =
+          Enum.count(query_words, fn w ->
+            Enum.any?(mem_tags, &String.contains?(&1, w))
+          end) * 2
+
+        title_score =
+          Enum.count(query_words, fn w ->
+            String.contains?(title_lower, w) or String.contains?(ref_lower, w)
+          end)
+
+        total = tag_score + title_score
+        {mem, total}
+      end)
+      |> Enum.filter(fn {_mem, score} -> score > 0 end)
+      |> Enum.sort_by(fn {_mem, score} -> score end, :desc)
+
+    case scored do
+      [] ->
+        {:error, :no_match}
+
+      [{best, best_score} | rest] ->
+        # If the top match is clearly better (1.5× score), use it
+        if rest == [] or best_score > elem(hd(rest), 1) * 1.5 do
+          {:ok, best}
+        else
+          top_matches = Enum.take([{best, best_score} | rest], 3) |> Enum.map(&elem(&1, 0))
+          {:error, :ambiguous, top_matches}
+        end
+    end
+  end
+
+  # Safely call Kyber.Knowledge.get_tiered at L0.
+  defp knowledge_l0(vault_ref) do
+    if Process.whereis(Kyber.Knowledge) do
+      try do
+        Kyber.Knowledge.get_tiered(Kyber.Knowledge, vault_ref, :l0)
+      catch
+        :exit, _ -> {:error, :not_running}
+      end
+    else
+      {:error, :not_running}
+    end
+  end
 end

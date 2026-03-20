@@ -173,23 +173,6 @@ defmodule Kyber.Plugin.Discord.Gateway do
     {:noreply, state}
   end
 
-  @impl true
-  def handle_cast({:presence_update, presence}, %{status: :connected} = state) do
-    payload = build_presence_update(presence)
-
-    case send_ws_frame(state, {:text, Jason.encode!(payload)}) do
-      {:ok, state} -> {:noreply, state}
-      {:error, reason, state} ->
-        Logger.error("[Discord.Gateway] presence update failed: #{inspect(reason)}")
-        {:noreply, state}
-    end
-  end
-
-  def handle_cast({:presence_update, _presence}, state) do
-    Logger.warning("[Discord.Gateway] cannot update presence: not connected")
-    {:noreply, state}
-  end
-
   # Handle Mint TCP/SSL messages
   def handle_info(message, %{conn: conn} = state) when not is_nil(conn) do
     case Mint.WebSocket.stream(conn, message) do
@@ -208,6 +191,23 @@ defmodule Kyber.Plugin.Discord.Gateway do
   end
 
   def handle_info(_message, state) do
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_cast({:presence_update, presence}, %{status: :connected} = state) do
+    payload = build_presence_update(presence)
+
+    case send_ws_frame(state, {:text, Jason.encode!(payload)}) do
+      {:ok, state} -> {:noreply, state}
+      {:error, reason, state} ->
+        Logger.error("[Discord.Gateway] presence update failed: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
+
+  def handle_cast({:presence_update, _presence}, state) do
+    Logger.warning("[Discord.Gateway] cannot update presence: not connected")
     {:noreply, state}
   end
 

@@ -170,8 +170,11 @@ defmodule Kyber.Plugin.Discord.GatewayTest do
       # Step 3: Reduce → effects
       state = %Kyber.State{}
       {_new_state, effects} = Kyber.Reducer.reduce(state, delta)
-      assert length(effects) == 1
-      assert hd(effects).type == :llm_call
+      assert length(effects) == 3
+      effect_types = Enum.map(effects, & &1.type)
+      assert :send_typing in effect_types
+      assert :add_reaction in effect_types
+      assert :llm_call in effect_types
     end
 
     test "bot messages are filtered before delta creation" do
