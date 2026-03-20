@@ -107,6 +107,135 @@ defmodule Kyber.Plugin.LLMTest do
       assert first["role"] == "user"
       assert first["content"] == "previous"
     end
+
+    # ── Image attachment tests ───────────────────────────────────────────
+
+    test "builds multi-block content when image attachment is present" do
+      payload = %{
+        "text" => "what's in this image?",
+        "attachments" => [
+          %{
+            "url" => "https://cdn.discordapp.com/attachments/123/456/photo.png",
+            "content_type" => "image/png",
+            "filename" => "photo.png"
+          }
+        ]
+      }
+
+      messages = LLM.build_messages(payload)
+      assert length(messages) == 1
+
+      user_msg = hd(messages)
+      assert user_msg["role"] == "user"
+      content = user_msg["content"]
+
+      # Content must be a list of blocks (not plain string)
+      assert is_list(content)
+
+      image_block = Enum.find(content, &(&1["type"] == "image"))
+      assert image_block != nil
+      assert image_block["source"]["type"] == "url"
+      assert image_block["source"]["url"] == "https://cdn.discordapp.com/attachments/123/456/photo.png"
+
+      text_block = Enum.find(content, &(&1["type"] == "text"))
+      assert text_block != nil
+      assert text_block["text"] == "what's in this image?"
+    end
+
+    test "builds multi-block content for multiple image attachments" do
+      payload = %{
+        "text" => "compare these",
+        "attachments" => [
+          %{"url" => "https://cdn.discordapp.com/a.jpg", "content_type" => "image/jpeg"},
+          %{"url" => "https://cdn.discordapp.com/b.png", "content_type" => "image/png"}
+        ]
+      }
+
+      messages = LLM.build_messages(payload)
+      content = hd(messages)["content"]
+
+      assert is_list(content)
+      image_blocks = Enum.filter(content, &(&1["type"] == "image"))
+      assert length(image_blocks) == 2
+
+      urls = Enum.map(image_blocks, & &1["source"]["url"])
+      assert "https://cdn.discordapp.com/a.jpg" in urls
+      assert "https://cdn.discordapp.com/b.png" in urls
+    end
+
+    test "ignores non-image attachments (e.g. PDF, text files)" do
+      payload = %{
+        "text" => "here is a PDF",
+        "attachments" => [
+          %{"url" => "https://cdn.discordapp.com/doc.pdf", "content_type" => "application/pdf"}
+        ]
+      }
+
+      messages = LLM.build_messages(payload)
+      user_msg = hd(messages)
+
+      # No images → content remains a plain string
+      assert user_msg["content"] == "here is a PDF"
+    end
+
+    test "mixed attachments: only image ones become blocks" do
+      payload = %{
+        "text" => "image and pdf",
+        "attachments" => [
+          %{"url" => "https://cdn.discordapp.com/img.png", "content_type" => "image/png"},
+          %{"url" => "https://cdn.discordapp.com/doc.pdf", "content_type" => "application/pdf"}
+        ]
+      }
+
+      messages = LLM.build_messages(payload)
+      content = hd(messages)["content"]
+
+      assert is_list(content)
+      image_blocks = Enum.filter(content, &(&1["type"] == "image"))
+      assert length(image_blocks) == 1
+      assert hd(image_blocks)["source"]["url"] == "https://cdn.discordapp.com/img.png"
+    end
+
+    test "empty attachments list keeps plain string content" do
+      payload = %{"text" => "just text", "attachments" => []}
+      messages = LLM.build_messages(payload)
+      assert hd(messages)["content"] == "just text"
+    end
+
+    test "nil attachments (absent key) keeps plain string content" do
+      payload = %{"text" => "just text"}
+      messages = LLM.build_messages(payload)
+      assert hd(messages)["content"] == "just text"
+    end
+
+    test "history with list content blocks is passed through unchanged" do
+      # Simulates a prior turn that had an image — the history entry has list content
+      image_content = [
+        %{"type" => "image", "source" => %{"type" => "url", "url" => "https://example.com/img.png"}},
+        %{"type" => "text", "text" => "what is this?"}
+      ]
+
+      payload = %{
+        "text" => "follow-up question",
+        "history" => [
+          %{"role" => "user", "content" => image_content},
+          %{"role" => "assistant", "content" => "That is a cat."}
+        ]
+      }
+
+      messages = LLM.build_messages(payload)
+      assert length(messages) == 3
+
+      # First history entry must preserve list content intact
+      first = hd(messages)
+      assert first["role"] == "user"
+      assert is_list(first["content"])
+      assert length(first["content"]) == 2
+
+      # Current message is a plain string (no attachments in this turn)
+      last = List.last(messages)
+      assert last["content"] == "follow-up question"
+    end
   end
 
   describe "load_auth_config/1" do

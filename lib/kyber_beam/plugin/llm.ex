@@ -110,7 +110,12 @@ defmodule Kyber.Plugin.LLM do
   Effect data may include:
   - `"history"` — list of prior message maps `%{role, content}`
   - `"text"` — current user message
+  - `"attachments"` — list of attachment maps with `"url"` and `"content_type"`
   - `"messages"` — explicit messages list (overrides history+text)
+
+  When `"attachments"` contains image entries (content_type starting with `"image/"`),
+  the user message content is built as a list of Anthropic content blocks (image + text).
+  Otherwise content is a plain string.
   """
   @spec build_messages(map()) :: [map()]
   def build_messages(payload) do
@@ -120,7 +125,8 @@ defmodule Kyber.Plugin.LLM do
 
       is_binary(payload["text"]) ->
         history = build_history_messages(payload["history"] || [])
-        history ++ [%{"role" => "user", "content" => payload["text"]}]
+        content = build_user_content(payload["text"], payload["attachments"] || [])
+        history ++ [%{"role" => "user", "content" => content}]
 
       true ->
         []
@@ -319,15 +325,20 @@ defmodule Kyber.Plugin.LLM do
         []
       end
 
-    # Build current user message
+    # Build current user message — may be a string or a list of content blocks
+    # (image + text blocks) when image attachments are present.
     text = payload["text"] || ""
+    attachments = payload["attachments"] || []
+    content = build_user_content(text, attachments)
 
-    # Store user message in session BEFORE API call
+    # Store user message in session BEFORE API call.
+    # We store `content` (not just `text`) so that conversation history
+    # preserves image blocks for future turns.
     if chat_id && process_alive?(session) do
       user_delta =
         Kyber.Delta.new(
           "session.user",
-          %{"role" => "user", "content" => text},
+          %{"role" => "user", "content" => content},
           origin
         )
 
@@ -339,7 +350,7 @@ defmodule Kyber.Plugin.LLM do
       if is_list(payload["messages"]) do
         payload["messages"]
       else
-        history ++ [%{"role" => "user", "content" => text}]
+        history ++ [%{"role" => "user", "content" => content}]
       end
 
     # Load system prompt: explicit payload > vault knowledge context
@@ -659,6 +670,9 @@ defmodule Kyber.Plugin.LLM do
   defp process_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
   defp process_alive?(_), do: false
 
+  # Build the Anthropic-compatible messages list from session history.
+  # Content may be a plain string OR a list of content blocks (e.g. image + text).
+  # Both forms are passed through as-is — the Anthropic API accepts either.
   defp build_history_messages(history) when is_list(history) do
     Enum.map(history, fn
       %{"role" => role, "content" => content} -> %{"role" => role, "content" => content}
@@ -669,6 +683,29 @@ defmodule Kyber.Plugin.LLM do
   end
 
   defp build_history_messages(_), do: []
+
+  # Build user-message content for the Anthropic API.
+  # If the payload has image attachments, returns a list of content blocks:
+  #   [image_block, ..., %{"type" => "text", "text" => text}]
+  # Otherwise returns the plain text string (more efficient for text-only turns).
+  defp build_user_content(text, attachments) when is_list(attachments) do
+    image_blocks =
+      attachments
+      |> Enum.filter(fn att ->
+        content_type = Map.get(att, "content_type", "")
+        String.starts_with?(content_type, "image/")
+      end)
+      |> Enum.map(fn att ->
+        %{"type" => "image", "source" => %{"type" => "url", "url" => att["url"]}}
+      end)
+
+    case image_blocks do
+      [] -> text
+      _ -> image_blocks ++ [%{"type" => "text", "text" => text}]
+    end
+  end
+
+  defp build_user_content(text, _), do: text
 
   defp extract_token(%{"claudeAiOauth" => %{"accessToken" => token}}) when is_binary(token),
     do: token
