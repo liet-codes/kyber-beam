@@ -202,37 +202,30 @@ defmodule Kyber.CronTest do
 
     test "emits cron.fired delta when core is set" do
       tmp_path = Path.join(System.tmp_dir!(), "kyber_cron_test_#{:rand.uniform(99999)}.jsonl")
-      {:ok, core} = Kyber.Core.start_link(name: :"TestCronCore#{:rand.uniform(99999)}", store_path: tmp_path)
+      core_name = :"TestCronCore#{:rand.uniform(99999)}"
+      {:ok, core} = Kyber.Core.start_link(name: core_name, store_path: tmp_path)
       test_pid = self()
 
-      # Subscribe to core's delta store
-      store_name = :"Elixir.Kyber.Delta.StoreTestCronCore#{:rand.uniform(99999)}"
-      # Easier: subscribe at the core level
-      # Actually, let's use a simpler approach — listen for the delta in the store
+      # Subscribe to delta broadcasts (cron.fired is ephemeral — not persisted to store)
+      store = :"#{core_name}.Store"
+      Kyber.Delta.Store.subscribe(store, fn delta ->
+        if delta.kind == "cron.fired", do: send(test_pid, {:delta, delta})
+      end)
 
       {:ok, pid} = Cron.start_link(
         name: nil,
         core: core,
-        check_interval: 50
+        check_interval: 50,
+        persist_path: nil
       )
-
-      # Subscribe to delta store
-      store = Kyber.Core.query_deltas(core)
-      _ = store
 
       # Add a fast job
       Cron.add_job(pid, "emit-test", {:every, 1})
 
-      # Give it time to fire
-      Process.sleep(200)
-
-      # Check the delta store
-      deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
-      assert length(deltas) >= 1
-
-      fired = Enum.find(deltas, fn d -> d.payload["job_name"] == "emit-test" end)
-      assert fired != nil, "Expected a cron.fired delta with job_name 'emit-test', got: #{inspect(Enum.map(deltas, & &1.payload["job_name"]))}"
+      # Wait for the delta broadcast
+      assert_receive {:delta, fired}, 1000
       assert fired.kind == "cron.fired"
+      assert fired.payload["job_name"] == "emit-test"
       assert fired.origin == {:cron, "emit-test"}
 
       GenServer.stop(pid)
@@ -254,25 +247,31 @@ defmodule Kyber.CronTest do
 
   describe "missed job detection" do
     test "job that fires late gets missed: true in delta" do
-      {:ok, core} = Kyber.Core.start_link(name: :"TestMissedCore#{:rand.uniform(99999)}")
+      tmp_path = Path.join(System.tmp_dir!(), "kyber_missed_test_#{:rand.uniform(99999)}.jsonl")
+      core_name = :"TestMissedCore#{:rand.uniform(99999)}"
+      {:ok, core} = Kyber.Core.start_link(name: core_name, store_path: tmp_path)
+      test_pid = self()
+
+      # Subscribe to delta broadcasts (cron.fired is ephemeral)
+      store = :"#{core_name}.Store"
+      Kyber.Delta.Store.subscribe(store, fn delta ->
+        if delta.kind == "cron.fired", do: send(test_pid, {:delta, delta})
+      end)
 
       {:ok, pid} = Cron.start_link(
         name: nil,
         core: core,
-        check_interval: 50
+        check_interval: 50,
+        persist_path: nil
       )
 
       # Schedule a one-shot job that was due 10 seconds ago (definitely missed)
       past = DateTime.add(DateTime.utc_now(), -10, :second)
       Cron.add_job(pid, "missed-test", {:at, past})
 
-      # Let it fire
-      Process.sleep(200)
-
-      deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
-      delta = Enum.find(deltas, fn d -> d.payload["job_name"] == "missed-test" end)
-
-      assert delta != nil
+      # Wait for the delta broadcast
+      assert_receive {:delta, delta}, 1000
+      assert delta.payload["job_name"] == "missed-test"
       assert delta.payload["missed"] == true
 
       GenServer.stop(pid)
@@ -280,23 +279,30 @@ defmodule Kyber.CronTest do
     end
 
     test "job that fires on time gets missed: false in delta" do
-      {:ok, core} = Kyber.Core.start_link(name: :"TestOnTimeCore#{:rand.uniform(99999)}")
+      tmp_path = Path.join(System.tmp_dir!(), "kyber_ontime_test_#{:rand.uniform(99999)}.jsonl")
+      core_name = :"TestOnTimeCore#{:rand.uniform(99999)}"
+      {:ok, core} = Kyber.Core.start_link(name: core_name, store_path: tmp_path)
+      test_pid = self()
+
+      # Subscribe to delta broadcasts (cron.fired is ephemeral)
+      store = :"#{core_name}.Store"
+      Kyber.Delta.Store.subscribe(store, fn delta ->
+        if delta.kind == "cron.fired", do: send(test_pid, {:delta, delta})
+      end)
 
       {:ok, pid} = Cron.start_link(
         name: nil,
         core: core,
-        check_interval: 50
+        check_interval: 50,
+        persist_path: nil
       )
 
       # Schedule an interval job that fires immediately (1ms)
       Cron.add_job(pid, "ontime-test", {:every, 1})
 
-      Process.sleep(200)
-
-      deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
-      delta = Enum.find(deltas, fn d -> d.payload["job_name"] == "ontime-test" end)
-
-      assert delta != nil
+      # Wait for the delta broadcast
+      assert_receive {:delta, delta}, 1000
+      assert delta.payload["job_name"] == "ontime-test"
       # Job fired within 5 second threshold — should not be "missed"
       assert delta.payload["missed"] == false
 
@@ -399,7 +405,15 @@ defmodule Kyber.CronTest do
       }
       File.write!(path, Jason.encode!(job_map) <> "\n")
 
-      {:ok, core} = Kyber.Core.start_link(name: :"TestReloadCore#{:rand.uniform(99999)}")
+      tmp_store = Path.join(System.tmp_dir!(), "kyber_reload_test_#{:rand.uniform(99999)}.jsonl")
+      core_name = :"TestReloadCore#{:rand.uniform(99999)}"
+      {:ok, core} = Kyber.Core.start_link(name: core_name, store_path: tmp_store)
+
+      # Subscribe to delta broadcasts (cron.fired is ephemeral)
+      store = :"#{core_name}.Store"
+      Kyber.Delta.Store.subscribe(store, fn delta ->
+        if delta.kind == "cron.fired", do: send(test_pid, {:delta, delta})
+      end)
 
       {:ok, _pid} = Cron.start_link(
         name: nil,
@@ -408,12 +422,9 @@ defmodule Kyber.CronTest do
         persist_path: path
       )
 
-      # Job was in the past — should fire on the first check
-      Process.sleep(300)
-
-      deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
-      delta = Enum.find(deltas, fn d -> d.payload["job_name"] == "past-reminder" end)
-      assert delta != nil
+      # Wait for the delta broadcast
+      assert_receive {:delta, delta}, 1000
+      assert delta.payload["job_name"] == "past-reminder"
       # It was in the past, so it should be flagged as missed
       assert delta.payload["missed"] == true
 
@@ -421,7 +432,16 @@ defmodule Kyber.CronTest do
     end
 
     test "reminders include label in delta payload", %{persist_file: path} do
-      {:ok, core} = Kyber.Core.start_link(name: :"TestLabelCore#{:rand.uniform(99999)}")
+      tmp_store = Path.join(System.tmp_dir!(), "kyber_label_test_#{:rand.uniform(99999)}.jsonl")
+      core_name = :"TestLabelCore#{:rand.uniform(99999)}"
+      {:ok, core} = Kyber.Core.start_link(name: core_name, store_path: tmp_store)
+      test_pid = self()
+
+      # Subscribe to delta broadcasts (cron.fired is ephemeral)
+      store = :"#{core_name}.Store"
+      Kyber.Delta.Store.subscribe(store, fn delta ->
+        if delta.kind == "cron.fired", do: send(test_pid, {:delta, delta})
+      end)
 
       {:ok, pid} = Cron.start_link(
         name: nil,
@@ -433,14 +453,9 @@ defmodule Kyber.CronTest do
       past = DateTime.add(DateTime.utc_now(), -1, :second)
       Cron.add_reminder(pid, "Feed the cat", past)
 
-      Process.sleep(300)
-
-      deltas = Kyber.Core.query_deltas(core, kind: "cron.fired")
-      delta = Enum.find(deltas, fn d ->
-        String.starts_with?(d.payload["job_name"] || "", "reminder:")
-      end)
-
-      assert delta != nil
+      # Wait for the delta broadcast
+      assert_receive {:delta, delta}, 1000
+      assert String.starts_with?(delta.payload["job_name"], "reminder:")
       assert delta.payload["label"] == "Feed the cat"
 
       GenServer.stop(pid)
