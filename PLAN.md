@@ -1,159 +1,45 @@
-# Kyber-BEAM — Planning Document
+# PLAN.md — Kyber-Beam Work Tracker
 
-## What Is This?
-Elixir/OTP port of Kyber, a personal agent harness. The TypeScript prototype validated the architecture (delta-driven unidirectional dataflow). Now we're putting it on the substrate it was always meant for.
+*Living document. Update in every PR. Never leave bugs unflagged.*
 
-## Why BEAM?
-- **Distribution is native** — `Node.connect/1` and processes talk across machines transparently
-- **Supervision trees** — fault tolerance we were hand-building in TS comes free
-- **Hot code reload** — plugin system without restarts
-- **Process isolation** — channel agents can't crash each other
-- **Pattern matching** — the reducer is literally just function clauses
-- **Lightweight processes** — millions of concurrent agents, not threads
+## Backlog
 
-## Architecture (OTP)
+### Bugs (Pre-existing)
 
-```
-Kyber.Application (Application)
-├── Kyber.Core (Supervisor)
-│   ├── Kyber.Delta.Store (GenServer)
-│   │   └── Append-only JSONL log + PubSub via Registry
-│   ├── Kyber.State (Agent)
-│   │   └── Holds current KyberState, updated by reducer
-│   ├── Kyber.Effect.Executor (GenServer)
-│   │   └── Dispatches effects to registered handlers
-│   ├── Kyber.Plugin.Manager (DynamicSupervisor)
-│   │   └── Each plugin is a supervised child process
-│   └── Kyber.Task.Supervisor (Task.Supervisor)
-│       └── Async effect execution
-├── Kyber.Web (Supervisor)
-│   └── Bandit HTTP server
-│       ├── GET /health
-│       ├── GET /api/deltas (query)
-│       ├── POST /api/deltas (emit)
-│       └── WS /ws (delta stream)
-└── Kyber.Registry (Registry)
-    └── PubSub for delta subscribers
-```
+- [ ] **5 cron test failures** — Tests fail on master (pre-date today's changes). Delta store path issues in test environment. Affected tests:
+  - `test job firing emits cron.fired delta when core is set`
+  - `test job persistence reminders include label in delta payload`
+  - `test job persistence one-shot jobs in the past are fired immediately on reload`
+  - `test missed job detection job that fires late gets missed: true in delta`
+  - `test missed job detection job that fires on time gets missed: false in delta`
+  - Root cause suspected: `priv/data/deltas.jsonl` path resolution in test env
 
-## Core Types
+### Features
 
-```elixir
-# Delta
-%Kyber.Delta{
-  id: String.t(),
-  ts: integer(),
-  origin: Kyber.Delta.Origin.t(),
-  kind: String.t(),
-  payload: map(),
-  parent_id: String.t() | nil
-}
+- [ ] **Session rehydration** — Conversation history lost on restart (ETS in-memory only). Rehydrate from delta log on boot so Stilgar keeps context across restarts.
+- [ ] **Slash commands** — Register Discord slash commands (`/ask`, `/status`, `/context`, `/history`, `/forget`)
+- [ ] **Embed support** — Rich embeds in responses (code blocks, structured output)
+- [ ] **File/image sending** — Send files and images from LLM responses
 
-# Origin (tagged tuples)
-{:channel, channel, chat_id, sender_id}
-{:cron, schedule}
-{:subagent, parent_delta_id}
-{:tool, tool}
-{:human, user_id}
-{:system, reason}
+### Tech Debt
 
-# Effect
-%{type: atom(), ...}
+- [ ] **Startup script** — Replace manual `DISCORD_BOT_TOKEN="..." nohup mix run --no-halt &` with a proper startup script or launchd plist that sets the correct token
+- [ ] **Vault path unification** — `@vault_path` in tool_executor.ex is hardcoded to `~/.kyber/vault`. Should read from config or application env for testability.
 
-# State
-%Kyber.State{
-  sessions: %{String.t() => Kyber.Session.t()},
-  plugins: [String.t()],
-  errors: [Kyber.Error.t()]
-}
-```
+## Completed
 
-## Data Flow
+### 2026-03-20
 
-```
-External Event (Discord msg, HTTP, cron)
-    ↓
-Delta created (with origin, kind, payload)
-    ↓
-DeltaStore.append(delta)
-    → persists to JSONL
-    → broadcasts via Registry PubSub
-    ↓
-Reducer.reduce(state, delta) → {new_state, effects}
-    → pure function, no side effects
-    → pattern matches on delta.kind
-    ↓
-State updated (Agent.update)
-    ↓
-Effects dispatched (Task.Supervisor.async)
-    → :llm_call → Anthropic API → emits llm.response delta
-    → :send_message → Discord/channel → emits message.sent delta
-    → :error → emits error delta
-```
-
-## Phases
-
-### Phase 0 — Crystal (Current Sprint)
-- [x] Mix project with supervision tree
-- [ ] Delta struct + Store GenServer (JSONL + PubSub)
-- [ ] Reducer (pure function module)
-- [ ] Effect Executor
-- [ ] Plugin Manager (DynamicSupervisor)
-- [ ] Web server (Bandit + Plug.Router)
-- [ ] ExUnit tests for all modules
-- [ ] GitHub repo + push
-
-### Phase 1 — Focus
-- [ ] LLM plugin (Anthropic API via Req, OAuth token support)
-- [ ] Session management (conversation history as deltas)
-- [ ] Discord plugin (gateway WebSocket + REST)
-- [ ] Basic CLI (Mix task or escript)
-
-### Phase 2 — Liquid
-- [ ] Multi-node distribution (connect BEAM nodes across minis)
-- [ ] Shared inference via exo integration
-- [ ] Phoenix LiveView dashboard (replaces Mission Control)
-- [ ] Hot code deployment across cluster
-
-### Phase 3 — Rhizome
-- [ ] Knowledge graph (Obsidian vault integration)
-- [ ] Familiard as a BEAM node
-- [ ] Autoresearch integration
-- [ ] Voice pipeline plugin
-
-## Key Design Decisions
-
-1. **Reducer stays pure** — no GenServer, no side effects. Just `reduce(state, delta) -> {state, effects}`. Testable, predictable, debuggable.
-
-2. **Plug, not Phoenix** — Phase 0 uses Plug + Bandit directly. Phoenix is Phase 2 when we need LiveView. Don't import the world before you need it.
-
-3. **Registry for PubSub** — no external deps (Redis, RabbitMQ). Registry is built into OTP and handles pub/sub beautifully.
-
-4. **Tagged tuples for origins** — Elixir pattern matching makes this natural. No need for union types or discriminated unions.
-
-5. **Task.Supervisor for effects** — effects are fire-and-forget async tasks under supervision. If one fails, it doesn't cascade.
-
-## From TS to Elixir — Translation Guide
-
-| TypeScript | Elixir |
-|-----------|--------|
-| class DeltaStore | GenServer + ETS/file |
-| reduce(state, delta) | Kyber.Reducer.reduce/2 (pure module) |
-| class EffectExecutor | GenServer + handler registry |
-| class PluginManager | DynamicSupervisor |
-| Express + ws | Plug.Router + Bandit + WebSockAdapter |
-| new Promise() | Task.async / GenServer.call |
-| EventEmitter | Registry PubSub |
-| try/catch | {:ok, _} / {:error, _} + supervisors |
-| interface/type | @type / defstruct |
-
-## Dependencies (Minimal)
-- `jason` — JSON encoding/decoding
-- `bandit` — HTTP server (lighter than Cowboy)
-- `plug` — HTTP routing
-- `websock_adapter` — WebSocket support for Plug
-- `req` — HTTP client (for Anthropic API, Phase 1)
-
----
-
-*"The BEAM is the territory." — Liet, March 2026*
+- [x] **Identity crisis fix** — Correct bot token, explicit env var on startup
+- [x] **Typing indicator** — `send_typing` effect before `llm_call`
+- [x] **👀 reaction** — `add_reaction` on message receipt
+- [x] **Reply detection** — Respond to replies, not just @mentions
+- [x] **Reply threading** — Responses appear as Discord replies (message_reference)
+- [x] **Vault consolidation** — `priv/vault` → symlink to `~/.kyber/vault`
+- [x] **Memory grounding** — Mandatory vault-check instruction in system prompt
+- [x] **SOUL.md cleanup** — Remove inline definitions, point to vault concepts/
+- [x] **Consolidator error handling** — try/rescue/catch around scoring tasks
+- [x] **delete_message capability** — REST + effect handler + snowflake validation + tests
+- [x] **Compiler warnings** — Clause grouping in tool_executor.ex and gateway.ex
+- [x] **PR workflow established** — Branch → PR → staff review → merge
+- [x] **#bot-test channel** — Integration test channel with cleanup workflow
