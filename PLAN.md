@@ -6,13 +6,7 @@
 
 ### Bugs (Pre-existing)
 
-- [ ] **5 cron test failures** — Tests fail on master (pre-date today's changes). Delta store path issues in test environment. Affected tests:
-  - `test job firing emits cron.fired delta when core is set`
-  - `test job persistence reminders include label in delta payload`
-  - `test job persistence one-shot jobs in the past are fired immediately on reload`
-  - `test missed job detection job that fires late gets missed: true in delta`
-  - `test missed job detection job that fires on time gets missed: false in delta`
-  - Root cause suspected: `priv/data/deltas.jsonl` path resolution in test env
+- [x] **5 cron test failures** — Fixed! Tests now use Delta.Store.subscribe() instead of query_deltas() because cron.fired deltas are ephemeral (broadcast_only, not persisted). Also added persist_path: nil and isolated store_path to prevent loading production jobs.
 
 ### Features
 
