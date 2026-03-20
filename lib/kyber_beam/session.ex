@@ -8,6 +8,17 @@ defmodule Kyber.Session do
   History is stored in ETS for fast concurrent reads. The GenServer serialises
   writes so there are no race conditions when appending messages.
 
+  ## Session Rehydration
+
+  On startup, if a `delta_store` is provided, the Session GenServer queries
+  historical `message.received` and `llm.response` deltas from the store and
+  rebuilds conversation history. This ensures context survives process restarts.
+
+  Rehydration is done synchronously inside `init/1` so that the session is
+  fully populated before `start_link/1` returns. This is safe because
+  `Kyber.Core` (and its `Delta.Store`) starts before `Kyber.Session` in the
+  application supervision tree.
+
   ## Usage
 
       {:ok, pid} = Kyber.Session.start_link()
@@ -20,6 +31,9 @@ defmodule Kyber.Session do
 
   use GenServer
   require Logger
+
+  # Kinds persisted to the delta store that we use to rebuild session history.
+  @rehydration_kinds ~w(message.received llm.response)
 
   # ── Public API ────────────────────────────────────────────────────────────
 
@@ -68,8 +82,12 @@ defmodule Kyber.Session do
     name = Keyword.get(opts, :name, __MODULE__)
     table = :"#{name}.Sessions"
     :ets.new(table, [:named_table, :public, :set, read_concurrency: true])
+
+    delta_store = Keyword.get(opts, :delta_store, nil)
+    rehydrate_from_store(table, delta_store)
+
     Logger.info("[Kyber.Session] started (table: #{table})")
-    {:ok, %{table: table}}
+    {:ok, %{table: table, delta_store: delta_store}}
   end
 
   @impl true
@@ -102,8 +120,87 @@ defmodule Kyber.Session do
 
   # ── Private helpers ───────────────────────────────────────────────────────
 
+  # Query the delta store and populate ETS with historical conversation history.
+  # Called synchronously from init/1 so the session is fully ready before
+  # start_link/1 returns. No-ops if delta_store is nil.
+  defp rehydrate_from_store(_table, nil), do: :ok
+
+  defp rehydrate_from_store(table, store) do
+    Logger.info("[Kyber.Session] rehydrating from #{inspect(store)}")
+
+    try do
+      history_by_chat =
+        @rehydration_kinds
+        |> Enum.flat_map(fn kind ->
+          Kyber.Delta.Store.query(store, kind: kind)
+        end)
+        |> Enum.sort_by(& &1.ts)
+        |> Enum.flat_map(&to_session_entry/1)
+        |> Enum.group_by(fn {chat_id, _delta} -> chat_id end)
+
+      Enum.each(history_by_chat, fn {chat_id, entries} ->
+        sorted =
+          entries
+          |> Enum.sort_by(fn {_cid, d} -> d.ts end)
+          |> Enum.map(fn {_cid, d} -> d end)
+
+        :ets.insert(table, {chat_id, sorted})
+        Logger.debug("[Kyber.Session] rehydrated #{length(sorted)} messages for chat #{chat_id}")
+      end)
+
+      total = Enum.reduce(history_by_chat, 0, fn {_, entries}, acc -> acc + length(entries) end)
+      Logger.info("[Kyber.Session] rehydrated #{total} messages across #{map_size(history_by_chat)} sessions")
+    rescue
+      e ->
+        Logger.error(
+          "[Kyber.Session] rehydration failed: #{inspect(e)}\n" <>
+            Exception.format_stacktrace(__STACKTRACE__)
+        )
+    end
+
+    :ok
+  end
+
+  # Convert a persisted delta to zero or one {chat_id, session_delta} pair.
+  # We rebuild in the same format that the LLM plugin stores at runtime so
+  # that history reads by Kyber.Plugin.LLM are uniform regardless of origin.
+  defp to_session_entry(%Kyber.Delta{kind: "message.received"} = delta) do
+    case chat_id_from_origin(delta.origin) do
+      nil -> []
+      chat_id ->
+        text = Map.get(delta.payload, "text", "")
+        session_delta = %Kyber.Delta{
+          delta
+          | kind: "session.user",
+            payload: %{"role" => "user", "content" => text}
+        }
+        [{chat_id, session_delta}]
+    end
+  end
+
+  defp to_session_entry(%Kyber.Delta{kind: "llm.response"} = delta) do
+    case chat_id_from_origin(delta.origin) do
+      nil -> []
+      chat_id ->
+        content = Map.get(delta.payload, "content", "")
+        session_delta = %Kyber.Delta{
+          delta
+          | kind: "session.assistant",
+            payload: %{"role" => "assistant", "content" => content}
+        }
+        [{chat_id, session_delta}]
+    end
+  end
+
+  defp to_session_entry(_delta), do: []
+
+  # Mirror the chat_id extraction logic from Kyber.Plugin.LLM so rehydration
+  # uses the same rules as live message handling.
+  defp chat_id_from_origin({:channel, _ch, chat_id, _sender}), do: chat_id
+  defp chat_id_from_origin({:human, user_id}), do: user_id
+  defp chat_id_from_origin(_), do: nil
+
   # Get the ETS table name for a given pid/name.
-  # Since table is named after the process name, we need to look it up.
   defp table_name(pid) when is_pid(pid) do
     case Process.info(pid, :registered_name) do
       {:registered_name, name} when is_atom(name) and name != [] ->
@@ -115,5 +212,4 @@ defmodule Kyber.Session do
   end
 
   defp table_name(name) when is_atom(name), do: :"#{name}.Sessions"
-
 end
