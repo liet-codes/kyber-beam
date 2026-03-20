@@ -10,10 +10,10 @@
 
 ### Features
 
-- [x] **Session rehydration** — Conversation history survives restarts. `Kyber.Session` queries the delta store for `message.received` and `llm.response` deltas on init, rebuilds per-chat history (sorted by timestamp), and populates ETS before `start_link/1` returns. PR #X.
-- [ ] **Slash commands** — Register Discord slash commands (`/ask`, `/status`, `/context`, `/history`, `/forget`)
-- [ ] **Embed support** — Rich embeds in responses (code blocks, structured output)
-- [ ] **File/image sending** — Send files and images from LLM responses
+- [x] **Session rehydration** — Conversation history survives restarts. `Kyber.Session` queries the delta store for `message.received` and `llm.response` deltas on init, rebuilds per-chat history (sorted by timestamp), and populates ETS before `start_link/1` returns. PR #4.
+- [x] **Slash commands** — Register Discord slash commands (`/ask`, `/status`, `/context`, `/history`, `/forget`). PR #5.
+- [x] **Embed support** — Rich embeds in responses (code blocks, structured output). PR #5.
+- [x] **File/image sending** — Send files and images from LLM responses. PR #5.
 
 ### Tech Debt
 
