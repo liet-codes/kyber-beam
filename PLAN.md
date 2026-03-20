@@ -17,8 +17,8 @@
 
 ### Tech Debt
 
-- [ ] **Startup script** — Replace manual `DISCORD_BOT_TOKEN="..." nohup mix run --no-halt &` with a proper startup script or launchd plist that sets the correct token
-- [ ] **Vault path unification** — `@vault_path` in tool_executor.ex is hardcoded to `~/.kyber/vault`. Should read from config or application env for testability.
+- [x] **Startup script** — `com.liet.kyber-beam.plist` + `scripts/start.sh` + `scripts/install.sh`. Loads token from `.env`, KeepAlive/RunAtLoad, logs to `~/.kyber/logs/`. PR #3.
+- [x] **Vault path unification** — `@vault_path` now uses `Application.compile_env/3`. Configured in `config/config.exs`, overridable via `KYBER_VAULT_PATH` or `config/runtime.exs`. Tests use isolated temp dir. PR #3.
 
 ## Completed
 
