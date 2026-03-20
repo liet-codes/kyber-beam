@@ -20,28 +20,16 @@ defmodule Kyber.ToolExecutor do
 
   require Logger
 
-  # Directories where write_file / edit_file are permitted.
-  @allowed_write_roots [
-    Path.expand("~/.kyber"),
-    Path.expand("~/kyber-beam"),
-    System.tmp_dir!()
-  ]
-
-  # Directories where read_file / list_dir are permitted.
-  # Reads are NOT unrestricted — a prompt-injected LLM could exfiltrate
-  # SSH keys, OAuth tokens, and other credentials via read_file.
-  @allowed_read_roots [
-    Path.expand("~/.kyber"),
-    Path.expand("~/kyber-beam"),
-    System.tmp_dir!()
-  ]
-
   # Strict allowlist for the exec tool.
   # Only these command stems are permitted — anything else is rejected.
   # This prevents LLM prompt injection from running arbitrary shell commands.
   @allowed_exec_commands ~w(ls cat grep mix git)
 
-  @vault_path Application.compile_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
+  # NOTE: @allowed_write_roots, @allowed_read_roots, and @vault_path are
+  # intentionally defined as private functions below (not module attributes)
+  # so that Path.expand and System.tmp_dir! are evaluated at runtime against
+  # the actual $HOME, not the $HOME of the build environment.
+  # See: Architecture Audit M3.
   @web_fetch_max_bytes 50_000
 
   # SSRF: blocked host literals (IPv6 loopback stored without brackets)
@@ -239,7 +227,7 @@ defmodule Kyber.ToolExecutor do
       {:error, "invalid vault path: must be relative with no '..' components"}
     else
       normalized = path
-      abs_path = Path.join(@vault_path, normalized)
+      abs_path = Path.join(vault_path(), normalized)
 
       with :ok <- File.mkdir_p(Path.dirname(abs_path)),
            :ok <- File.write(abs_path, content) do
@@ -262,15 +250,15 @@ defmodule Kyber.ToolExecutor do
     else
       search_root =
         if subdir && subdir != "" do
-          Path.join(@vault_path, String.trim_leading(subdir, "/"))
+          Path.join(vault_path(), String.trim_leading(subdir, "/"))
         else
-          @vault_path
+          vault_path()
         end
 
       if File.dir?(search_root) do
         paths =
           Path.wildcard(Path.join([search_root, "**", "*.md"]))
-          |> Enum.map(&Path.relative_to(&1, @vault_path))
+          |> Enum.map(&Path.relative_to(&1, vault_path()))
           |> Enum.sort()
           |> Enum.join("\n")
 
@@ -515,14 +503,36 @@ defmodule Kyber.ToolExecutor do
 
   # ── Private helpers ────────────────────────────────────────────────────────
 
+  # Evaluate allowed roots at runtime so Path.expand uses the actual $HOME.
+  # Using module attributes would bake in the build-time $HOME (wrong in CI).
+  defp allowed_write_roots do
+    [
+      Path.expand("~/.kyber"),
+      Path.expand("~/kyber-beam"),
+      System.tmp_dir!()
+    ]
+  end
+
+  defp allowed_read_roots do
+    [
+      Path.expand("~/.kyber"),
+      Path.expand("~/kyber-beam"),
+      System.tmp_dir!()
+    ]
+  end
+
+  defp vault_path do
+    Application.get_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
+  end
+
   # Returns true if the expanded path is under one of the allowed write roots.
   defp path_allowed?(expanded) do
-    Enum.any?(@allowed_write_roots, &String.starts_with?(expanded, &1))
+    Enum.any?(allowed_write_roots(), &String.starts_with?(expanded, &1))
   end
 
   # Returns true if the expanded path is under one of the allowed read roots.
   defp read_path_allowed?(expanded) do
-    Enum.any?(@allowed_read_roots, &String.starts_with?(expanded, &1))
+    Enum.any?(allowed_read_roots(), &String.starts_with?(expanded, &1))
   end
 
   # Returns true if the URL host is not a private/internal address (SSRF guard).

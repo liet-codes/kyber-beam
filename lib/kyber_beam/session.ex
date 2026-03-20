@@ -48,9 +48,16 @@ defmodule Kyber.Session do
   @spec get_history(GenServer.server(), String.t()) :: [Kyber.Delta.t()]
   def get_history(pid \\ __MODULE__, chat_id) when is_binary(chat_id) do
     table = table_name(pid)
-    case :ets.lookup(table, chat_id) do
-      [{^chat_id, history}] -> history
-      [] -> []
+
+    # Guard against the ETS table not existing (e.g. Session GenServer is between
+    # crash and restart). Returns [] rather than raising :badarg.
+    try do
+      case :ets.lookup(table, chat_id) do
+        [{^chat_id, history}] -> history
+        [] -> []
+      end
+    rescue
+      ArgumentError -> []
     end
   end
 
@@ -81,10 +88,13 @@ defmodule Kyber.Session do
     Process.flag(:trap_exit, true)
     name = Keyword.get(opts, :name, __MODULE__)
     table = :"#{name}.Sessions"
-    :ets.new(table, [:named_table, :public, :set, read_concurrency: true])
+    # :protected allows concurrent reads from any process (fast path for get_history)
+    # while restricting writes to the owning GenServer (ordering guarantee).
+    :ets.new(table, [:named_table, :protected, :set, read_concurrency: true])
 
     delta_store = Keyword.get(opts, :delta_store, nil)
     rehydrate_from_store(table, delta_store)
+
 
     Logger.info("[Kyber.Session] started (table: #{table})")
     {:ok, %{table: table, delta_store: delta_store}}
