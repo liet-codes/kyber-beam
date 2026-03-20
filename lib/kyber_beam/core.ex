@@ -144,7 +144,8 @@ defmodule Kyber.Core do
 
     # :rest_for_one ensures that if an early child (e.g. Delta.Store) crashes,
     # all children started after it also restart, preventing stale subscriptions.
-    Supervisor.init(children, strategy: :rest_for_one)
+    # Raised max_restarts to avoid silent supervisor death during debugging.
+    Supervisor.init(children, strategy: :rest_for_one, max_restarts: 10, max_seconds: 30)
   end
 
   # ── Private ───────────────────────────────────────────────────────────────

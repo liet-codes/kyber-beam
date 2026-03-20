@@ -170,7 +170,15 @@ defmodule Kyber.Delta.Store do
 
   @impl true
   def terminate(reason, state) do
-    Logger.info("[Kyber.Delta.Store] terminating: #{inspect(reason)}")
+    Logger.error("[Kyber.Delta.Store] TERMINATING - reason: #{inspect(reason)}")
+    Logger.error("[Kyber.Delta.Store] State snapshot: deltas=#{length(Map.get(state, :deltas, []))}, subs=#{map_size(Map.get(state, :subs, %{}))}")
+    Logger.error("[Kyber.Delta.Store] Path: #{Map.get(state, :path, "unknown")}")
+    
+    # Log stack trace if available
+    case Process.info(self(), :current_stacktrace) do
+      {_, stacktrace} -> Logger.error("[Kyber.Delta.Store] Stacktrace: #{inspect(stacktrace)}")
+      nil -> Logger.error("[Kyber.Delta.Store] No stacktrace available")
+    end
 
     # Close the IO device gracefully so buffered writes are flushed.
     if io = Map.get(state, :io_device), do: File.close(io)

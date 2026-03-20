@@ -100,7 +100,9 @@ defmodule Kyber.Web.Router do
   defp store_pid do
     # In production, look up the registered store.
     # In tests, this can be overridden by process dictionary.
-    Process.get(:kyber_store_pid) || Kyber.Delta.Store
+    # The Core supervisor registers the store as :"Elixir.Kyber.Core.Store"
+    # (derived from the core name), not as Kyber.Delta.Store.
+    Process.get(:kyber_store_pid) || :"Elixir.Kyber.Core.Store"
   end
 end
 
