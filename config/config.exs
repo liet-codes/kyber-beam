@@ -1,5 +1,9 @@
 import Config
 
+# Vault path for memory_read / memory_write / memory_list tools.
+# Override in config/test.exs or config/runtime.exs.
+config :kyber_beam, :vault_path, Path.expand("~/.kyber/vault")
+
 # Phoenix Endpoint for LiveView Dashboard (port 4001)
 config :kyber_beam, Kyber.Web.Endpoint,
   adapter: Bandit.PhoenixAdapter,
