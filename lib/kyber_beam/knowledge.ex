@@ -475,7 +475,8 @@ defmodule Kyber.Knowledge do
 
   @doc false
   def parse_frontmatter(content) do
-    case String.split(content, ~r/^---\s*$/m, parts: 3) do
+    {:ok, frontmatter_re} = Regex.compile("^---\\s*$", "m")
+    case String.split(content, frontmatter_re, parts: 3) do
       ["", yaml_str, rest] ->
         frontmatter = parse_yaml(yaml_str)
         {frontmatter, String.trim_leading(rest)}
@@ -522,7 +523,7 @@ defmodule Kyber.Knowledge do
 
   @doc false
   def extract_wikilinks(body) do
-    ~r/\[\[([^\]]+)\]\]/
+    Regex.compile!("\\[\\[([^\\]]+)\\]\\]")
     |> Regex.scan(body, capture: :all_but_first)
     |> Enum.map(fn [link] ->
       # Support display text: [[path|display]] — take only path part
@@ -594,7 +595,7 @@ defmodule Kyber.Knowledge do
   defp tiered_context(note, :l1) do
     first_para =
       note.body
-      |> String.split(~r/\n\n+/, parts: 2)
+      |> String.split(Regex.compile!("\\n\\n+"), parts: 2)
       |> hd()
       |> String.trim()
 
