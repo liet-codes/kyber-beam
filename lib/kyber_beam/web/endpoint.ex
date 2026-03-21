@@ -16,7 +16,7 @@ defmodule Kyber.Web.Endpoint do
 
   # LiveView socket
   socket "/live", Phoenix.LiveView.Socket,
-    websocket: [connect_info: [session: {:cookie, "_kyber_session", [sign: true]}]],
+    websocket: true,
     longpoll: false
 
   # Serve static assets from phoenix and phoenix_live_view hex packages
