@@ -43,6 +43,8 @@ defmodule Kyber.Cron do
   @check_interval_ms 1_000  # check every second for due jobs
   # A job is "missed" if now is this many ms past its scheduled next_run
   @missed_threshold_ms 5_000
+  # Minimum allowed interval for {:every, ms} schedules (10 seconds)
+  @min_interval_ms 10_000
 
   @type schedule ::
     {:every, pos_integer()}
@@ -154,15 +156,23 @@ defmodule Kyber.Cron do
 
   @impl true
   def handle_call({:add_job, name, schedule, callback}, _from, state) do
-    new_state = add_job_to_state(state, name, schedule, callback, %{})
-    persist_jobs(new_state)
-    {:reply, :ok, new_state}
+    case enforce_min_interval(schedule) do
+      {:error, _} = err -> {:reply, err, state}
+      schedule ->
+        new_state = add_job_to_state(state, name, schedule, callback, %{})
+        persist_jobs(new_state)
+        {:reply, :ok, new_state}
+    end
   end
 
   def handle_call({:add_job, name, schedule, callback, metadata}, _from, state) do
-    new_state = add_job_to_state(state, name, schedule, callback, metadata)
-    persist_jobs(new_state)
-    {:reply, :ok, new_state}
+    case enforce_min_interval(schedule) do
+      {:error, _} = err -> {:reply, err, state}
+      schedule ->
+        new_state = add_job_to_state(state, name, schedule, callback, metadata)
+        persist_jobs(new_state)
+        {:reply, :ok, new_state}
+    end
   end
 
   def handle_call({:toggle_job, name}, _from, state) do
@@ -283,6 +293,15 @@ defmodule Kyber.Cron do
     %{state | jobs: Map.put(state.jobs, name, job)}
   end
 
+  # Enforce minimum interval on {:every, ms} schedules.
+  # Returns the schedule (possibly clamped) or {:error, reason}.
+  defp enforce_min_interval({:every, ms}) when ms < @min_interval_ms do
+    Logger.warning("[Kyber.Cron] interval #{ms}ms below minimum #{@min_interval_ms}ms — clamping")
+    {:every, @min_interval_ms}
+  end
+
+  defp enforce_min_interval(schedule), do: schedule
+
   defp schedule_check(interval) do
     Process.send_after(self(), :check_jobs, interval)
   end
@@ -399,6 +418,11 @@ defmodule Kyber.Cron do
 
   defp serialize_schedule({:at, dt}),
     do: {:ok, %{"type" => "at", "datetime" => DateTime.to_iso8601(dt)}}
+
+  defp deserialize_schedule(%{"type" => "every", "ms" => ms}) when ms < @min_interval_ms do
+    Logger.warning("[Kyber.Cron] loaded job with interval #{ms}ms — clamping to #{@min_interval_ms}ms")
+    {:ok, {:every, @min_interval_ms}}
+  end
 
   defp deserialize_schedule(%{"type" => "every", "ms" => ms}), do: {:ok, {:every, ms}}
   defp deserialize_schedule(%{"type" => "cron", "expr" => expr}), do: {:ok, {:cron, expr}}

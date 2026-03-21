@@ -432,6 +432,26 @@ defmodule Kyber.Tools do
         },
         "required" => ["path"]
       }
+    },
+    %{
+      "name" => "cleanup_tmp",
+      "description" =>
+        "Clean up temporary files you created. Deletes files matching a prefix pattern " <>
+        "in /tmp that are older than max_age_seconds. Default pattern: 'stilgar_*', " <>
+        "default max age: 3600 seconds (1 hour). Use after camera_snap or any temp file work.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "pattern" => %{
+            "type" => "string",
+            "description" => "Filename prefix pattern (e.g. 'stilgar_*'). Default: 'stilgar_*'"
+          },
+          "max_age_seconds" => %{
+            "type" => "integer",
+            "description" => "Only delete files older than this many seconds. Default: 3600"
+          }
+        }
+      }
     }
   ]
 
