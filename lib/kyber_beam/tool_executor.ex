@@ -28,7 +28,7 @@ defmodule Kyber.ToolExecutor do
     System.tmp_dir!()
   ]
 
-  @vault_path Path.expand("~/.kyber/vault")
+  @vault_path Application.compile_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
   @web_fetch_max_bytes 50_000
 
   # SSRF: blocked host literals (IPv6 loopback stored without brackets)

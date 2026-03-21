@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Service identity -->
+  <key>Label</key>
+  <string>com.liet.kyber-beam</string>
+
+  <!--
+    Program: the startup script loads .env (DISCORD_BOT_TOKEN and any
+    other secrets) from the repo root before exec-ing mix run.
+    launchd does not source shell files, so we delegate to start.sh.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/liet/kyber-beam/scripts/start.sh</string>
+  </array>
+
+  <!-- Working directory -->
+  <key>WorkingDirectory</key>
+  <string>/Users/liet/kyber-beam</string>
+
+  <!-- Restart automatically if it exits -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Start on login -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Logs -->
+  <key>StandardOutPath</key>
+  <string>/Users/liet/.kyber/logs/kyber-beam.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/liet/.kyber/logs/kyber-beam-error.log</string>
+
+  <!--
+    PATH needs to include asdf shims so `mix` resolves correctly.
+    Adjust if you use a different version manager.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/liet/.asdf/shims:/Users/liet/.asdf/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/liet</string>
+    <key>MIX_ENV</key>
+    <string>prod</string>
+  </dict>
+
+  <!-- Throttle rapid crash loops: wait 10s before restarting -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>

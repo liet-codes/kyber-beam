@@ -242,7 +242,7 @@ defmodule Kyber.ToolExecutorTest do
       assert {:ok, msg} = ToolExecutor.execute("memory_write", %{"path" => path, "content" => content})
       assert String.contains?(msg, "Written")
 
-      vault_root = Path.expand("~/.kyber/vault")
+      vault_root = Application.get_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
       abs_path = Path.join(vault_root, path)
       on_exit(fn -> File.rm(abs_path) end)
       assert File.read!(abs_path) == content
