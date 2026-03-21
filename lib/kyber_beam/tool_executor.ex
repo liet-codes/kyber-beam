@@ -527,7 +527,8 @@ defmodule Kyber.ToolExecutor do
 
   def execute("camera_snap", input) do
     timestamp = System.system_time(:second)
-    output_path = Map.get(input, "output_path", "/tmp/stilgar_snap_#{timestamp}.jpg")
+    raw_path = Map.get(input, "output_path", "/tmp/stilgar_snap_#{timestamp}.jpg")
+    output_path = Path.expand(raw_path)
 
     Logger.info("[Kyber.ToolExecutor] camera_snap: #{output_path}")
 
@@ -607,7 +608,9 @@ defmodule Kyber.ToolExecutor do
     [
       Path.expand("~/.kyber"),
       Path.expand("~/kyber-beam"),
-      System.tmp_dir!()
+      System.tmp_dir!(),
+      "/tmp",
+      "/private/tmp"
     ]
   end
 
