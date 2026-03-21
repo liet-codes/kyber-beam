@@ -124,30 +124,59 @@ defmodule Kyber.Web.DashboardLive do
     <div style="padding: 16px 0;">
       <h1 style="color:#63b3ed;margin-bottom:16px;">Traces</h1>
       <p style="color:#718096;margin-bottom:16px;">Nested delta trace view — click to expand/collapse</p>
-      <div style="display:flex;flex-direction:column;gap:2px;">
+      <div style="display:flex;flex-direction:column;gap:12px;">
         <%= if @trace_entries == [] do %>
           <div style="color:#4a5568;text-align:center;padding:32px;">No traces yet…</div>
         <% end %>
         <%= for {delta, depth, has_children, expanded} <- @trace_entries do %>
+          <%!-- Waterfall + token summary for root traces --%>
+          <%= if depth == 0 and expanded do %>
+            <% waterfall = build_waterfall(@all_deltas, delta.id, delta.ts) %>
+            <% token_summary = trace_token_summary(@all_deltas, delta.id) %>
+            <div class="trace-card">
+              <%= if token_summary do %>
+                <div class="trace-token-summary"><%= token_summary %></div>
+              <% end %>
+              <div class="waterfall-container">
+                <%= for bar <- waterfall do %>
+                  <div class="wf-row">
+                    <div class="wf-label"><%= bar.label %></div>
+                    <div class="wf-track">
+                      <div
+                        class="wf-bar"
+                        style={"left:#{bar.offset_pct}%;width:#{bar.width_pct}%;background:#{waterfall_color(bar.kind)};"}
+                      >
+                        <span class="wf-ms"><%= bar.duration_ms %>ms</span>
+                      </div>
+                    </div>
+                  </div>
+                <% end %>
+              </div>
+            </div>
+          <% end %>
+          <%!-- Tree node --%>
           <div
-            style={"padding:10px 12px;padding-left:#{12 + depth * 16}px;background:#{if depth == 0, do: "#1a1d2e", else: "#151823"};border:1px solid #{if depth == 0, do: "#2d3748", else: "#1e2435"};border-radius:6px;cursor:pointer;min-height:44px;"}
+            class={"trace-node #{if depth == 0, do: "trace-root", else: "trace-child"}"}
+            style={"padding-left:#{12 + depth * 20}px;"}
             phx-click="toggle_trace"
             phx-value-id={delta.id}
           >
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <div class="trace-header">
               <%= if has_children do %>
-                <span style="color:#4a5568;font-size:0.85rem;width:14px;"><%= if expanded, do: "▼", else: "▶" %></span>
+                <span class="trace-toggle"><%= if expanded, do: "▼", else: "▶" %></span>
               <% else %>
-                <span style="width:14px;"></span>
+                <span class="trace-toggle-spacer"></span>
               <% end %>
-              <span style="font-size:1.1rem;"><%= kind_emoji(delta.kind) %></span>
-              <span style="color:#68d391;font-weight:bold;font-size:0.9rem;"><%= delta.kind %></span>
-              <span style="color:#718096;font-size:0.8rem;"><%= format_ts(delta.ts) %></span>
+              <span class="trace-kind" style={"color:#{delta_kind_color(delta.kind)};"}><%= delta.kind %></span>
+              <span class="trace-ts"><%= format_ts(delta.ts) %></span>
             </div>
-            <%= if expanded do %>
-              <div style="margin-top:8px;padding:8px;background:#0f1117;border-radius:4px;font-size:0.8rem;color:#a0aec0;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;overflow-x:hidden;" class="json-block">
-                <%= format_payload_json(delta.payload) %>
-              </div>
+            <div class="trace-summary">
+              <%= for line <- String.split(delta_summary(delta), "\n") do %>
+                <div><%= line %></div>
+              <% end %>
+            </div>
+            <%= if token_badge(delta) do %>
+              <div class="trace-tokens"><%= token_badge(delta) %></div>
             <% end %>
           </div>
         <% end %>
@@ -531,6 +560,7 @@ defmodule Kyber.Web.DashboardLive do
   defp kind_emoji("tool.result"), do: "📋"
   defp kind_emoji("plugin.loaded"), do: "🔌"
   defp kind_emoji("cron.fired"), do: "⏰"
+  defp kind_emoji("familiard.escalation"), do: "⚠️"
   defp kind_emoji(_), do: "📌"
 
   defp payload_preview(payload) when map_size(payload) == 0, do: ""
@@ -545,12 +575,209 @@ defmodule Kyber.Web.DashboardLive do
     end
   end
 
-  defp format_payload_json(payload) do
-    case Jason.encode(payload, pretty: true) do
-      {:ok, json} -> json
-      _ -> inspect(payload, pretty: true)
+
+  # ── Known entity maps ──────────────────────────────────────────────────
+
+  @known_users %{
+    "353690689571258376" => "mykola_b"
+  }
+
+  @known_guilds %{
+    "1483371179459870834" => "Arrakis"
+  }
+
+  @known_channels %{
+    "1483371179459870834" => "#general"
+  }
+
+  defp resolve_user(id), do: Map.get(@known_users, to_string(id), to_string(id))
+  defp resolve_guild(id), do: Map.get(@known_guilds, to_string(id), to_string(id))
+  defp resolve_channel(id), do: Map.get(@known_channels, to_string(id), "#" <> to_string(id))
+
+  # ── Rich delta summaries ───────────────────────────────────────────────
+
+  defp delta_summary(%{kind: "message.received", payload: p}) do
+    user = resolve_user(p["author_id"] || p["username"] || "?")
+    channel = resolve_channel(p["channel_id"])
+    guild = if p["guild_id"], do: " (#{resolve_guild(p["guild_id"])})", else: ""
+    text = p["text"] || ""
+    truncated = if String.length(text) > 80, do: String.slice(text, 0, 80) <> "…", else: text
+    "💬 **#{user}** in #{channel}#{guild}: \"#{truncated}\""
+  end
+
+  defp delta_summary(%{kind: "llm.call", payload: p}) do
+    model = p["model"] || "unknown"
+    msgs = p["message_count"] || "?"
+    tools = if is_list(p["tools"]), do: length(p["tools"]), else: p["tools"] || 0
+    "🤖 Calling #{model} with #{msgs} messages, #{tools} tools available"
+  end
+
+  defp delta_summary(%{kind: "llm.response", payload: p}) do
+    usage = p["usage"] || %{}
+    input = usage["input_tokens"] || 0
+    output = usage["output_tokens"] || 0
+    cache = usage["cache_read_input_tokens"] || 0
+    content = p["content"] || ""
+    preview = if String.length(content) > 200, do: String.slice(content, 0, 200) <> "…", else: content
+
+    cache_info = if cache > 0, do: " (#{format_number(cache)} cached)", else: ""
+    base = "💬 Responded (#{format_number(input)} in / #{format_number(output)} out#{cache_info})"
+    if preview != "", do: base <> "\n" <> preview, else: base
+  end
+
+  defp delta_summary(%{kind: "tool.call", payload: p}) do
+    name = p["name"] || "unknown"
+    input = p["input"] || %{}
+    params = input |> Enum.map(fn {k, v} -> "#{k}=#{inspect_short(v)}" end) |> Enum.join(", ")
+    "🔧 Calling **#{name}** with: {#{params}}"
+  end
+
+  defp delta_summary(%{kind: "tool.result", payload: p}) do
+    name = p["name"] || "unknown"
+    status = p["status"] || "unknown"
+    output = p["output"] || ""
+    len = if is_binary(output), do: String.length(output), else: String.length(inspect(output))
+
+    if status in ["ok", "success"] do
+      "✅ #{name} succeeded (#{format_number(len)} chars)"
+    else
+      error_preview = if is_binary(output), do: String.slice(output, 0, 100), else: inspect(output, limit: 3)
+      "❌ #{name} failed: #{error_preview}"
     end
   end
+
+  defp delta_summary(%{kind: "familiard.escalation", payload: p}) do
+    level = p["level"] || "info"
+    msg = p["message"] || ""
+    "⚠️ Escalation [#{level}]: #{String.slice(msg, 0, 120)}"
+  end
+
+  defp delta_summary(%{kind: kind, payload: p}) do
+    preview = payload_preview(p)
+    "#{kind_emoji(kind)} #{kind}" <> if(preview != "", do: ": #{preview}", else: "")
+  end
+
+  defp inspect_short(v) when is_binary(v) do
+    if String.length(v) > 60, do: "\"#{String.slice(v, 0, 60)}…\"", else: "\"#{v}\""
+  end
+
+  defp inspect_short(v), do: inspect(v, limit: 3, printable_limit: 60)
+
+  defp format_number(n) when is_integer(n) do
+    n
+    |> Integer.to_string()
+    |> String.graphemes()
+    |> Enum.reverse()
+    |> Enum.chunk_every(3)
+    |> Enum.map(&Enum.reverse/1)
+    |> Enum.reverse()
+    |> Enum.map(&Enum.join/1)
+    |> Enum.join(",")
+  end
+
+  defp format_number(n), do: to_string(n)
+
+  # ── Token aggregation ──────────────────────────────────────────────────
+
+  defp trace_token_summary(all_deltas, root_id) do
+    by_parent = Enum.group_by(all_deltas, & &1.parent_id)
+    descendants = collect_descendants(root_id, by_parent)
+
+    llm_responses = Enum.filter(descendants, &(&1.kind == "llm.response"))
+    count = length(llm_responses)
+
+    {total_in, total_out} =
+      Enum.reduce(llm_responses, {0, 0}, fn d, {ai, ao} ->
+        usage = d.payload["usage"] || %{}
+        {ai + (usage["input_tokens"] || 0), ao + (usage["output_tokens"] || 0)}
+      end)
+
+    if count > 0 do
+      "📊 Total: #{format_number(total_in)} in / #{format_number(total_out)} out across #{count} LLM call#{if count != 1, do: "s", else: ""}"
+    else
+      nil
+    end
+  end
+
+  defp collect_descendants(parent_id, by_parent) do
+    children = Map.get(by_parent, parent_id, [])
+
+    Enum.flat_map(children, fn child ->
+      [child | collect_descendants(child.id, by_parent)]
+    end)
+  end
+
+  # ── Waterfall data ─────────────────────────────────────────────────────
+
+  defp build_waterfall(all_deltas, root_id, root_ts) do
+    by_parent = Enum.group_by(all_deltas, & &1.parent_id)
+    descendants = collect_descendants(root_id, by_parent)
+    all_in_trace = [Enum.find(all_deltas, &(&1.id == root_id)) | descendants] |> Enum.reject(&is_nil/1)
+
+    trace_end = all_in_trace |> Enum.map(& &1.ts) |> Enum.max(fn -> root_ts end)
+    total_duration = max(trace_end - root_ts, 1)
+
+    all_in_trace
+    |> Enum.sort_by(& &1.ts)
+    |> Enum.map(fn d ->
+      offset_ms = d.ts - root_ts
+      offset_pct = offset_ms / total_duration * 100
+
+      # Estimate duration: for pairs like tool.call->tool.result, use next sibling
+      duration_ms = estimate_duration(d, all_in_trace, total_duration)
+      width_pct = max(duration_ms / total_duration * 100, 2)
+
+      %{
+        id: d.id,
+        kind: d.kind,
+        offset_pct: Float.round(offset_pct, 1),
+        width_pct: Float.round(min(width_pct, 100 - offset_pct), 1),
+        offset_ms: offset_ms,
+        duration_ms: duration_ms,
+        label: waterfall_label(d)
+      }
+    end)
+  end
+
+  defp estimate_duration(delta, all_in_trace, total_duration) do
+    sorted = Enum.sort_by(all_in_trace, & &1.ts)
+    idx = Enum.find_index(sorted, &(&1.id == delta.id))
+    next = Enum.at(sorted, (idx || 0) + 1)
+
+    cond do
+      next != nil -> max(next.ts - delta.ts, 1)
+      true -> max(div(total_duration, 10), 1)
+    end
+  end
+
+  defp waterfall_label(%{kind: "message.received"}), do: "msg"
+  defp waterfall_label(%{kind: "llm.call"}), do: "llm→"
+  defp waterfall_label(%{kind: "llm.response"}), do: "←llm"
+  defp waterfall_label(%{kind: "tool.call", payload: p}), do: p["name"] || "tool→"
+  defp waterfall_label(%{kind: "tool.result", payload: p}), do: "←#{p["name"] || "tool"}"
+  defp waterfall_label(%{kind: kind}), do: kind
+
+  defp waterfall_color("message.received"), do: "#68d391"
+  defp waterfall_color("llm.call"), do: "#63b3ed"
+  defp waterfall_color("llm.response"), do: "#b794f4"
+  defp waterfall_color("tool.call"), do: "#fbd38d"
+  defp waterfall_color("tool.result"), do: "#f6e05e"
+  defp waterfall_color(_), do: "#a0aec0"
+
+  defp token_badge(%{kind: "llm.response", payload: p}) do
+    usage = p["usage"] || %{}
+    input = usage["input_tokens"] || 0
+    output = usage["output_tokens"] || 0
+    total = input + output
+
+    if total > 0 do
+      "📊 #{format_number(input)} in / #{format_number(output)} out (#{format_number(total)} total)"
+    else
+      nil
+    end
+  end
+
+  defp token_badge(_), do: nil
 
   defp stat_card_style do
     "background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:16px;"
