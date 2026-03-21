@@ -130,25 +130,22 @@ defmodule Kyber.Web.DashboardLive do
         <% end %>
         <%= for {delta, depth, has_children, expanded} <- @trace_entries do %>
           <div
-            style={"padding:8px 12px;padding-left:#{12 + depth * 24}px;background:#{if depth == 0, do: "#1a1d2e", else: "#151823"};border:1px solid #{if depth == 0, do: "#2d3748", else: "#1e2435"};border-radius:6px;cursor:pointer;"}
+            style={"padding:10px 12px;padding-left:#{12 + depth * 16}px;background:#{if depth == 0, do: "#1a1d2e", else: "#151823"};border:1px solid #{if depth == 0, do: "#2d3748", else: "#1e2435"};border-radius:6px;cursor:pointer;min-height:44px;"}
             phx-click="toggle_trace"
             phx-value-id={delta.id}
           >
-            <div style="display:flex;align-items:center;gap:8px;">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
               <%= if has_children do %>
-                <span style="color:#4a5568;font-size:0.75rem;width:12px;"><%= if expanded, do: "▼", else: "▶" %></span>
+                <span style="color:#4a5568;font-size:0.85rem;width:14px;"><%= if expanded, do: "▼", else: "▶" %></span>
               <% else %>
-                <span style="width:12px;"></span>
+                <span style="width:14px;"></span>
               <% end %>
-              <span><%= kind_emoji(delta.kind) %></span>
-              <span style="color:#68d391;font-weight:bold;font-size:0.85rem;"><%= delta.kind %></span>
-              <span style="color:#718096;font-size:0.75rem;"><%= format_ts(delta.ts) %></span>
-              <span style="color:#a0aec0;font-size:0.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:500px;">
-                <%= payload_preview(delta.payload) %>
-              </span>
+              <span style="font-size:1.1rem;"><%= kind_emoji(delta.kind) %></span>
+              <span style="color:#68d391;font-weight:bold;font-size:0.9rem;"><%= delta.kind %></span>
+              <span style="color:#718096;font-size:0.8rem;"><%= format_ts(delta.ts) %></span>
             </div>
             <%= if expanded do %>
-              <div style="margin-top:8px;padding:8px;background:#0f1117;border-radius:4px;font-size:0.8rem;color:#a0aec0;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;">
+              <div style="margin-top:8px;padding:8px;background:#0f1117;border-radius:4px;font-size:0.8rem;color:#a0aec0;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;overflow-x:hidden;" class="json-block">
                 <%= format_payload_json(delta.payload) %>
               </div>
             <% end %>
@@ -167,15 +164,15 @@ defmodule Kyber.Web.DashboardLive do
       <div style="display:flex;flex-direction:column;gap:8px;">
         <%= for delta <- @recent_deltas do %>
           <div phx-click="toggle_delta" phx-value-id={delta.id}
-               style={"background:#1a1d2e;border:1px solid #{delta_border_color(delta.kind)};border-radius:8px;padding:12px;font-size:0.85rem;cursor:pointer;transition:border-color 0.2s;"}>
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+               style={"background:#1a1d2e;border:1px solid #{delta_border_color(delta.kind)};border-radius:8px;padding:12px 14px;font-size:0.9rem;cursor:pointer;transition:border-color 0.2s;min-height:44px;"}>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px;">
               <div style="display:flex;align-items:center;gap:8px;">
-                <span style="font-size:0.7rem;"><%= delta_icon(delta.kind) %></span>
-                <span style={"color:#{delta_kind_color(delta.kind)};font-weight:bold;"}><%= delta.kind %></span>
+                <span style="font-size:1rem;"><%= delta_icon(delta.kind) %></span>
+                <span style={"color:#{delta_kind_color(delta.kind)};font-weight:bold;font-size:0.9rem;"}><%= delta.kind %></span>
               </div>
               <span style="color:#718096;font-size:0.8rem;"><%= format_ts(delta.ts) %></span>
             </div>
-            <div style="color:#a0aec0;font-size:0.8rem;">
+            <div style="color:#a0aec0;font-size:0.8rem;overflow:hidden;text-overflow:ellipsis;">
               id: <span style="color:#63b3ed;"><%= String.slice(delta.id, 0, 12) %>…</span>
               <%= if delta.origin do %>
                 <span style="color:#718096;margin-left:8px;">origin: <%= inspect_origin(delta.origin) %></span>
@@ -244,7 +241,7 @@ defmodule Kyber.Web.DashboardLive do
       <h1 style="color:#63b3ed;margin-bottom:24px;">Kyber BEAM — Overview</h1>
 
       <!-- Stats row -->
-      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;margin-bottom:32px;">
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-bottom:24px;">
         <div style={stat_card_style()}>
           <div style="color:#718096;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;">Uptime</div>
           <div style="color:#68d391;font-size:1.4rem;font-weight:bold;margin-top:4px;"><%= format_uptime(@started_at) %></div>
@@ -267,8 +264,8 @@ defmodule Kyber.Web.DashboardLive do
         </div>
       </div>
 
-      <!-- Two-column layout -->
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;">
+      <!-- Two-column layout (stacks on mobile) -->
+      <div style="display:grid;grid-template-columns:1fr;gap:16px;" class="two-col">
 
         <!-- Plugins -->
         <div style="background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:20px;">

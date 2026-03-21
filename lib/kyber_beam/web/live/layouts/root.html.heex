@@ -7,12 +7,21 @@
     <title>Kyber BEAM Dashboard</title>
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
-      body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0f1117; color: #e2e8f0; }
-      nav { background: #1a1d2e; border-bottom: 1px solid #2d3748; padding: 12px 24px; display: flex; align-items: center; gap: 24px; }
-      nav .brand { color: #63b3ed; font-weight: bold; font-size: 1.1rem; }
-      nav a { color: #a0aec0; text-decoration: none; font-size: 0.9rem; }
-      nav a:hover { color: #63b3ed; }
-      main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+      body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0f1117; color: #e2e8f0; -webkit-text-size-adjust: 100%; }
+      nav { background: #1a1d2e; border-bottom: 1px solid #2d3748; padding: 10px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      nav .brand { color: #63b3ed; font-weight: bold; font-size: 1rem; margin-right: 4px; }
+      nav a { color: #a0aec0; text-decoration: none; font-size: 0.85rem; padding: 6px 10px; border-radius: 6px; min-height: 36px; display: flex; align-items: center; }
+      nav a:hover, nav a:active { color: #63b3ed; background: #2d3748; }
+      main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+      @media (min-width: 768px) {
+        nav { padding: 12px 24px; gap: 16px; }
+        main { padding: 24px; }
+        .two-col { grid-template-columns: 1fr 1fr !important; gap: 24px !important; }
+      }
+      /* Mobile-friendly JSON blocks */
+      pre, .json-block { word-break: break-all; overflow-wrap: break-word; }
+      /* Touch-friendly tap targets */
+      [phx-click] { min-height: 44px; display: flex; flex-direction: column; justify-content: center; }
     </style>
     <!-- Phoenix/LiveView JS — classic script tags for broad mobile compatibility -->
     <script src="/assets/phoenix/phoenix.min.js"></script>
