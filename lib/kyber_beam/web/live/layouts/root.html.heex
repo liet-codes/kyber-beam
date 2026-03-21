@@ -22,6 +22,69 @@
       pre, .json-block { word-break: break-all; overflow-wrap: break-word; }
       /* Touch-friendly tap targets — use padding not flex override */
       [phx-click] { min-height: 44px; cursor: pointer; -webkit-tap-highlight-color: rgba(99,179,237,0.15); }
+
+      /* ── Trace view ─────────────────────────────────────── */
+      .trace-card {
+        background: #1a1d2e; border: 1px solid #2d3748; border-radius: 8px;
+        padding: 12px; margin-bottom: 4px;
+      }
+      .trace-token-summary {
+        color: #fbd38d; font-size: 0.8rem; margin-bottom: 10px;
+        padding: 6px 10px; background: #1e2435; border-radius: 6px;
+      }
+      .waterfall-container { display: flex; flex-direction: column; gap: 2px; }
+      .wf-row {
+        display: flex; align-items: center; gap: 8px;
+        min-height: 28px;
+      }
+      .wf-label {
+        color: #a0aec0; font-size: 0.7rem; width: 56px; flex-shrink: 0;
+        text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .wf-track {
+        flex: 1; position: relative; height: 22px;
+        background: #151823; border-radius: 4px; overflow: hidden;
+      }
+      .wf-bar {
+        position: absolute; top: 2px; bottom: 2px; border-radius: 3px;
+        display: flex; align-items: center; justify-content: center;
+        min-width: 24px; opacity: 0.85; transition: opacity 0.15s;
+      }
+      .wf-bar:hover { opacity: 1; }
+      .wf-ms {
+        color: #0f1117; font-size: 0.6rem; font-weight: bold;
+        white-space: nowrap; padding: 0 4px;
+      }
+      .trace-node {
+        padding: 10px 12px; border-radius: 6px; cursor: pointer;
+        transition: background 0.15s;
+      }
+      .trace-root { background: #1a1d2e; border: 1px solid #2d3748; }
+      .trace-child { background: #151823; border: 1px solid #1e2435; }
+      .trace-node:active { background: #242838; }
+      .trace-header {
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      }
+      .trace-toggle { color: #4a5568; font-size: 0.75rem; width: 14px; flex-shrink: 0; }
+      .trace-toggle-spacer { width: 14px; flex-shrink: 0; }
+      .trace-kind { font-weight: bold; font-size: 0.8rem; }
+      .trace-ts { color: #718096; font-size: 0.7rem; }
+      .trace-summary {
+        color: #e2e8f0; font-size: 0.8rem; margin-top: 4px;
+        line-height: 1.5; word-break: break-word;
+      }
+      .trace-tokens {
+        color: #b794f4; font-size: 0.75rem; margin-top: 4px;
+      }
+      @media (max-width: 480px) {
+        .wf-row { min-height: 44px; }
+        .wf-track { height: 36px; }
+        .wf-bar { top: 3px; bottom: 3px; }
+        .wf-label { width: 48px; font-size: 0.65rem; }
+        .wf-ms { font-size: 0.55rem; }
+        .trace-node { padding: 12px 10px; }
+        .trace-summary { font-size: 0.75rem; }
+      }
     </style>
     <!-- Phoenix/LiveView JS — classic script tags for broad mobile compatibility -->
     <script src="/assets/phoenix/phoenix.min.js"></script>
