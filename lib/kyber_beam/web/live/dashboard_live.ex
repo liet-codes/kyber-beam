@@ -38,6 +38,7 @@ defmodule Kyber.Web.DashboardLive do
       socket
       |> assign(:started_at, System.system_time(:millisecond))
       |> assign(:node_name, node())
+      |> assign(:expanded, MapSet.new())
       |> load_state()
 
     {:ok, socket}
@@ -67,6 +68,13 @@ defmodule Kyber.Web.DashboardLive do
     {:noreply, socket}
   end
 
+  @impl true
+  def handle_event("toggle_delta", %{"id" => id}, socket) do
+    expanded = socket.assigns.expanded
+    expanded = if MapSet.member?(expanded, id), do: MapSet.delete(expanded, id), else: MapSet.put(expanded, id)
+    {:noreply, assign(socket, :expanded, expanded)}
+  end
+
   # ── Render ────────────────────────────────────────────────────────────────
 
   @impl true
@@ -77,16 +85,34 @@ defmodule Kyber.Web.DashboardLive do
       <p style="color:#718096;margin-bottom:16px;">Live feed — newest first. Total: <%= @delta_count %></p>
       <div style="display:flex;flex-direction:column;gap:8px;">
         <%= for delta <- @recent_deltas do %>
-          <div style="background:#1a1d2e;border:1px solid #2d3748;border-radius:8px;padding:12px;font-size:0.85rem;">
-            <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-              <span style="color:#68d391;font-weight:bold;"><%= delta.kind %></span>
-              <span style="color:#718096;"><%= format_ts(delta.ts) %></span>
-            </div>
-            <div style="color:#a0aec0;">id: <span style="color:#63b3ed;"><%= String.slice(delta.id, 0, 12) %>…</span></div>
-            <%= if map_size(delta.payload) > 0 do %>
-              <div style="color:#a0aec0;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-                <%= inspect(delta.payload) %>
+          <div phx-click="toggle_delta" phx-value-id={delta.id}
+               style={"background:#1a1d2e;border:1px solid #{delta_border_color(delta.kind)};border-radius:8px;padding:12px;font-size:0.85rem;cursor:pointer;transition:border-color 0.2s;"}>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <div style="display:flex;align-items:center;gap:8px;">
+                <span style="font-size:0.7rem;"><%= delta_icon(delta.kind) %></span>
+                <span style={"color:#{delta_kind_color(delta.kind)};font-weight:bold;"}><%= delta.kind %></span>
               </div>
+              <span style="color:#718096;font-size:0.8rem;"><%= format_ts(delta.ts) %></span>
+            </div>
+            <div style="color:#a0aec0;font-size:0.8rem;">
+              id: <span style="color:#63b3ed;"><%= String.slice(delta.id, 0, 12) %>…</span>
+              <%= if delta.origin do %>
+                <span style="color:#718096;margin-left:8px;">origin: <%= inspect_origin(delta.origin) %></span>
+              <% end %>
+            </div>
+            <%= if MapSet.member?(@expanded, delta.id) do %>
+              <div style="margin-top:12px;padding-top:12px;border-top:1px solid #2d3748;">
+                <pre style="color:#e2e8f0;font-size:0.8rem;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;"><%= Jason.encode!(delta.payload, pretty: true) %></pre>
+                <%= if delta.parent_id do %>
+                  <div style="color:#718096;font-size:0.75rem;margin-top:8px;">parent: <span style="color:#b794f4;"><%= delta.parent_id %></span></div>
+                <% end %>
+              </div>
+            <% else %>
+              <%= if map_size(delta.payload) > 0 do %>
+                <div style="color:#4a5568;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.8rem;">
+                  <%= delta.payload |> Map.keys() |> Enum.join(", ") %>  — tap to expand
+                </div>
+              <% end %>
             <% end %>
           </div>
         <% end %>
@@ -182,10 +208,19 @@ defmodule Kyber.Web.DashboardLive do
         <div style="background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:20px;">
           <h2 style="color:#a0aec0;font-size:0.9rem;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:16px;">Recent Deltas</h2>
           <%= for delta <- Enum.take(@recent_deltas, 8) do %>
-            <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e2435;font-size:0.8rem;">
-              <span style="color:#68d391;"><%= delta.kind %></span>
+            <div phx-click="toggle_delta" phx-value-id={delta.id}
+                 style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1e2435;font-size:0.8rem;cursor:pointer;">
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="font-size:0.65rem;"><%= delta_icon(delta.kind) %></span>
+                <span style={"color:#{delta_kind_color(delta.kind)};"}><%= delta.kind %></span>
+              </div>
               <span style="color:#4a5568;"><%= format_ts(delta.ts) %></span>
             </div>
+            <%= if MapSet.member?(@expanded, delta.id) do %>
+              <div style="padding:8px 0 12px;border-bottom:1px solid #2d3748;">
+                <pre style="color:#e2e8f0;font-size:0.75rem;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;"><%= Jason.encode!(delta.payload, pretty: true) %></pre>
+              </div>
+            <% end %>
           <% end %>
           <%= if @recent_deltas == [] do %>
             <div style="color:#4a5568;font-size:0.9rem;">No deltas yet</div>
@@ -312,6 +347,56 @@ defmodule Kyber.Web.DashboardLive do
       true -> "#{div(diff_s, 3600)}h #{rem(div(diff_s, 60), 60)}m"
     end
   end
+
+  defp delta_icon(kind) do
+    case kind do
+      "message.received" -> "💬"
+      "llm.response" -> "🧠"
+      "tool_use" -> "🔧"
+      "cron.fired" -> "⏰"
+      "send_message" -> "📤"
+      "session." <> _ -> "📋"
+      "error" <> _ -> "❌"
+      _ -> "◆"
+    end
+  end
+
+  defp delta_kind_color(kind) do
+    case kind do
+      "message.received" -> "#68d391"
+      "llm.response" -> "#63b3ed"
+      "tool_use" -> "#fbd38d"
+      "cron.fired" -> "#b794f4"
+      "send_message" -> "#4fd1c5"
+      "error" <> _ -> "#fc8181"
+      _ -> "#a0aec0"
+    end
+  end
+
+  defp delta_border_color(kind) do
+    case kind do
+      "error" <> _ -> "#fc8181"
+      _ -> "#2d3748"
+    end
+  end
+
+  defp inspect_origin(origin) when is_map(origin) do
+    cond do
+      origin["chat_id"] -> "chat:#{origin["chat_id"]}"
+      origin["type"] -> origin["type"]
+      true -> inspect(origin)
+    end
+  end
+
+  defp inspect_origin(origin) when is_tuple(origin) do
+    case origin do
+      {:channel, "discord", cid, _} -> "discord:#{cid}"
+      {:cron, name} -> "cron:#{name}"
+      _ -> inspect(origin)
+    end
+  end
+
+  defp inspect_origin(origin), do: inspect(origin)
 
   defp stat_card_style do
     "background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:16px;"
