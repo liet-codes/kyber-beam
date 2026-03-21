@@ -555,6 +555,27 @@ defmodule Kyber.Plugin.LLM do
                   "content" => output
                 }
 
+              {:ok_image, %{"media_type" => media_type, "base64" => b64, "path" => path, "size_bytes" => size}} ->
+                Logger.info("[Kyber.Plugin.LLM] view_image: #{path} (#{size} bytes)")
+                %{
+                  "type" => "tool_result",
+                  "tool_use_id" => tu["id"],
+                  "content" => [
+                    %{
+                      "type" => "image",
+                      "source" => %{
+                        "type" => "base64",
+                        "media_type" => media_type,
+                        "data" => b64
+                      }
+                    },
+                    %{
+                      "type" => "text",
+                      "text" => "Image loaded: #{path} (#{size} bytes)"
+                    }
+                  ]
+                }
+
               {:error, err} ->
                 Logger.warning("[Kyber.Plugin.LLM] tool error (#{tool_name}): #{err}")
 
@@ -660,10 +681,14 @@ defmodule Kyber.Plugin.LLM do
 
 ## Your Capabilities
 
-You are a Claude model with vision — you CAN see and analyze images attached to Discord messages.
-When someone sends you an image, you can describe it, answer questions about it, etc.
-You also have a `camera_snap` tool to take photos via the MacBook camera, and a `send_file` tool
-to post files/images back to the Discord channel. Use them together: snap → send_file.
+You are a Claude model with vision — you CAN see and analyze images.
+
+**Image workflow:**
+- When someone attaches an image to a Discord message, you see it automatically.
+- To take a photo: `camera_snap` → `view_image` (to see it) → `send_file` (to post it).
+- To look at any image file: `view_image` with the file path.
+- IMPORTANT: `camera_snap` only returns a file path. You MUST call `view_image` on that path
+  to actually see the photo before describing it. Never describe a photo you haven't viewed.
 """
 
     vault_instruction = """
