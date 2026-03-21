@@ -568,4 +568,246 @@ defmodule Kyber.Plugin.DiscordTest do
       assert function_exported?(Discord, :update_presence, 2)
     end
   end
+
+  # ── Feature: Slash Commands ─────────────────────────────────────────────────
+
+  describe "register_slash_commands/2" do
+    test "function exists with arity 2" do
+      assert function_exported?(Discord, :register_slash_commands, 2)
+    end
+  end
+
+  describe "build_interaction_delta/1" do
+    test "function exists with arity 1" do
+      assert function_exported?(Discord, :build_interaction_delta, 1)
+    end
+
+    test "builds a message.received delta from /ask interaction" do
+      data = %{
+        "id" => "interaction_001",
+        "token" => "tok_abc",
+        "application_id" => "app_123",
+        "channel_id" => "ch_slash",
+        "guild_id" => "guild_1",
+        "type" => 2,
+        "member" => %{"user" => %{"id" => "user_1", "username" => "slasher"}},
+        "data" => %{
+          "name" => "ask",
+          "options" => [%{"name" => "query", "value" => "What is life?"}]
+        }
+      }
+
+      delta = Discord.build_interaction_delta(data)
+
+      assert delta.kind == "message.received"
+      assert delta.payload["text"] == "What is life?"
+      assert delta.payload["channel_id"] == "ch_slash"
+      assert delta.payload["author_id"] == "user_1"
+      assert delta.payload["username"] == "slasher"
+      assert delta.payload["interaction_id"] == "interaction_001"
+      assert delta.payload["interaction_token"] == "tok_abc"
+      assert delta.payload["application_id"] == "app_123"
+      assert delta.payload["command"] == "ask"
+    end
+
+    test "/status maps to a status prompt" do
+      data = %{
+        "id" => "i2", "token" => "t2", "application_id" => "app_1",
+        "channel_id" => "ch_1", "type" => 2,
+        "user" => %{"id" => "u1", "username" => "tester"},
+        "data" => %{"name" => "status", "options" => []}
+      }
+      delta = Discord.build_interaction_delta(data)
+      assert delta.payload["text"] =~ ~r/status/i
+      assert delta.payload["command"] == "status"
+    end
+
+    test "/context maps to a context prompt" do
+      data = %{
+        "id" => "i3", "token" => "t3", "application_id" => "app_1",
+        "channel_id" => "ch_1", "type" => 2,
+        "user" => %{"id" => "u1", "username" => "tester"},
+        "data" => %{"name" => "context", "options" => []}
+      }
+      delta = Discord.build_interaction_delta(data)
+      assert delta.payload["text"] =~ ~r/context/i
+    end
+
+    test "/history maps to a history prompt" do
+      data = %{
+        "id" => "i4", "token" => "t4", "application_id" => "app_1",
+        "channel_id" => "ch_1", "type" => 2,
+        "user" => %{"id" => "u1", "username" => "tester"},
+        "data" => %{"name" => "history", "options" => []}
+      }
+      delta = Discord.build_interaction_delta(data)
+      assert delta.payload["text"] =~ ~r/histor/i
+    end
+
+    test "/forget maps to a forget prompt" do
+      data = %{
+        "id" => "i5", "token" => "t5", "application_id" => "app_1",
+        "channel_id" => "ch_1", "type" => 2,
+        "user" => %{"id" => "u1", "username" => "tester"},
+        "data" => %{"name" => "forget", "options" => []}
+      }
+      delta = Discord.build_interaction_delta(data)
+      assert delta.payload["text"] =~ ~r/clear|forget/i
+    end
+
+    test "delta origin is a channel tuple" do
+      data = %{
+        "id" => "i6", "token" => "t6", "application_id" => "app_1",
+        "channel_id" => "ch_slash", "type" => 2,
+        "user" => %{"id" => "u2", "username" => "tester2"},
+        "data" => %{"name" => "status", "options" => []}
+      }
+      delta = Discord.build_interaction_delta(data)
+      assert {:channel, "discord", "ch_slash", "u2"} = delta.origin
+    end
+
+    test "interaction payload has empty attachments" do
+      data = %{
+        "id" => "i7", "token" => "t7", "application_id" => "app_1",
+        "channel_id" => "ch_1", "type" => 2,
+        "user" => %{"id" => "u1", "username" => "u"},
+        "data" => %{"name" => "status", "options" => []}
+      }
+      delta = Discord.build_interaction_delta(data)
+      assert delta.payload["attachments"] == []
+    end
+  end
+
+  # ── Feature: Embed Support ──────────────────────────────────────────────────
+
+  describe "extract_code_embeds/1" do
+    test "function exists with arity 1" do
+      assert function_exported?(Discord, :extract_code_embeds, 1)
+    end
+
+    test "returns empty list for nil" do
+      assert Discord.extract_code_embeds(nil) == []
+    end
+
+    test "returns empty list for empty string" do
+      assert Discord.extract_code_embeds("") == []
+    end
+
+    test "returns empty list for plain text (no code blocks)" do
+      assert Discord.extract_code_embeds("Hello, this is plain text.") == []
+    end
+
+    test "extracts a single elixir code block" do
+      content = ~s(Here is some code:\n```elixir\nIO.puts \"hello\"\n```)
+      embeds = Discord.extract_code_embeds(content)
+      assert length(embeds) == 1
+      [embed] = embeds
+      assert embed["title"] == "ELIXIR"
+      assert String.contains?(embed["description"], "```elixir")
+      assert String.contains?(embed["description"], "IO.puts")
+      assert embed["color"] == 0x5865F2
+    end
+
+    test "extracts a code block without language tag" do
+      content = "```\nsome code\n```"
+      embeds = Discord.extract_code_embeds(content)
+      assert length(embeds) == 1
+      [embed] = embeds
+      assert embed["title"] == "Code"
+      assert String.contains?(embed["description"], "some code")
+    end
+
+    test "extracts multiple code blocks" do
+      content = """
+      First:
+      ```python
+      print("hello")
+      ```
+
+      Second:
+      ```bash
+      echo "world"
+      ```
+      """
+      embeds = Discord.extract_code_embeds(content)
+      assert length(embeds) == 2
+      titles = Enum.map(embeds, & &1["title"])
+      assert "PYTHON" in titles
+      assert "BASH" in titles
+    end
+
+    test "embed description is within Discord's 4096 char limit" do
+      big_code = String.duplicate("x", 4000)
+      content = "```elixir\n#{big_code}\n```"
+      embeds = Discord.extract_code_embeds(content)
+      assert length(embeds) == 1
+      [embed] = embeds
+      assert String.length(embed["description"]) <= 4096
+    end
+  end
+
+  # ── Feature: File/Image Sending ─────────────────────────────────────────────
+
+  describe "send_message effect handler: files support" do
+    test "files field extracted from effect payload" do
+      effect = %{
+        type: :send_message,
+        payload: %{
+          "channel_id" => "ch_123",
+          "content" => "Here is an image",
+          "files" => ["/tmp/test_image.png"]
+        }
+      }
+
+      files = get_in(effect, [:payload, "files"]) || []
+      channel_id = get_in(effect, [:payload, "channel_id"])
+      content = get_in(effect, [:payload, "content"])
+
+      assert files == ["/tmp/test_image.png"]
+      assert channel_id == "ch_123"
+      assert content == "Here is an image"
+    end
+
+    test "empty files list falls through to regular message" do
+      effect = %{
+        type: :send_message,
+        payload: %{"channel_id" => "ch_123", "content" => "no files", "files" => []}
+      }
+
+      files = get_in(effect, [:payload, "files"]) || []
+      assert files == []
+    end
+  end
+
+  describe "send_message effect handler: interaction context" do
+    test "interaction token and app_id extracted from effect payload" do
+      effect = %{
+        type: :send_message,
+        payload: %{
+          "channel_id" => "ch_1",
+          "content" => "slash response",
+          "interaction_token" => "itok_xyz",
+          "application_id" => "app_999"
+        }
+      }
+
+      interaction_token = get_in(effect, [:payload, "interaction_token"])
+      application_id = get_in(effect, [:payload, "application_id"])
+      content = get_in(effect, [:payload, "content"])
+
+      assert interaction_token == "itok_xyz"
+      assert application_id == "app_999"
+      assert content == "slash response"
+    end
+
+    test "missing interaction_token routes to regular channel send" do
+      effect = %{
+        type: :send_message,
+        payload: %{"channel_id" => "ch_1", "content" => "regular message"}
+      }
+
+      interaction_token = get_in(effect, [:payload, "interaction_token"])
+      assert is_nil(interaction_token)
+    end
+  end
 end

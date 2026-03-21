@@ -36,6 +36,18 @@ defmodule Kyber.Plugin.Discord do
   # Max Discord message length (characters)
   @max_message_length 2000
 
+  # Discord interaction types
+  @interaction_type_application_command 2
+
+  # Discord interaction response types — 5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+  @interaction_response_deferred_channel_message 5
+
+  # Slash command option types — 3 = STRING
+  @option_type_string 3
+
+  # Regex to detect fenced code blocks in LLM responses
+  @code_block_pattern ~r/```(\w*)\n?(.*?)```/s
+
   # Intents: GUILDS (1) | GUILD_MESSAGES (512) | DIRECT_MESSAGES (4096) | MESSAGE_CONTENT (32768)
   # = 1 + 512 + 4096 + 32768 = 37377
   # Matches the TypeScript kyber build. Do NOT include GUILD_MEMBERS (2) — it's privileged.
@@ -225,6 +237,119 @@ defmodule Kyber.Plugin.Discord do
   @spec update_presence(GenServer.server(), map()) :: :ok
   def update_presence(server \\ __MODULE__, presence) do
     GenServer.cast(server, {:update_presence, presence})
+  end
+
+  @doc """
+  Register global slash commands for the bot application.
+
+  Uses bulk-overwrite (PUT) so commands are idempotent on each boot.
+  Commands: /ask, /status, /context, /history, /forget
+  """
+  @spec register_slash_commands(String.t(), String.t()) :: :ok | {:error, term()}
+  def register_slash_commands(token, app_id) do
+    url = "#{@discord_api_base}/applications/#{app_id}/commands"
+    headers = [{"Authorization", "Bot #{token}"}, {"Content-Type", "application/json"}]
+
+    commands = [
+      %{
+        "name" => "ask",
+        "description" => "Ask Kyber a question",
+        "options" => [
+          %{
+            "type" => @option_type_string,
+            "name" => "query",
+            "description" => "Your question",
+            "required" => true
+          }
+        ]
+      },
+      %{"name" => "status", "description" => "Get bot status"},
+      %{"name" => "context", "description" => "Show current session context"},
+      %{"name" => "history", "description" => "Show recent message history"},
+      %{"name" => "forget", "description" => "Clear the current session"}
+    ]
+
+    case Req.put(url, headers: headers, json: commands) do
+      {:ok, %{status: status}} when status in 200..299 ->
+        Logger.info("[Kyber.Plugin.Discord] slash commands registered (#{length(commands)} commands)")
+        :ok
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.warning("[Kyber.Plugin.Discord] slash command registration failed: #{status} #{inspect(body)}")
+        {:error, %{status: status, body: body}}
+
+      {:error, reason} ->
+        Logger.error("[Kyber.Plugin.Discord] slash command registration error: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Build a delta from a Discord INTERACTION_CREATE event (slash command).
+
+  Routes slash commands through the same message.received pipeline.
+  The payload carries `interaction_id`, `interaction_token`, and `application_id`
+  so the send_message effect handler can respond via the interaction webhook.
+  """
+  @spec build_interaction_delta(map()) :: Kyber.Delta.t()
+  def build_interaction_delta(data) do
+    command_name = get_in(data, ["data", "name"]) || ""
+    channel_id = data["channel_id"] || "unknown"
+    application_id = data["application_id"] || ""
+    guild_id = data["guild_id"]
+
+    user = get_in(data, ["member", "user"]) || data["user"] || %{}
+    author_id = user["id"] || "unknown"
+    username = user["username"]
+
+    text = build_interaction_text(command_name, data)
+
+    payload = %{
+      "text" => text,
+      "channel_id" => channel_id,
+      "author_id" => author_id,
+      "guild_id" => guild_id,
+      "username" => username,
+      "message_id" => nil,
+      "attachments" => [],
+      "interaction_id" => data["id"],
+      "interaction_token" => data["token"],
+      "application_id" => application_id,
+      "command" => command_name
+    }
+
+    Kyber.Delta.new(
+      "message.received",
+      payload,
+      {:channel, "discord", channel_id, author_id}
+    )
+  end
+
+  @doc """
+  Extract Discord embed maps from fenced code blocks in text content.
+
+  Each ```lang\\n...``` block becomes an embed with the language as title
+  and the code as a Discord code block in the description.
+  Returns an empty list if no code blocks are found.
+  """
+  @spec extract_code_embeds(String.t() | nil) :: [map()]
+  def extract_code_embeds(nil), do: []
+  def extract_code_embeds(""), do: []
+
+  def extract_code_embeds(content) when is_binary(content) do
+    Regex.scan(@code_block_pattern, content, capture: :all_but_first)
+    |> Enum.map(fn
+      [lang, code] ->
+        title = if lang == "", do: "Code", else: String.upcase(lang)
+        trimmed_code = String.slice(code, 0, 3900)
+        fence = if lang == "", do: "```", else: "```#{lang}"
+        description = "#{fence}\n#{String.trim(trimmed_code)}\n```"
+        %{"title" => title, "description" => description, "color" => 0x5865F2}
+
+      _ ->
+        nil
+    end)
+    |> Enum.reject(&is_nil/1)
   end
 
   @doc "Parse a raw Discord Gateway message (JSON map) into a structured event."
@@ -428,16 +553,45 @@ defmodule Kyber.Plugin.Discord do
 
       content = get_in(effect, [:payload, "content"]) ||
                 get_in(effect, [:payload, "text"]) ||
-                get_in(effect, ["content"])
+                get_in(effect, ["content"]) || ""
 
       reply_to = get_in(effect, [:payload, "reply_to"])
-      opts = if reply_to, do: [reply_to: reply_to], else: []
 
-      if channel_id && content do
-        send_message(token, channel_id, content, opts)
-      else
-        Logger.warning("[Kyber.Plugin.Discord] send_message effect missing channel_id or content")
-        {:error, :missing_params}
+      # Slash command interaction context (carried through from INTERACTION_CREATE delta)
+      interaction_token = get_in(effect, [:payload, "interaction_token"])
+      application_id = get_in(effect, [:payload, "application_id"])
+
+      # Embed support: explicit embeds in payload OR auto-extracted from code blocks
+      explicit_embeds = get_in(effect, [:payload, "embeds"])
+      code_embeds = if is_nil(explicit_embeds), do: extract_code_embeds(content), else: []
+      embeds = explicit_embeds || (if code_embeds != [], do: code_embeds, else: nil)
+
+      # File/image sending: list of file paths in the effect payload
+      files = get_in(effect, [:payload, "files"]) || []
+
+      opts = []
+      opts = if reply_to, do: Keyword.put(opts, :reply_to, reply_to), else: opts
+      opts = if embeds, do: Keyword.put(opts, :embeds, embeds), else: opts
+
+      cond do
+        # Slash command: respond via interaction webhook (supports 15min window)
+        is_binary(interaction_token) && is_binary(application_id) && application_id != "" ->
+          send_interaction_followup(token, application_id, interaction_token, content, opts)
+
+        # Files: multipart upload (first file carries the content caption)
+        files != [] && is_binary(channel_id) ->
+          [first_file | rest_files] = files
+          result = send_file(token, channel_id, first_file, content: if(content != "", do: content, else: nil))
+          Enum.each(rest_files, fn f -> send_file(token, channel_id, f) end)
+          result
+
+        # Regular channel message
+        is_binary(channel_id) && (content != "" || embeds) ->
+          send_message(token, channel_id, content, opts)
+
+        true ->
+          Logger.warning("[Kyber.Plugin.Discord] send_message effect missing channel_id or content")
+          {:error, :missing_params}
       end
     end
 
@@ -534,8 +688,16 @@ defmodule Kyber.Plugin.Discord do
 
   defp handle_gateway_message(%{"op" => @op_dispatch, "t" => "READY", "d" => data, "s" => seq}, state) do
     session_id = data["session_id"]
-    Logger.info("[Kyber.Plugin.Discord] READY — session_id: #{session_id}")
-    %{state | session_id: session_id, sequence: seq}
+    application_id = get_in(data, ["application", "id"])
+    Logger.info("[Kyber.Plugin.Discord] READY — session_id: #{session_id}, app_id: #{application_id}")
+
+    # Register slash commands in the background (non-blocking)
+    if application_id && state.token do
+      token = state.token
+      Task.start(fn -> register_slash_commands(token, application_id) end)
+    end
+
+    %{state | session_id: session_id, sequence: seq, application_id: application_id}
   end
 
   # Bot user ID for mention detection / self-ignore
@@ -576,6 +738,27 @@ defmodule Kyber.Plugin.Discord do
 
       %{state | sequence: seq}
     end
+  end
+
+  defp handle_gateway_message(%{"op" => @op_dispatch, "t" => "INTERACTION_CREATE", "d" => data, "s" => seq}, state) do
+    if data["type"] == @interaction_type_application_command do
+      command_name = get_in(data, ["data", "name"]) || "unknown"
+      Logger.debug("[Kyber.Plugin.Discord] slash command: /#{command_name}")
+
+      # Immediately ACK the interaction to avoid Discord's 3-second timeout.
+      # Type 5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE ("bot is thinking...")
+      respond_interaction(state.token, data["id"], data["token"])
+
+      delta = build_interaction_delta(data)
+
+      try do
+        Kyber.Core.emit(state.core, delta)
+      rescue
+        e -> Logger.error("[Kyber.Plugin.Discord] failed to emit interaction delta: #{inspect(e)}")
+      end
+    end
+
+    %{state | sequence: seq}
   end
 
   defp handle_gateway_message(%{"op" => @op_dispatch, "s" => seq}, state) when not is_nil(seq) do
@@ -644,5 +827,62 @@ defmodule Kyber.Plugin.Discord do
     Enum.map(attachments, fn att ->
       Map.take(att, @attachment_fields)
     end)
+  end
+
+  # ── Private: Slash command helpers ────────────────────────────────────────
+
+  # Build the text prompt for each slash command to feed into the delta pipeline.
+  defp build_interaction_text("ask", data) do
+    options = get_in(data, ["data", "options"]) || []
+    Enum.find_value(options, "", fn opt ->
+      if opt["name"] == "query", do: opt["value"], else: nil
+    end)
+  end
+
+  defp build_interaction_text("status", _data), do: "What is your current status?"
+  defp build_interaction_text("context", _data), do: "What is our current session context?"
+  defp build_interaction_text("history", _data), do: "Show me our recent message history."
+  defp build_interaction_text("forget", _data), do: "Please clear our session history and start fresh."
+  defp build_interaction_text(name, _data), do: "Execute command: /#{name}"
+
+  # Send an immediate deferred ACK for an interaction (type 5 = "bot is thinking...")
+  defp respond_interaction(nil, _interaction_id, _interaction_token), do: :ok
+
+  defp respond_interaction(token, interaction_id, interaction_token) do
+    url = "#{@discord_api_base}/interactions/#{interaction_id}/#{interaction_token}/callback"
+    headers = [{"Authorization", "Bot #{token}"}, {"Content-Type", "application/json"}]
+    body = %{"type" => @interaction_response_deferred_channel_message}
+
+    case Req.post(url, headers: headers, json: body) do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, %{status: 204}} -> :ok
+      {:ok, %{status: status, body: resp_body}} ->
+        Logger.warning("[Kyber.Plugin.Discord] interaction ACK failed: #{status} #{inspect(resp_body)}")
+        {:error, %{status: status, body: resp_body}}
+      {:error, reason} ->
+        Logger.error("[Kyber.Plugin.Discord] interaction ACK error: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  # Send a followup message to an already-deferred interaction via webhook.
+  # Must be called within 15 minutes of the original interaction.
+  defp send_interaction_followup(token, application_id, interaction_token, content, opts) do
+    url = "#{@discord_api_base}/webhooks/#{application_id}/#{interaction_token}"
+    headers = [{"Authorization", "Bot #{token}"}, {"Content-Type", "application/json"}]
+
+    embeds = Keyword.get(opts, :embeds)
+    body = %{"content" => content}
+    body = if embeds && embeds != [], do: Map.put(body, "embeds", embeds), else: body
+
+    case Req.post(url, headers: headers, json: body) do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, %{status: status, body: resp_body}} ->
+        Logger.warning("[Kyber.Plugin.Discord] interaction followup failed: #{status} #{inspect(resp_body)}")
+        {:error, %{status: status, body: resp_body}}
+      {:error, reason} ->
+        Logger.error("[Kyber.Plugin.Discord] interaction followup error: #{inspect(reason)}")
+        {:error, reason}
+    end
   end
 end
