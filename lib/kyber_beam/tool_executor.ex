@@ -627,6 +627,42 @@ defmodule Kyber.ToolExecutor do
     end
   end
 
+  # ── cleanup_tmp ──────────────────────────────────────────────────────────
+
+  def execute("cleanup_tmp", input) do
+    pattern = Map.get(input, "pattern", "stilgar_*")
+    max_age_seconds = Map.get(input, "max_age_seconds", 3600)
+    now = System.system_time(:second)
+    prefix = String.replace_trailing(pattern, "*", "")
+
+    tmp_dirs = ["/tmp", System.tmp_dir!()] |> Enum.uniq() |> Enum.filter(&File.dir?/1)
+
+    {deleted, skipped, errors} =
+      Enum.reduce(tmp_dirs, {[], [], []}, fn dir, acc ->
+        case File.ls(dir) do
+          {:ok, files} ->
+            files
+            |> Enum.filter(&String.starts_with?(&1, prefix))
+            |> Enum.reduce(acc, fn f, {d, s, e} ->
+              path = Path.join(dir, f)
+              case File.stat(path, time: :posix) do
+                {:ok, %{mtime: mtime}} when (now - mtime) > max_age_seconds ->
+                  case File.rm(path) do
+                    :ok -> {[path | d], s, e}
+                    {:error, reason} -> {d, s, ["#{path}: #{reason}" | e]}
+                  end
+                {:ok, _} -> {d, [path | s], e}
+                _ -> {d, s, ["#{path}: stat failed" | e]}
+              end
+            end)
+          _ -> acc
+        end
+      end)
+
+    {:ok, "Cleaned #{length(deleted)} file(s), skipped #{length(skipped)} (too recent), #{length(errors)} error(s)." <>
+      if(deleted != [], do: "\nDeleted: #{Enum.join(deleted, ", ")}", else: "")}
+  end
+
   # ── Catch-all ─────────────────────────────────────────────────────────────
 
   def execute(name, _input) do
@@ -641,7 +677,9 @@ defmodule Kyber.ToolExecutor do
     [
       Path.expand("~/.kyber"),
       Path.expand("~/kyber-beam"),
-      System.tmp_dir!()
+      System.tmp_dir!(),
+      "/tmp",
+      "/private/tmp"
     ]
   end
 
