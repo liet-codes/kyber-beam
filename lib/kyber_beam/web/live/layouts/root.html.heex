@@ -20,21 +20,56 @@
       }
       /* Mobile-friendly JSON blocks */
       pre, .json-block { word-break: break-all; overflow-wrap: break-word; }
-      /* Touch-friendly tap targets */
-      [phx-click] { min-height: 44px; display: flex; flex-direction: column; justify-content: center; }
+      /* Touch-friendly tap targets — use padding not flex override */
+      [phx-click] { min-height: 44px; cursor: pointer; -webkit-tap-highlight-color: rgba(99,179,237,0.15); }
     </style>
     <!-- Phoenix/LiveView JS — classic script tags for broad mobile compatibility -->
     <script src="/assets/phoenix/phoenix.min.js"></script>
     <script src="/assets/lv/phoenix_live_view.min.js"></script>
     <script>
+      // Debug: verify JS execution and lib loading
+      document.addEventListener("DOMContentLoaded", function() {
+        var d = document.createElement("div");
+        d.style.cssText = "position:fixed;top:0;left:0;right:0;padding:4px 8px;font-size:11px;z-index:99999;text-align:center;";
+        var ph = typeof Phoenix !== "undefined";
+        var lv = typeof LiveView !== "undefined";
+        if (ph && lv) {
+          d.style.background = "#68d391"; d.style.color = "#000";
+          d.textContent = "JS OK: Phoenix=" + ph + " LiveView=" + lv;
+        } else {
+          d.style.background = "#fc8181"; d.style.color = "#000";
+          d.textContent = "JS FAIL: Phoenix=" + ph + " LiveView=" + lv;
+        }
+        document.body.appendChild(d);
+        setTimeout(function() { d.style.display = "none"; }, 10000);
+      });
+    </script>
+    <script>
       (function() {
-        var csrfToken = document.querySelector("meta[name='csrf-token']");
-        csrfToken = csrfToken ? csrfToken.content : "";
-        var liveSocket = new LiveView.LiveSocket("/live", Phoenix.Socket, {
-          params: {_csrf_token: csrfToken}
-        });
-        liveSocket.connect();
-        window.liveSocket = liveSocket;
+        try {
+          var csrfToken = document.querySelector("meta[name='csrf-token']");
+          csrfToken = csrfToken ? csrfToken.content : "";
+          var liveSocket = new LiveView.LiveSocket("/live", Phoenix.Socket, {
+            params: {_csrf_token: csrfToken}
+          });
+          liveSocket.connect();
+          window.liveSocket = liveSocket;
+
+          // Connection indicator
+          var dot = document.createElement("div");
+          dot.id = "lv-status";
+          dot.style.cssText = "position:fixed;bottom:8px;right:8px;width:10px;height:10px;border-radius:50%;background:#fc8181;z-index:9999;transition:background 0.3s;";
+          document.body.appendChild(dot);
+          setInterval(function() {
+            try { dot.style.background = liveSocket.isConnected() ? "#68d391" : "#fc8181"; } catch(e) {}
+          }, 1000);
+        } catch(e) {
+          console.error("LiveView init failed:", e);
+          var err = document.createElement("div");
+          err.style.cssText = "position:fixed;bottom:8px;left:8px;background:#fc8181;color:#000;padding:8px 12px;border-radius:6px;font-size:12px;z-index:9999;";
+          err.textContent = "LV Error: " + e.message;
+          document.body.appendChild(err);
+        }
       })();
     </script>
   </head>

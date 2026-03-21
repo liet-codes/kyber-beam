@@ -8,7 +8,7 @@ config :kyber_beam, :vault_path, Path.expand("~/.kyber/vault")
 config :kyber_beam, Kyber.Web.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   http: [port: 4001],
-  url: [host: "localhost"],
+  url: [host: "0.0.0.0"],
   # secret_key_base is NOT set here — env-specific configs set it explicitly.
   # prod.exs requires SECRET_KEY_BASE env var (raises if missing).
   # dev.exs sets a dev-only placeholder.
