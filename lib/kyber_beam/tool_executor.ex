@@ -495,6 +495,57 @@ defmodule Kyber.ToolExecutor do
     {:ok, Kyber.Introspection.port_info() |> format_map()}
   end
 
+  # ── weather ──────────────────────────────────────────────────────────────
+
+  def execute("weather", %{"location" => location}) do
+    encoded = URI.encode(location)
+    url = "https://wttr.in/#{encoded}?format=j1"
+
+    Logger.info("[Kyber.ToolExecutor] weather: #{location}")
+
+    case Req.get(url,
+           connect_options: [timeout: 5_000],
+           receive_timeout: 10_000
+         ) do
+      {:ok, %{status: 200, body: body}} ->
+        parse_weather(body, location)
+
+      {:ok, %{status: 404}} ->
+        {:error, "Location not found: #{location}"}
+
+      {:ok, %{status: status}} ->
+        {:error, "Weather API returned HTTP #{status}"}
+
+      {:error, reason} ->
+        {:error, "Weather API unavailable: #{inspect(reason)}"}
+    end
+  rescue
+    e -> {:error, "weather failed: #{inspect(e)}"}
+  end
+
+  # ── camera_snap ──────────────────────────────────────────────────────────
+
+  def execute("camera_snap", input) do
+    timestamp = System.system_time(:second)
+    output_path = Map.get(input, "output_path", "/tmp/stilgar_snap_#{timestamp}.jpg")
+
+    Logger.info("[Kyber.ToolExecutor] camera_snap: #{output_path}")
+
+    # Remove any stale result file from a previous (possibly failed) snap
+    File.rm("/tmp/snap_result")
+
+    case File.write("/tmp/snap_request", output_path) do
+      :ok ->
+        # Poll for up to 5 seconds (10 attempts × 500ms)
+        poll_snap_result(0, 10)
+
+      {:error, reason} ->
+        {:error, "Failed to write snap request: #{inspect(reason)}"}
+    end
+  rescue
+    e -> {:error, "camera_snap failed: #{inspect(e)}"}
+  end
+
   # ── Catch-all ─────────────────────────────────────────────────────────────
 
   def execute(name, _input) do
@@ -701,6 +752,117 @@ defmodule Kyber.ToolExecutor do
           top_matches = Enum.take([{best, best_score} | rest], 3) |> Enum.map(&elem(&1, 0))
           {:error, :ambiguous, top_matches}
         end
+    end
+  end
+
+  # ── weather helpers ───────────────────────────────────────────────────────
+
+  # Parse a decoded wttr.in j1 JSON response body into a formatted string.
+  defp parse_weather(body, location) when is_map(body) do
+    [current | _] = body["current_condition"]
+
+    area_info = get_in(body, ["nearest_area", Access.at(0)])
+    city = get_in(area_info, ["areaName", Access.at(0), "value"]) || location
+    country = get_in(area_info, ["country", Access.at(0), "value"]) || ""
+
+    temp_c = current["temp_C"]
+    temp_f = current["temp_F"]
+    feels_c = current["FeelsLikeC"]
+    feels_f = current["FeelsLikeF"]
+    humidity = current["humidity"]
+    wind_kmph = current["windspeedKmph"]
+    wind_dir = current["winddir16Point"]
+    condition = get_in(current, ["weatherDesc", Access.at(0), "value"]) || "Unknown"
+
+    location_str = if country != "", do: "#{city}, #{country}", else: city
+
+    current_block = """
+    🌤 Weather for #{location_str}
+
+    Current Conditions:
+    • Temperature: #{temp_c}°C / #{temp_f}°F
+    • Feels like: #{feels_c}°C / #{feels_f}°F
+    • Condition: #{condition}
+    • Humidity: #{humidity}%
+    • Wind: #{wind_kmph} km/h #{wind_dir}
+    """
+
+    forecast_block =
+      body
+      |> Map.get("weather", [])
+      |> Enum.take(3)
+      |> Enum.map(fn day ->
+        date = day["date"]
+        max_c = day["maxtempC"]
+        min_c = day["mintempC"]
+        max_f = day["maxtempF"]
+        min_f = day["mintempF"]
+
+        desc =
+          day
+          |> Map.get("hourly", [])
+          |> Enum.at(4)
+          |> then(&get_in(&1 || %{}, ["weatherDesc", Access.at(0), "value"]))
+          |> Kernel.||("--")
+
+        "  #{date}: #{min_c}–#{max_c}°C (#{min_f}–#{max_f}°F), #{desc}"
+      end)
+      |> Enum.join("\n")
+
+    result =
+      if forecast_block != "" do
+        current_block <> "\n3-Day Forecast:\n#{forecast_block}"
+      else
+        current_block
+      end
+
+    {:ok, String.trim(result)}
+  rescue
+    e -> {:error, "Failed to parse weather data: #{inspect(e)}"}
+  end
+
+  defp parse_weather(_body, _location) do
+    {:error, "Unexpected weather response format"}
+  end
+
+  # ── camera helpers ────────────────────────────────────────────────────────
+
+  # Poll /tmp/snap_result every 500ms for up to max_attempts × 500ms total.
+  defp poll_snap_result(attempt, max_attempts) when attempt >= max_attempts do
+    File.rm("/tmp/snap_request")
+    {:error, "Camera snap timed out after 5 seconds — snap daemon may not be running"}
+  end
+
+  defp poll_snap_result(attempt, max_attempts) do
+    :timer.sleep(500)
+
+    case File.read("/tmp/snap_result") do
+      {:ok, result} ->
+        # Always clean up both sentinel files
+        File.rm("/tmp/snap_request")
+        File.rm("/tmp/snap_result")
+
+        result = String.trim(result)
+
+        cond do
+          String.starts_with?(result, "ok:") ->
+            path = String.replace_prefix(result, "ok:", "")
+            {:ok, "Photo saved: #{path}"}
+
+          String.starts_with?(result, "error:") ->
+            reason = String.replace_prefix(result, "error:", "")
+            {:error, "Camera error: #{reason}"}
+
+          true ->
+            {:error, "Unexpected snap result: #{result}"}
+        end
+
+      {:error, :enoent} ->
+        poll_snap_result(attempt + 1, max_attempts)
+
+      {:error, reason} ->
+        File.rm("/tmp/snap_request")
+        {:error, "Error polling snap result: #{inspect(reason)}"}
     end
   end
 
