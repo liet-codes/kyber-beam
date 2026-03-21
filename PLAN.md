@@ -10,7 +10,7 @@
 
 ### Features
 
-- [ ] **Session rehydration** — Conversation history lost on restart (ETS in-memory only). Rehydrate from delta log on boot so Stilgar keeps context across restarts.
+- [x] **Session rehydration** — Conversation history survives restarts. `Kyber.Session` queries the delta store for `message.received` and `llm.response` deltas on init, rebuilds per-chat history (sorted by timestamp), and populates ETS before `start_link/1` returns. PR #X.
 - [ ] **Slash commands** — Register Discord slash commands (`/ask`, `/status`, `/context`, `/history`, `/forget`)
 - [ ] **Embed support** — Rich embeds in responses (code blocks, structured output)
 - [ ] **File/image sending** — Send files and images from LLM responses
