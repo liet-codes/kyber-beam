@@ -439,7 +439,7 @@ defmodule Kyber.Plugin.LLM do
         emit_error(core, "no auth config", 0, origin, parent_id)
 
       config ->
-        case run_tool_loop(messages, system_prompt, config) do
+        case run_tool_loop(messages, system_prompt, config, core, origin, parent_id) do
           {:ok, response} ->
             content = extract_content(response)
 
@@ -511,19 +511,33 @@ defmodule Kyber.Plugin.LLM do
 
   # Multi-turn tool loop. Calls the API, executes any tool_use blocks,
   # and repeats until stop_reason is end_turn (or max iterations reached).
-  defp run_tool_loop(messages, system_prompt, auth_config, remaining \\ 10)
+  # Emits llm.call, tool.call, and tool.result deltas for observability.
+  defp run_tool_loop(messages, system_prompt, auth_config, core, origin, parent_id, remaining \\ 10)
 
-  defp run_tool_loop(_messages, _system_prompt, _auth_config, 0) do
+  defp run_tool_loop(_messages, _system_prompt, _auth_config, _core, _origin, _parent_id, 0) do
     {:error, "tool loop limit reached (max 10 iterations)"}
   end
 
-  defp run_tool_loop(messages, system_prompt, auth_config, remaining) do
+  defp run_tool_loop(messages, system_prompt, auth_config, core, origin, parent_id, remaining) do
+    tool_defs = Kyber.Tools.definitions()
+
+    # Emit llm.call delta before API call
+    llm_call_delta =
+      Kyber.Delta.new(
+        "llm.call",
+        %{"model" => @default_model, "message_count" => length(messages), "tools" => Kyber.Tools.names()},
+        origin,
+        parent_id
+      )
+
+    safe_emit(core, llm_call_delta)
+
     params = %{
       "model" => @default_model,
       "max_tokens" => @default_max_tokens,
       "messages" => messages,
       "system" => system_prompt,
-      "tools" => Kyber.Tools.definitions()
+      "tools" => tool_defs
     }
 
     case call_api(auth_config, params) do
@@ -547,8 +561,30 @@ defmodule Kyber.Plugin.LLM do
 
             Logger.debug("[Kyber.Plugin.LLM] executing tool: #{tool_name} #{inspect(tool_input)}")
 
+            # Emit tool.call delta before execution
+            call_delta =
+              Kyber.Delta.new(
+                "tool.call",
+                %{"name" => tool_name, "input" => tool_input},
+                origin,
+                parent_id
+              )
+
+            safe_emit(core, call_delta)
+
             case Kyber.ToolExecutor.execute(tool_name, tool_input) do
               {:ok, output} ->
+                # Emit tool.result delta (parent is the tool.call)
+                result_delta =
+                  Kyber.Delta.new(
+                    "tool.result",
+                    %{"name" => tool_name, "status" => "ok", "output" => truncate_output(output)},
+                    origin,
+                    call_delta.id
+                  )
+
+                safe_emit(core, result_delta)
+
                 %{
                   "type" => "tool_result",
                   "tool_use_id" => tu["id"],
@@ -557,6 +593,17 @@ defmodule Kyber.Plugin.LLM do
 
               {:ok_image, %{"media_type" => media_type, "base64" => b64, "path" => path, "size_bytes" => size}} ->
                 Logger.info("[Kyber.Plugin.LLM] view_image: #{path} (#{size} bytes)")
+
+                result_delta =
+                  Kyber.Delta.new(
+                    "tool.result",
+                    %{"name" => tool_name, "status" => "ok", "output" => truncate_output("Image: #{path} (#{size} bytes)")},
+                    origin,
+                    call_delta.id
+                  )
+
+                safe_emit(core, result_delta)
+
                 %{
                   "type" => "tool_result",
                   "tool_use_id" => tu["id"],
@@ -579,6 +626,16 @@ defmodule Kyber.Plugin.LLM do
               {:error, err} ->
                 Logger.warning("[Kyber.Plugin.LLM] tool error (#{tool_name}): #{err}")
 
+                result_delta =
+                  Kyber.Delta.new(
+                    "tool.result",
+                    %{"name" => tool_name, "status" => "error", "output" => truncate_output(err)},
+                    origin,
+                    call_delta.id
+                  )
+
+                safe_emit(core, result_delta)
+
                 %{
                   "type" => "tool_result",
                   "tool_use_id" => tu["id"],
@@ -595,6 +652,9 @@ defmodule Kyber.Plugin.LLM do
           messages ++ [assistant_msg, user_result_msg],
           system_prompt,
           auth_config,
+          core,
+          origin,
+          parent_id,
           remaining - 1
         )
 
@@ -604,6 +664,24 @@ defmodule Kyber.Plugin.LLM do
 
       {:error, _} = err ->
         err
+    end
+  end
+
+  defp safe_emit(core, delta) do
+    try do
+      Kyber.Core.emit(core, delta)
+    rescue
+      e -> Logger.error("[Kyber.Plugin.LLM] failed to emit delta: #{inspect(e)}")
+    end
+  end
+
+  defp truncate_output(output, max \\ 500) do
+    str = if is_binary(output), do: output, else: inspect(output)
+
+    if String.length(str) > max do
+      String.slice(str, 0, max) <> "…"
+    else
+      str
     end
   end
 

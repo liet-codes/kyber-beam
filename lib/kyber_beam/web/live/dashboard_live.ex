@@ -45,6 +45,20 @@ defmodule Kyber.Web.DashboardLive do
   end
 
   @impl true
+  def handle_params(_params, _uri, %{assigns: %{live_action: :traces}} = socket) do
+    all_deltas = fetch_all_deltas()
+    expanded_ids = Map.get(socket.assigns, :expanded_ids, MapSet.new())
+    trace_entries = build_trace_tree(all_deltas, expanded_ids)
+
+    socket =
+      socket
+      |> assign(:all_deltas, all_deltas)
+      |> assign(:expanded_ids, expanded_ids)
+      |> assign(:trace_entries, trace_entries)
+
+    {:noreply, socket}
+  end
+
   def handle_params(_params, _uri, socket) do
     {:noreply, socket}
   end
@@ -52,6 +66,21 @@ defmodule Kyber.Web.DashboardLive do
   # ── Events ────────────────────────────────────────────────────────────────
 
   @impl true
+  def handle_info({:new_delta, delta}, %{assigns: %{live_action: :traces}} = socket) do
+    deltas = [delta | Enum.take(socket.assigns.recent_deltas, @max_displayed_deltas - 1)]
+    all_deltas = [delta | socket.assigns.all_deltas]
+    expanded_ids = socket.assigns.expanded_ids
+    trace_entries = build_trace_tree(all_deltas, expanded_ids)
+
+    socket =
+      socket
+      |> assign(:recent_deltas, deltas)
+      |> assign(:all_deltas, all_deltas)
+      |> assign(:trace_entries, trace_entries)
+
+    {:noreply, socket}
+  end
+
   def handle_info({:new_delta, delta}, socket) do
     deltas = [delta | Enum.take(socket.assigns.recent_deltas, @max_displayed_deltas - 1)]
     {:noreply, assign(socket, :recent_deltas, deltas)}
@@ -75,9 +104,61 @@ defmodule Kyber.Web.DashboardLive do
     {:noreply, assign(socket, :expanded, expanded)}
   end
 
+  def handle_event("toggle_trace", %{"id" => id}, socket) do
+    expanded = socket.assigns.expanded_ids
+
+    expanded =
+      if MapSet.member?(expanded, id),
+        do: MapSet.delete(expanded, id),
+        else: MapSet.put(expanded, id)
+
+    trace_entries = build_trace_tree(socket.assigns.all_deltas, expanded)
+    {:noreply, assign(socket, expanded_ids: expanded, trace_entries: trace_entries)}
+  end
+
   # ── Render ────────────────────────────────────────────────────────────────
 
   @impl true
+  def render(%{live_action: :traces} = assigns) do
+    ~H"""
+    <div style="padding: 16px 0;">
+      <h1 style="color:#63b3ed;margin-bottom:16px;">Traces</h1>
+      <p style="color:#718096;margin-bottom:16px;">Nested delta trace view — click to expand/collapse</p>
+      <div style="display:flex;flex-direction:column;gap:2px;">
+        <%= if @trace_entries == [] do %>
+          <div style="color:#4a5568;text-align:center;padding:32px;">No traces yet…</div>
+        <% end %>
+        <%= for {delta, depth, has_children, expanded} <- @trace_entries do %>
+          <div
+            style={"padding:8px 12px;padding-left:#{12 + depth * 24}px;background:#{if depth == 0, do: "#1a1d2e", else: "#151823"};border:1px solid #{if depth == 0, do: "#2d3748", else: "#1e2435"};border-radius:6px;cursor:pointer;"}
+            phx-click="toggle_trace"
+            phx-value-id={delta.id}
+          >
+            <div style="display:flex;align-items:center;gap:8px;">
+              <%= if has_children do %>
+                <span style="color:#4a5568;font-size:0.75rem;width:12px;"><%= if expanded, do: "▼", else: "▶" %></span>
+              <% else %>
+                <span style="width:12px;"></span>
+              <% end %>
+              <span><%= kind_emoji(delta.kind) %></span>
+              <span style="color:#68d391;font-weight:bold;font-size:0.85rem;"><%= delta.kind %></span>
+              <span style="color:#718096;font-size:0.75rem;"><%= format_ts(delta.ts) %></span>
+              <span style="color:#a0aec0;font-size:0.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:500px;">
+                <%= payload_preview(delta.payload) %>
+              </span>
+            </div>
+            <%= if expanded do %>
+              <div style="margin-top:8px;padding:8px;background:#0f1117;border-radius:4px;font-size:0.8rem;color:#a0aec0;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;">
+                <%= format_payload_json(delta.payload) %>
+              </div>
+            <% end %>
+          </div>
+        <% end %>
+      </div>
+    </div>
+    """
+  end
+
   def render(%{live_action: :deltas} = assigns) do
     ~H"""
     <div style="padding: 16px 0;">
@@ -352,6 +433,9 @@ defmodule Kyber.Web.DashboardLive do
     case kind do
       "message.received" -> "💬"
       "llm.response" -> "🧠"
+      "llm.call" -> "🤖"
+      "tool.call" -> "🔧"
+      "tool.result" -> "📋"
       "tool_use" -> "🔧"
       "cron.fired" -> "⏰"
       "send_message" -> "📤"
@@ -365,6 +449,9 @@ defmodule Kyber.Web.DashboardLive do
     case kind do
       "message.received" -> "#68d391"
       "llm.response" -> "#63b3ed"
+      "llm.call" -> "#9ae6b4"
+      "tool.call" -> "#fbd38d"
+      "tool.result" -> "#f6e05e"
       "tool_use" -> "#fbd38d"
       "cron.fired" -> "#b794f4"
       "send_message" -> "#4fd1c5"
@@ -397,6 +484,76 @@ defmodule Kyber.Web.DashboardLive do
   end
 
   defp inspect_origin(origin), do: inspect(origin)
+
+  # ── Trace helpers ─────────────────────────────────────────────────────
+
+  defp fetch_all_deltas do
+    store = store_pid()
+
+    try do
+      Kyber.Delta.Store.query(store)
+    rescue
+      _ -> []
+    end
+  end
+
+  defp build_trace_tree(deltas, expanded_ids) do
+    by_parent = Enum.group_by(deltas, & &1.parent_id)
+    all_ids = MapSet.new(deltas, & &1.id)
+
+    roots =
+      deltas
+      |> Enum.filter(fn d ->
+        is_nil(d.parent_id) or not MapSet.member?(all_ids, d.parent_id)
+      end)
+      |> Enum.sort_by(& &1.ts, :desc)
+
+    flatten_trace(roots, by_parent, expanded_ids, 0)
+  end
+
+  defp flatten_trace(nodes, by_parent, expanded_ids, depth) do
+    Enum.flat_map(nodes, fn node ->
+      children = Map.get(by_parent, node.id, []) |> Enum.sort_by(& &1.ts)
+      has_children = children != []
+      expanded = MapSet.member?(expanded_ids, node.id)
+      entry = {node, depth, has_children, expanded}
+
+      if expanded and has_children do
+        [entry | flatten_trace(children, by_parent, expanded_ids, depth + 1)]
+      else
+        [entry]
+      end
+    end)
+  end
+
+  defp kind_emoji("message.received"), do: "📨"
+  defp kind_emoji("llm.call"), do: "🤖"
+  defp kind_emoji("llm.response"), do: "💬"
+  defp kind_emoji("llm.error"), do: "❌"
+  defp kind_emoji("tool.call"), do: "🔧"
+  defp kind_emoji("tool.result"), do: "📋"
+  defp kind_emoji("plugin.loaded"), do: "🔌"
+  defp kind_emoji("cron.fired"), do: "⏰"
+  defp kind_emoji(_), do: "📌"
+
+  defp payload_preview(payload) when map_size(payload) == 0, do: ""
+
+  defp payload_preview(payload) do
+    str = inspect(payload, limit: 3, printable_limit: 80)
+
+    if String.length(str) > 100 do
+      String.slice(str, 0, 100) <> "…"
+    else
+      str
+    end
+  end
+
+  defp format_payload_json(payload) do
+    case Jason.encode(payload, pretty: true) do
+      {:ok, json} -> json
+      _ -> inspect(payload, pretty: true)
+    end
+  end
 
   defp stat_card_style do
     "background:#1a1d2e;border:1px solid #2d3748;border-radius:12px;padding:16px;"
