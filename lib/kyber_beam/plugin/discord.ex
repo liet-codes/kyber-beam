@@ -503,7 +503,8 @@ defmodule Kyber.Plugin.Discord do
       gateway_pid: nil,
       sequence: nil,
       session_id: nil,
-      connected: false
+      connected: false,
+      application_id: nil
     }
 
     if token do
