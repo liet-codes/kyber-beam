@@ -77,6 +77,18 @@ defmodule Kyber.Cron do
     GenServer.call(server, :list_jobs)
   end
 
+  @doc "Add a job with metadata (e.g. an action string stored for later reference)."
+  @spec add_job_with_meta(GenServer.server(), String.t(), schedule(), callback(), map()) :: :ok
+  def add_job_with_meta(server \\ __MODULE__, name, schedule, callback, metadata) do
+    GenServer.call(server, {:add_job, name, schedule, callback, metadata})
+  end
+
+  @doc "Enable or disable a job by name. Returns :ok or {:error, :not_found}."
+  @spec toggle_job(GenServer.server(), String.t(), boolean()) :: :ok | {:error, :not_found}
+  def toggle_job(server \\ __MODULE__, name, enabled) when is_boolean(enabled) do
+    GenServer.call(server, {:toggle_job, name, enabled})
+  end
+
   @doc "Add a one-shot reminder that emits a delta at the given datetime."
   @spec add_reminder(GenServer.server(), String.t(), DateTime.t()) :: :ok
   def add_reminder(server \\ __MODULE__, message, datetime) do
@@ -153,6 +165,33 @@ defmodule Kyber.Cron do
     {:reply, :ok, new_state}
   end
 
+  def handle_call({:toggle_job, name}, _from, state) do
+    # Fallback clause — missing enabled arg; default to true
+    case Map.get(state.jobs, name) do
+      nil ->
+        {:reply, {:error, :not_found}, state}
+
+      job ->
+        new_job = Map.put(job, :enabled, true)
+        new_state = %{state | jobs: Map.put(state.jobs, name, new_job)}
+        persist_jobs(new_state)
+        {:reply, :ok, new_state}
+    end
+  end
+
+  def handle_call({:toggle_job, name, enabled}, _from, state) do
+    case Map.get(state.jobs, name) do
+      nil ->
+        {:reply, {:error, :not_found}, state}
+
+      job ->
+        new_job = Map.put(job, :enabled, enabled)
+        new_state = %{state | jobs: Map.put(state.jobs, name, new_job)}
+        persist_jobs(new_state)
+        {:reply, :ok, new_state}
+    end
+  end
+
   def handle_call({:remove_job, name}, _from, state) do
     case Map.get(state.jobs, name) do
       nil ->
@@ -171,10 +210,12 @@ defmodule Kyber.Cron do
       state.jobs
       |> Enum.map(fn {name, job} ->
         %{
+          id: name,
           name: name,
           schedule: job.schedule,
           next_run: job.next_run,
-          fired_count: job.fired_count
+          fired_count: job.fired_count,
+          enabled: Map.get(job, :enabled, true)
         }
       end)
 
@@ -235,7 +276,8 @@ defmodule Kyber.Cron do
       next_run: next_run,
       fired_count: 0,
       metadata: metadata || %{},
-      missed: false
+      missed: false,
+      enabled: true
     }
 
     %{state | jobs: Map.put(state.jobs, name, job)}
@@ -248,22 +290,36 @@ defmodule Kyber.Cron do
   defp check_and_fire(jobs, now, _check_interval) do
     Enum.reduce(jobs, {%{}, []}, fn {name, job}, {new_jobs, fired} ->
       if DateTime.compare(job.next_run, now) != :gt do
-        # Determine if this job was missed (late by more than threshold)
-        late_ms = DateTime.diff(now, job.next_run, :millisecond)
-        missed = late_ms > @missed_threshold_ms
+        if Map.get(job, :enabled, true) do
+          # Job is enabled — fire it
+          late_ms = DateTime.diff(now, job.next_run, :millisecond)
+          missed = late_ms > @missed_threshold_ms
 
-        updated_job = %{job | fired_count: job.fired_count + 1, missed: missed}
+          updated_job = %{job | fired_count: job.fired_count + 1, missed: missed}
 
-        case job.schedule do
-          {:at, _} ->
-            # One-shot: remove after firing
-            {new_jobs, [updated_job | fired]}
+          case job.schedule do
+            {:at, _} ->
+              # One-shot: remove after firing
+              {new_jobs, [updated_job | fired]}
 
-          schedule ->
-            # Recurring: compute next run from now (not from next_run, to avoid drift cascade)
-            next = compute_next_run(schedule, now)
-            updated_job = %{updated_job | next_run: next}
-            {Map.put(new_jobs, name, updated_job), [updated_job | fired]}
+            schedule ->
+              # Recurring: compute next run from now (not from next_run, to avoid drift cascade)
+              next = compute_next_run(schedule, now)
+              updated_job = %{updated_job | next_run: next}
+              {Map.put(new_jobs, name, updated_job), [updated_job | fired]}
+          end
+        else
+          # Job is disabled — advance next_run but do NOT fire
+          case job.schedule do
+            {:at, _} ->
+              # Disabled one-shot: keep it (don't fire, don't remove)
+              {Map.put(new_jobs, name, job), fired}
+
+            schedule ->
+              next = compute_next_run(schedule, now)
+              updated_job = %{job | next_run: next}
+              {Map.put(new_jobs, name, updated_job), fired}
+          end
         end
       else
         {Map.put(new_jobs, name, job), fired}
@@ -330,7 +386,8 @@ defmodule Kyber.Cron do
       "schedule" => sched_map,
       "next_run" => DateTime.to_iso8601(job.next_run),
       "fired_count" => job.fired_count,
-      "metadata" => job.metadata || %{}
+      "metadata" => job.metadata || %{},
+      "enabled" => Map.get(job, :enabled, true)
     }
   end
 
@@ -411,6 +468,8 @@ defmodule Kyber.Cron do
             compute_next_run(schedule, now)
         end
 
+      enabled = Map.get(job_map, "enabled", true)
+
       job = %{
         name: name,
         schedule: schedule,
@@ -418,7 +477,8 @@ defmodule Kyber.Cron do
         next_run: next_run,
         fired_count: fired_count,
         metadata: metadata,
-        missed: false
+        missed: false,
+        enabled: enabled
       }
 
       {:ok, job}

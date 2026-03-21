@@ -347,6 +347,42 @@ defmodule Kyber.Tools do
       "description" =>
         "Port/socket inspection: active ports, driver names, connected processes.",
       "input_schema" => %{"type" => "object", "properties" => %{}}
+    },
+
+    # ── Phase 7: External + Hardware ──────────────────────────────────────────
+
+    %{
+      "name" => "weather",
+      "description" =>
+        "Get current weather conditions and a 3-day forecast for a city or coordinates. " <>
+        "Returns temperature (°C/°F), condition, humidity, wind, and feels-like.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "location" => %{
+            "type" => "string",
+            "description" =>
+              "City name or coordinates, e.g. 'New York', 'London', '48.8566,2.3522'"
+          }
+        },
+        "required" => ["location"]
+      }
+    },
+    %{
+      "name" => "camera_snap",
+      "description" =>
+        "Take a photo using the built-in FaceTime HD camera via the macOS snap daemon " <>
+        "(com.liet.snap-watcher). Returns the path to the saved JPEG.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "output_path" => %{
+            "type" => "string",
+            "description" =>
+              "Destination path for the JPEG. Defaults to /tmp/stilgar_snap_{timestamp}.jpg"
+          }
+        }
+      }
     }
   ]
 
