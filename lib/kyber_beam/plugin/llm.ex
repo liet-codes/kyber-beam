@@ -830,9 +830,10 @@ Confabulating a plausible-sounding answer when you have files you didn't check i
         %{"type" => "image", "source" => %{"type" => "url", "url" => att["url"]}}
       end)
 
-    case image_blocks do
-      [] -> text
-      _ -> image_blocks ++ [%{"type" => "text", "text" => text}]
+    case {image_blocks, text} do
+      {[], _} -> text
+      {imgs, t} when t == "" or is_nil(t) -> imgs
+      {imgs, t} -> imgs ++ [%{"type" => "text", "text" => t}]
     end
   end
 
