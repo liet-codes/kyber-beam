@@ -753,12 +753,17 @@ defmodule Kyber.Plugin.Discord do
     if skip do
       %{state | sequence: seq}
     else
-      # Respond to @mentions, DMs, or replies to our messages
+      # Respond to @mentions (user or role), DMs, or replies to our messages
       is_dm = is_nil(guild_id)
       is_mentioned = String.contains?(content, "<@#{@bot_user_id}>") or String.contains?(content, "<@!#{@bot_user_id}>")
+      mention_roles = data["mention_roles"] || []
+      is_role_mentioned = Enum.any?(mention_roles, fn role_id ->
+        # Check if any of our roles were mentioned (role mentions use <@&ROLE_ID>)
+        String.contains?(content, "<@&#{role_id}>")
+      end)
       is_reply_to_us = get_in(data, ["referenced_message", "author", "id"]) == @bot_user_id
 
-      if is_dm or is_mentioned or is_reply_to_us do
+      if is_dm or is_mentioned or is_role_mentioned or is_reply_to_us do
         delta = build_message_delta(data)
         Logger.debug("[Kyber.Plugin.Discord] emitting message.received delta: #{delta.id}")
         try do

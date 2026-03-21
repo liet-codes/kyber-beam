@@ -48,7 +48,7 @@
     <key>HOME</key>
     <string>/Users/liet</string>
     <key>MIX_ENV</key>
-    <string>prod</string>
+    <string>dev</string>
   </dict>
 
   <!-- Throttle rapid crash loops: wait 10s before restarting -->
