@@ -383,6 +383,33 @@ defmodule Kyber.Tools do
           }
         }
       }
+    },
+
+    # ── Phase 9: Discord File Posting ─────────────────────────────────────────
+
+    %{
+      "name" => "send_file",
+      "description" =>
+        "Send a file or image to the current Discord channel. Use this after camera_snap " <>
+        "to share photos, or to send any file from allowed directories.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "file_path" => %{
+            "type" => "string",
+            "description" => "Path to the file to send (must be in allowed directories: ~/.kyber, ~/kyber-beam, or /tmp)"
+          },
+          "caption" => %{
+            "type" => "string",
+            "description" => "Optional caption/message to send with the file"
+          },
+          "channel_id" => %{
+            "type" => "string",
+            "description" => "Discord channel ID to send to. If omitted, uses the channel from the current conversation."
+          }
+        },
+        "required" => ["file_path"]
+      }
     }
   ]
 

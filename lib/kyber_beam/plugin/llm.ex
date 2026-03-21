@@ -427,6 +427,13 @@ defmodule Kyber.Plugin.LLM do
     # Load system prompt: explicit payload > vault knowledge context
     system_prompt = payload["system"] || build_system_prompt(chat_id)
 
+    # Set channel context for tools that need it (e.g. send_file)
+    case origin do
+      {:channel, "discord", cid, _} ->
+        Kyber.ToolExecutor.set_channel_context(cid)
+      _ -> :ok
+    end
+
     case auth_config do
       nil ->
         emit_error(core, "no auth config", 0, origin, parent_id)
@@ -649,6 +656,16 @@ defmodule Kyber.Plugin.LLM do
           ""
       end
 
+    capabilities_note = """
+
+## Your Capabilities
+
+You are a Claude model with vision — you CAN see and analyze images attached to Discord messages.
+When someone sends you an image, you can describe it, answer questions about it, etc.
+You also have a `camera_snap` tool to take photos via the MacBook camera, and a `send_file` tool
+to post files/images back to the Discord channel. Use them together: snap → send_file.
+"""
+
     vault_instruction = """
 
 ## MANDATORY: Check Your Vault First
@@ -660,7 +677,7 @@ Do NOT answer from general knowledge or vibes — if it's not in your vault, say
 Confabulating a plausible-sounding answer when you have files you didn't check is a failure mode.
 """
 
-    (soul_content || "") <> long_term_memory <> memory_context <> vault_instruction
+    (soul_content || "") <> long_term_memory <> memory_context <> capabilities_note <> vault_instruction
   end
 
   # Call Kyber.Knowledge safely — returns nil if not running.

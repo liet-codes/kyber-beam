@@ -546,6 +546,45 @@ defmodule Kyber.ToolExecutor do
     e -> {:error, "camera_snap failed: #{inspect(e)}"}
   end
 
+  # ── Phase 9: Discord File Posting ──────────────────────────────────────────
+
+  def execute("send_file", %{"file_path" => file_path} = input) do
+    expanded = Path.expand(file_path)
+
+    unless read_path_allowed?(expanded) do
+      {:error, "path not in allowed directories: #{expanded}"}
+    else
+      unless File.exists?(expanded) do
+        {:error, "File not found: #{expanded}"}
+      else
+        caption = Map.get(input, "caption", "")
+        channel_id = Map.get(input, "channel_id")
+
+        # Get the Discord token from the plugin's config
+        token = Application.get_env(:kyber_beam, :discord_token) ||
+                System.get_env("DISCORD_BOT_TOKEN")
+
+        if is_nil(token) do
+          {:error, "Discord token not available"}
+        else
+          # If no channel_id provided, try to get it from the current context
+          target_channel = channel_id || get_last_channel_id()
+
+          if is_nil(target_channel) do
+            {:error, "No channel_id provided and no recent channel context available"}
+          else
+            case Kyber.Plugin.Discord.send_file(token, target_channel, expanded, content: caption) do
+              :ok ->
+                {:ok, "File sent to channel #{target_channel}: #{Path.basename(expanded)}"}
+              {:error, reason} ->
+                {:error, "Failed to send file: #{inspect(reason)}"}
+            end
+          end
+        end
+      end
+    end
+  end
+
   # ── Catch-all ─────────────────────────────────────────────────────────────
 
   def execute(name, _input) do
@@ -876,6 +915,22 @@ defmodule Kyber.ToolExecutor do
       end
     else
       {:error, :not_running}
+    end
+  end
+
+  @doc """
+  Store the current channel_id for tool context. Called by the LLM plugin
+  before executing tools so send_file knows where to post.
+  """
+  def set_channel_context(channel_id) do
+    :persistent_term.put(:kyber_tool_channel_id, channel_id)
+  end
+
+  defp get_last_channel_id do
+    try do
+      :persistent_term.get(:kyber_tool_channel_id)
+    rescue
+      ArgumentError -> nil
     end
   end
 end
