@@ -14,22 +14,19 @@
       nav a:hover { color: #63b3ed; }
       main { padding: 24px; max-width: 1400px; margin: 0 auto; }
     </style>
-    <!-- Import maps for Phoenix/LiveView JS (no build step required) -->
-    <script type="importmap">
-    {
-      "imports": {
-        "phoenix": "/assets/phoenix/phoenix.mjs",
-        "phoenix_live_view": "/assets/lv/phoenix_live_view.esm.js"
-      }
-    }
-    </script>
-    <script type="module">
-      import {Socket} from "phoenix";
-      import {LiveSocket} from "phoenix_live_view";
-      let csrfToken = document.querySelector("meta[name='csrf-token']")?.content || "";
-      let liveSocket = new LiveSocket("/live", Socket, {params: {_csrf_token: csrfToken}});
-      liveSocket.connect();
-      window.liveSocket = liveSocket;
+    <!-- Phoenix/LiveView JS — classic script tags for broad mobile compatibility -->
+    <script src="/assets/phoenix/phoenix.min.js"></script>
+    <script src="/assets/lv/phoenix_live_view.min.js"></script>
+    <script>
+      (function() {
+        var csrfToken = document.querySelector("meta[name='csrf-token']");
+        csrfToken = csrfToken ? csrfToken.content : "";
+        var liveSocket = new LiveView.LiveSocket("/live", Phoenix.Socket, {
+          params: {_csrf_token: csrfToken}
+        });
+        liveSocket.connect();
+        window.liveSocket = liveSocket;
+      })();
     </script>
   </head>
   <body>
