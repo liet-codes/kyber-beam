@@ -241,23 +241,51 @@ defmodule Kyber.Web.DashboardLive do
   end
 
   defp safe_get_state do
-    try do
-      Kyber.State.get(Kyber.State)
-    rescue
-      _ -> %Kyber.State{}
-    end
+    # Gather state from actual running GenServers
+    # Detect running plugins by checking known GenServer names
+    plugin_checks = [
+      {"Discord", Kyber.Plugin.Discord},
+      {"LLM", Kyber.Plugin.LLM},
+      {"Knowledge", Kyber.Knowledge},
+      {"Cron", Kyber.Cron},
+      {"Delta.Store", Kyber.Delta.Store}
+    ]
+
+    plugins =
+      Enum.filter(plugin_checks, fn {_name, mod} ->
+        Process.whereis(mod) != nil
+      end)
+      |> Enum.map(fn {name, _} -> name end)
+
+    sessions =
+      try do
+        # ETS table :kyber_sessions
+        case :ets.info(:kyber_sessions) do
+          :undefined -> %{}
+          _ -> :ets.tab2list(:kyber_sessions) |> Map.new()
+        end
+      rescue
+        _ -> %{}
+      end
+
+    cron_jobs =
+      try do
+        Kyber.Cron.list_jobs()
+      rescue
+        _ -> %{}
+      catch
+        :exit, _ -> %{}
+      end
+
+    %{plugins: plugins, errors: [], sessions: sessions, cron_jobs: cron_jobs}
   end
 
   defp safe_get_nodes do
-    try do
-      Kyber.Distribution.nodes(Kyber.Distribution)
-    rescue
-      _ -> []
-    end
+    Node.list()
   end
 
   defp store_pid do
-    Process.get(:kyber_store_pid) || Kyber.Delta.Store
+    Process.get(:kyber_store_pid) || :"Elixir.Kyber.Core.Store"
   end
 
   defp format_ts(ts) when is_integer(ts) do
