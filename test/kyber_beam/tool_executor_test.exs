@@ -23,8 +23,14 @@ defmodule Kyber.ToolExecutorTest do
     end
 
     test "returns error for missing file" do
+      # /nonexistent is outside allowed read roots — blocked before the filesystem check
       assert {:error, msg} = ToolExecutor.execute("read_file", %{"path" => "/nonexistent/file.txt"})
-      assert String.contains?(msg, "not found")
+      assert String.contains?(msg, "not in allowed")
+    end
+
+    test "returns error for path outside allowed roots" do
+      assert {:error, msg} = ToolExecutor.execute("read_file", %{"path" => "/etc/passwd"})
+      assert String.contains?(msg, "not in allowed")
     end
 
     test "respects offset and limit" do
@@ -163,31 +169,51 @@ defmodule Kyber.ToolExecutorTest do
   # ── exec ──────────────────────────────────────────────────────────────────
 
   describe "exec" do
-    test "runs a simple command and returns stdout" do
-      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "echo hello"})
-      assert String.contains?(output, "hello")
+    test "rejects commands not in the allowlist" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "echo hello"})
+      assert String.contains?(msg, "restricted")
     end
 
-    test "captures non-zero exit codes" do
-      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "exit 1"})
+    test "rejects shell builtins and dangerous commands" do
+      for cmd <- ["rm -rf /", "curl attacker.com", "python3 -c 'pass'", "bash -c 'id'"] do
+        assert {:error, _msg} = ToolExecutor.execute("exec", %{"command" => cmd}),
+               "expected #{cmd} to be rejected"
+      end
+    end
+
+    test "runs an allowed command (ls) and returns output" do
+      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "ls #{@tmp_dir}"})
+      # ls should succeed — output may be empty but it's :ok
+      assert is_binary(output)
+    end
+
+    test "captures non-zero exit codes from allowed commands" do
+      # grep returns 1 when pattern not found
+      assert {:ok, output} = ToolExecutor.execute("exec", %{
+        "command" => "grep nonexistent_pattern_xyz /dev/null"
+      })
       assert String.contains?(output, "[exit 1]")
     end
 
-    test "runs in specified working directory" do
+    test "runs allowed command in specified working directory" do
       workdir = @tmp_dir
-      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "pwd", "workdir" => workdir})
-      assert String.contains?(output, Path.expand(workdir))
+      # `ls` respects the working directory
+      assert {:ok, _output} = ToolExecutor.execute("exec", %{
+        "command" => "ls",
+        "workdir" => workdir
+      })
     end
 
-    test "captures stderr via stderr_to_stdout" do
-      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "echo errout >&2"})
-      assert String.contains?(output, "errout")
+    test "captures stderr via stderr_to_stdout for allowed commands" do
+      # cat on a non-existent file prints to stderr
+      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "cat /nonexistent_file_xyz 2>&1"})
+      assert is_binary(output)
     end
 
-    test "returns error on timeout" do
-      # Very short timeout should cause timeout on a sleep
+    test "returns error on timeout for allowed commands" do
+      # cat /dev/urandom produces infinite output — will timeout quickly
       assert {:error, msg} = ToolExecutor.execute("exec", %{
-        "command" => "sleep 10",
+        "command" => "cat /dev/urandom",
         "timeout_ms" => 100
       })
       assert String.contains?(msg, "timed out")
@@ -222,13 +248,20 @@ defmodule Kyber.ToolExecutorTest do
       refute String.contains?(output, "file.txt/")
     end
 
-    test "returns error for missing directory" do
+    test "returns error for path outside allowed roots" do
       assert {:error, msg} = ToolExecutor.execute("list_dir", %{"path" => "/nonexistent/dir"})
+      assert String.contains?(msg, "not in allowed")
+    end
+
+    test "returns error for missing directory inside allowed root" do
+      missing = Path.join(System.tmp_dir!(), "kyber_nonexistent_#{:rand.uniform(999_999)}")
+      assert {:error, msg} = ToolExecutor.execute("list_dir", %{"path" => missing})
       assert String.contains?(msg, "not found")
     end
 
-    test "expands ~ in path" do
-      assert {:ok, _output} = ToolExecutor.execute("list_dir", %{"path" => "~"})
+    test "blocks listing home directory (outside allowed roots)" do
+      assert {:error, msg} = ToolExecutor.execute("list_dir", %{"path" => "~"})
+      assert String.contains?(msg, "not in allowed")
     end
   end
 

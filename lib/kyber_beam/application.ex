@@ -56,44 +56,7 @@ defmodule KyberBeam.Application do
       |> then(&(&1 ++ [{Kyber.Distribution, name: Kyber.Distribution}]))  # LAST — subscribes to Core's children
 
     opts = [strategy: :one_for_one, name: KyberBeam.Supervisor, max_restarts: 10, max_seconds: 60]
-    result = Supervisor.start_link(children, opts)
-
-    # Start a background monitor that watches Delta.Store and logs deaths
-    spawn(fn ->
-      Process.sleep(2_000)  # Let the tree settle
-      monitor_delta_store()
-    end)
-
-    result
-  end
-
-  defp monitor_delta_store do
-    case Process.whereis(:"Elixir.Kyber.Core.Store") do
-      nil ->
-        Logger.error("[AppMonitor] Delta.Store NOT FOUND at startup!")
-        Process.sleep(5_000)
-        monitor_delta_store()
-
-      pid ->
-        ref = Process.monitor(pid)
-        Logger.info("[AppMonitor] Watching Delta.Store pid=#{inspect(pid)}")
-
-        receive do
-          {:DOWN, ^ref, :process, ^pid, reason} ->
-            Logger.error("[AppMonitor] ⚠️  Delta.Store DIED! reason=#{inspect(reason)}")
-            Logger.error("[AppMonitor] Process info was: #{inspect(Process.info(pid))}")
-
-            # Check if supervisor is still alive
-            case Process.whereis(Kyber.Core) do
-              nil -> Logger.error("[AppMonitor] Kyber.Core supervisor is also DEAD")
-              sup_pid -> Logger.error("[AppMonitor] Kyber.Core supervisor alive at #{inspect(sup_pid)}")
-            end
-
-            # Re-monitor after restart
-            Process.sleep(2_000)
-            monitor_delta_store()
-        end
-    end
+    Supervisor.start_link(children, opts)
   end
 
   defp web_children do

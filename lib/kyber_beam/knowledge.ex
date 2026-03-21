@@ -159,16 +159,22 @@ defmodule Kyber.Knowledge do
       subscribers: []    # PIDs to notify on vault changes
     }
 
-    # Initial load — synchronous on startup so we're ready to serve immediately
+    # Defer vault load to handle_continue so init/1 returns immediately and
+    # the supervisor is not blocked during potentially large vault traversals.
+    # Polling is also scheduled from handle_continue after the load completes.
+    {:ok, state, {:continue, :load_vault}}
+  end
+
+  @impl true
+  def handle_continue(:load_vault, state) do
     state = load_vault_sync(state)
 
-    # Schedule polling
-    if poll_interval > 0 do
-      schedule_poll(poll_interval)
+    if state.poll_interval > 0 do
+      schedule_poll(state.poll_interval)
     end
 
-    Logger.info("[Kyber.Knowledge] vault loaded from #{vault_dir} (#{map_size(state.notes)} notes)")
-    {:ok, state}
+    Logger.info("[Kyber.Knowledge] vault loaded from #{state.vault_path} (#{map_size(state.notes)} notes)")
+    {:noreply, state}
   end
 
   @impl true

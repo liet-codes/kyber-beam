@@ -20,15 +20,16 @@ defmodule Kyber.ToolExecutor do
 
   require Logger
 
-  # Directories where write_file / edit_file are permitted.
-  # read_file and list_dir are NOT restricted (reads are safe).
-  @allowed_write_roots [
-    Path.expand("~/.kyber"),
-    Path.expand("~/kyber-beam"),
-    System.tmp_dir!()
-  ]
+  # Strict allowlist for the exec tool.
+  # Only these command stems are permitted — anything else is rejected.
+  # This prevents LLM prompt injection from running arbitrary shell commands.
+  @allowed_exec_commands ~w(ls cat grep mix git)
 
-  @vault_path Application.compile_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
+  # NOTE: @allowed_write_roots, @allowed_read_roots, and @vault_path are
+  # intentionally defined as private functions below (not module attributes)
+  # so that Path.expand and System.tmp_dir! are evaluated at runtime against
+  # the actual $HOME, not the $HOME of the build environment.
+  # See: Architecture Audit M3.
   @web_fetch_max_bytes 50_000
 
   # SSRF: blocked host literals (IPv6 loopback stored without brackets)
@@ -44,29 +45,34 @@ defmodule Kyber.ToolExecutor do
 
   def execute("read_file", %{"path" => path} = input) do
     expanded = Path.expand(path)
-    offset = Map.get(input, "offset", 1)
-    limit = Map.get(input, "limit", 2000)
 
-    case File.read(expanded) do
-      {:ok, content} ->
-        lines = String.split(content, "\n")
-        total = length(lines)
-        start_idx = max(0, offset - 1)
+    unless read_path_allowed?(expanded) do
+      {:error, "path not in allowed read directories: #{expanded}"}
+    else
+      offset = Map.get(input, "offset", 1)
+      limit = Map.get(input, "limit", 2000)
 
-        sliced =
-          lines
-          |> Enum.drop(start_idx)
-          |> Enum.take(limit)
-          |> Enum.join("\n")
+      case File.read(expanded) do
+        {:ok, content} ->
+          lines = String.split(content, "\n")
+          total = length(lines)
+          start_idx = max(0, offset - 1)
 
-        end_line = min(offset + limit - 1, total)
-        {:ok, "(#{total} lines total, showing #{offset}-#{end_line})\n#{sliced}"}
+          sliced =
+            lines
+            |> Enum.drop(start_idx)
+            |> Enum.take(limit)
+            |> Enum.join("\n")
 
-      {:error, :enoent} ->
-        {:error, "File not found: #{expanded}"}
+          end_line = min(offset + limit - 1, total)
+          {:ok, "(#{total} lines total, showing #{offset}-#{end_line})\n#{sliced}"}
 
-      {:error, reason} ->
-        {:error, "Read error: #{inspect(reason)}"}
+        {:error, :enoent} ->
+          {:error, "File not found: #{expanded}"}
+
+        {:error, reason} ->
+          {:error, "Read error: #{inspect(reason)}"}
+      end
     end
   end
 
@@ -119,32 +125,43 @@ defmodule Kyber.ToolExecutor do
   end
 
   def execute("exec", %{"command" => cmd} = input) do
-    workdir = Map.get(input, "workdir", System.get_env("HOME", "/tmp"))
-    timeout_ms = Map.get(input, "timeout_ms", 30_000)
-    expanded_dir = Path.expand(workdir)
+    # Enforce a strict command allowlist — only safe, read-only tools.
+    # The first token of the command (before any spaces, pipes, or flags)
+    # must be one of the approved stems. This blocks arbitrary shell injection
+    # while still allowing useful inspection commands.
+    cmd_stem = cmd |> String.trim() |> String.split(~r/[\s|;&]/, parts: 2) |> List.first("")
 
-    Logger.warning("[Kyber.ToolExecutor] exec: #{String.slice(cmd, 0, 500)}")
+    if cmd_stem not in @allowed_exec_commands do
+      Logger.warning("[Kyber.ToolExecutor] exec blocked (not in allowlist): #{String.slice(cmd, 0, 200)}")
+      {:error, "exec is restricted to: #{Enum.join(@allowed_exec_commands, ", ")}. Got: '#{cmd_stem}'"}
+    else
+      workdir = Map.get(input, "workdir", System.get_env("HOME", "/tmp"))
+      timeout_ms = Map.get(input, "timeout_ms", 30_000)
+      expanded_dir = Path.expand(workdir)
 
-    # Use Task.async + Task.yield for timeout support (compatible with Elixir 1.14+)
-    # NOTE: On timeout, the child sh process may become orphaned.
-    # For production use, switch to Port-based execution with OS PID tracking.
-    task =
-      Task.async(fn ->
-        System.cmd("sh", ["-c", cmd],
-          cd: expanded_dir,
-          stderr_to_stdout: true
-        )
-      end)
+      Logger.info("[Kyber.ToolExecutor] exec: #{String.slice(cmd, 0, 500)}")
 
-    case Task.yield(task, timeout_ms) || Task.shutdown(task) do
-      {:ok, {output, 0}} ->
-        {:ok, truncate_output(output)}
+      # Use Task.async + Task.yield for timeout support.
+      # NOTE: On timeout, the child sh process may become orphaned.
+      # For production use, switch to Port-based execution with OS PID tracking.
+      task =
+        Task.async(fn ->
+          System.cmd("sh", ["-c", cmd],
+            cd: expanded_dir,
+            stderr_to_stdout: true
+          )
+        end)
 
-      {:ok, {output, code}} ->
-        {:ok, "[exit #{code}]\n#{truncate_output(output)}"}
+      case Task.yield(task, timeout_ms) || Task.shutdown(task) do
+        {:ok, {output, 0}} ->
+          {:ok, truncate_output(output)}
 
-      nil ->
-        {:error, "command timed out after #{timeout_ms}ms"}
+        {:ok, {output, code}} ->
+          {:ok, "[exit #{code}]\n#{truncate_output(output)}"}
+
+        nil ->
+          {:error, "command timed out after #{timeout_ms}ms"}
+      end
     end
   rescue
     e -> {:error, "exec failed: #{inspect(e)}"}
@@ -153,24 +170,28 @@ defmodule Kyber.ToolExecutor do
   def execute("list_dir", %{"path" => path}) do
     expanded = Path.expand(path)
 
-    case File.ls(expanded) do
-      {:ok, entries} ->
-        formatted =
-          entries
-          |> Enum.sort()
-          |> Enum.map(fn name ->
-            full = Path.join(expanded, name)
-            if File.dir?(full), do: "#{name}/", else: name
-          end)
-          |> Enum.join("\n")
+    unless read_path_allowed?(expanded) do
+      {:error, "path not in allowed read directories: #{expanded}"}
+    else
+      case File.ls(expanded) do
+        {:ok, entries} ->
+          formatted =
+            entries
+            |> Enum.sort()
+            |> Enum.map(fn name ->
+              full = Path.join(expanded, name)
+              if File.dir?(full), do: "#{name}/", else: name
+            end)
+            |> Enum.join("\n")
 
-        {:ok, formatted}
+          {:ok, formatted}
 
-      {:error, :enoent} ->
-        {:error, "Directory not found: #{expanded}"}
+        {:error, :enoent} ->
+          {:error, "Directory not found: #{expanded}"}
 
-      {:error, reason} ->
-        {:error, "List error: #{inspect(reason)}"}
+        {:error, reason} ->
+          {:error, "List error: #{inspect(reason)}"}
+      end
     end
   end
 
@@ -206,7 +227,7 @@ defmodule Kyber.ToolExecutor do
       {:error, "invalid vault path: must be relative with no '..' components"}
     else
       normalized = path
-      abs_path = Path.join(@vault_path, normalized)
+      abs_path = Path.join(vault_path(), normalized)
 
       with :ok <- File.mkdir_p(Path.dirname(abs_path)),
            :ok <- File.write(abs_path, content) do
@@ -229,15 +250,15 @@ defmodule Kyber.ToolExecutor do
     else
       search_root =
         if subdir && subdir != "" do
-          Path.join(@vault_path, String.trim_leading(subdir, "/"))
+          Path.join(vault_path(), String.trim_leading(subdir, "/"))
         else
-          @vault_path
+          vault_path()
         end
 
       if File.dir?(search_root) do
         paths =
           Path.wildcard(Path.join([search_root, "**", "*.md"]))
-          |> Enum.map(&Path.relative_to(&1, @vault_path))
+          |> Enum.map(&Path.relative_to(&1, vault_path()))
           |> Enum.sort()
           |> Enum.join("\n")
 
@@ -482,9 +503,36 @@ defmodule Kyber.ToolExecutor do
 
   # ── Private helpers ────────────────────────────────────────────────────────
 
+  # Evaluate allowed roots at runtime so Path.expand uses the actual $HOME.
+  # Using module attributes would bake in the build-time $HOME (wrong in CI).
+  defp allowed_write_roots do
+    [
+      Path.expand("~/.kyber"),
+      Path.expand("~/kyber-beam"),
+      System.tmp_dir!()
+    ]
+  end
+
+  defp allowed_read_roots do
+    [
+      Path.expand("~/.kyber"),
+      Path.expand("~/kyber-beam"),
+      System.tmp_dir!()
+    ]
+  end
+
+  defp vault_path do
+    Application.get_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
+  end
+
   # Returns true if the expanded path is under one of the allowed write roots.
   defp path_allowed?(expanded) do
-    Enum.any?(@allowed_write_roots, &String.starts_with?(expanded, &1))
+    Enum.any?(allowed_write_roots(), &String.starts_with?(expanded, &1))
+  end
+
+  # Returns true if the expanded path is under one of the allowed read roots.
+  defp read_path_allowed?(expanded) do
+    Enum.any?(allowed_read_roots(), &String.starts_with?(expanded, &1))
   end
 
   # Returns true if the URL host is not a private/internal address (SSRF guard).

@@ -43,7 +43,10 @@ defmodule Kyber.Plugin.LLM do
   @doc "Start the LLM plugin."
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    # Accept an explicit :name so Plugin.Manager (and tests) can override it.
+    # Defaults to __MODULE__ to preserve backwards compatibility.
+    {name, opts} = Keyword.pop(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @doc """
@@ -225,7 +228,8 @@ defmodule Kyber.Plugin.LLM do
       core: core,
       session: session,
       auth_config: nil,
-      auth_path: auth_path
+      auth_path: auth_path,
+      executor_monitor: nil
     }
 
     # Load auth config asynchronously so init doesn't block if file is missing
@@ -248,9 +252,37 @@ defmodule Kyber.Plugin.LLM do
 
   @impl true
   def handle_info(:register_handlers, state) do
-    register_effect_handler(state)
+    state = register_effect_handler(state)
     Logger.info("[Kyber.Plugin.LLM] effect handler registered")
     {:noreply, state}
+  end
+
+  # When the Core's Effect.Executor crashes and restarts, its handler registry
+  # is wiped. We get a :DOWN from our monitor and re-register once it's back.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{executor_monitor: ref} = state) do
+    Logger.warning(
+      "[Kyber.Plugin.LLM] Effect.Executor went down (#{inspect(reason)}) — " <>
+        "will re-register handler once it's back"
+    )
+
+    # Poll until the executor is up again, then re-register
+    send(self(), :reregister_after_core_restart)
+    {:noreply, %{state | executor_monitor: nil}}
+  end
+
+  def handle_info(:reregister_after_core_restart, state) do
+    # Find the executor — it may be registered under the Core's child name
+    executor = find_executor(state.core)
+
+    if executor && Process.alive?(executor) do
+      state = register_effect_handler(state)
+      Logger.info("[Kyber.Plugin.LLM] effect handler re-registered after Core restart")
+      {:noreply, state}
+    else
+      # Not ready yet — retry in 500ms
+      Process.send_after(self(), :reregister_after_core_restart, 500)
+      {:noreply, state}
+    end
   end
 
   def handle_info({:update_auth, auth_config}, state) do
@@ -258,7 +290,7 @@ defmodule Kyber.Plugin.LLM do
   end
 
   def handle_info(msg, state) do
-    Logger.warning("[Kyber.Plugin.LLM] unexpected message: #{inspect(msg)}")
+    Logger.debug("[Kyber.Plugin.LLM] unexpected message: #{inspect(msg)}")
     {:noreply, state}
   end
 
@@ -275,7 +307,30 @@ defmodule Kyber.Plugin.LLM do
 
   # ── Private ───────────────────────────────────────────────────────────────
 
-  defp register_effect_handler(%{core: core, session: session}) do
+  defp find_executor(core) do
+    # The executor is a child of Kyber.Core named :"#{core}.Executor" or similar.
+    # Try common registered names.
+    executor_name = :"#{core}.Executor"
+
+    case Process.whereis(executor_name) do
+      nil ->
+        # Fall back: ask the Core supervisor for its children
+        try do
+          Supervisor.which_children(core)
+          |> Enum.find_value(fn
+            {Kyber.Effect.Executor, pid, _, _} when is_pid(pid) -> pid
+            _ -> nil
+          end)
+        catch
+          _, _ -> nil
+        end
+
+      pid ->
+        pid
+    end
+  end
+
+  defp register_effect_handler(%{core: core, session: session} = state) do
     # Capture plugin_pid (self()) BEFORE the closure, so the handler always
     # fetches the current auth config at invocation time rather than using the
     # stale value that was closed over at registration time. This allows
@@ -289,16 +344,32 @@ defmodule Kyber.Plugin.LLM do
 
     try do
       Kyber.Core.register_effect_handler(core, :llm_call, handler)
+
+      # Monitor the Effect.Executor so we know when to re-register.
+      # Clear any previous monitor first.
+      if old_ref = state[:executor_monitor], do: Process.demonitor(old_ref, [:flush])
+
+      executor_monitor =
+        case find_executor(core) do
+          nil -> nil
+          pid -> Process.monitor(pid)
+        end
+
+      %{state | executor_monitor: executor_monitor}
     catch
       :exit, reason ->
         Logger.warning(
           "[Kyber.Plugin.LLM] could not register handler (core not ready): #{inspect(reason)}"
         )
 
+        state
+
       kind, reason ->
         Logger.error(
           "[Kyber.Plugin.LLM] failed to register handler: #{kind} #{inspect(reason)}"
         )
+
+        state
     end
   end
 

@@ -84,10 +84,15 @@ defmodule Kyber.State do
     %{state | plugins: [plugin_name | state.plugins]}
   end
 
-  @doc "Append an error to the state (returns new struct)."
+  # Keep at most this many errors in the in-memory list.
+  # Prevents unbounded memory growth under sustained error conditions.
+  @max_errors 100
+
+  @doc "Append an error to the state (returns new struct). Keeps the last #{@max_errors}."
   @spec add_error(t(), map()) :: t()
   def add_error(%__MODULE__{} = state, error) when is_map(error) do
-    %{state | errors: state.errors ++ [error]}
+    trimmed = Enum.take(state.errors ++ [error], -@max_errors)
+    %{state | errors: trimmed}
   end
 
   @doc "Put a session entry (returns new struct)."

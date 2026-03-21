@@ -205,14 +205,47 @@ defmodule Kyber.Plugin.Discord do
     end
   end
 
+  # Directories from which send_file is permitted to read.
+  # Must match @allowed_read_roots in ToolExecutor — keeps the security
+  # boundary consistent across all file-reading paths.
+  @allowed_file_send_roots [
+    Path.expand("~/.kyber"),
+    Path.expand("~/kyber-beam"),
+    System.tmp_dir!()
+  ]
+
   @doc "Send a file/image to a Discord channel via multipart upload."
   @spec send_file(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def send_file(token, channel_id, file_path, opts \\ []) do
+    expanded = Path.expand(file_path)
+
+    allowed =
+      Enum.any?(@allowed_file_send_roots, &String.starts_with?(expanded, &1))
+
+    unless allowed do
+      Logger.warning("[Kyber.Plugin.Discord] send_file blocked — path not in allowed roots: #{expanded}")
+      {:error, :path_not_allowed}
+    else
+      do_send_file(token, channel_id, expanded, opts)
+    end
+  end
+
+  defp do_send_file(token, channel_id, file_path, opts) do
     url = "#{@discord_api_base}/channels/#{channel_id}/messages"
     headers = [{"Authorization", "Bot #{token}"}]
     content = Keyword.get(opts, :content)
 
-    file_content = File.read!(file_path)
+    case File.read(file_path) do
+      {:error, reason} ->
+        Logger.error("[Kyber.Plugin.Discord] send_file read failed #{file_path}: #{inspect(reason)}")
+        {:error, {:read_failed, reason}}
+
+      {:ok, file_content} ->
+        send_file_content(url, headers, file_path, file_content, content)
+    end
+  end
+
+  defp send_file_content(url, headers, file_path, file_content, content) do
     filename = Path.basename(file_path)
 
     payload_json = if content, do: %{"content" => content}, else: %{}
