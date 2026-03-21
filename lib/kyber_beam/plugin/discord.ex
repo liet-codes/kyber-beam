@@ -205,22 +205,13 @@ defmodule Kyber.Plugin.Discord do
     end
   end
 
-  # Directories from which send_file is permitted to read.
-  # Must match @allowed_read_roots in ToolExecutor — keeps the security
-  # boundary consistent across all file-reading paths.
-  @allowed_file_send_roots [
-    Path.expand("~/.kyber"),
-    Path.expand("~/kyber-beam"),
-    System.tmp_dir!()
-  ]
-
   @doc "Send a file/image to a Discord channel via multipart upload."
   @spec send_file(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def send_file(token, channel_id, file_path, opts \\ []) do
     expanded = Path.expand(file_path)
 
     allowed =
-      Enum.any?(@allowed_file_send_roots, &String.starts_with?(expanded, &1))
+      Enum.any?(allowed_file_send_roots(), &String.starts_with?(expanded, &1))
 
     unless allowed do
       Logger.warning("[Kyber.Plugin.Discord] send_file blocked — path not in allowed roots: #{expanded}")
@@ -923,5 +914,20 @@ defmodule Kyber.Plugin.Discord do
         Logger.error("[Kyber.Plugin.Discord] interaction followup error: #{inspect(reason)}")
         {:error, reason}
     end
+  end
+
+  # Directories from which send_file is permitted to read.
+  # Evaluated at runtime so Path.expand and System.tmp_dir! use the actual
+  # $HOME, not the build environment. Also includes /tmp and /private/tmp
+  # since macOS /tmp symlinks to /private/tmp but System.tmp_dir! returns
+  # /var/folders/...
+  defp allowed_file_send_roots do
+    [
+      Path.expand("~/.kyber"),
+      Path.expand("~/kyber-beam"),
+      System.tmp_dir!(),
+      "/tmp",
+      "/private/tmp"
+    ]
   end
 end
