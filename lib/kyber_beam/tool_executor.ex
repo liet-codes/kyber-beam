@@ -921,16 +921,16 @@ defmodule Kyber.ToolExecutor do
   @doc """
   Store the current channel_id for tool context. Called by the LLM plugin
   before executing tools so send_file knows where to post.
+
+  Uses process dictionary — safe because LLM handler runs tool execution
+  in the same process (synchronous tool loop). No race conditions between
+  concurrent conversations since each runs in its own process/task.
   """
   def set_channel_context(channel_id) do
-    :persistent_term.put(:kyber_tool_channel_id, channel_id)
+    Process.put(:kyber_tool_channel_id, channel_id)
   end
 
   defp get_last_channel_id do
-    try do
-      :persistent_term.get(:kyber_tool_channel_id)
-    rescue
-      ArgumentError -> nil
-    end
+    Process.get(:kyber_tool_channel_id)
   end
 end
