@@ -410,6 +410,28 @@ defmodule Kyber.Tools do
         },
         "required" => ["file_path"]
       }
+    },
+
+    # ── Phase 10: Vision ──────────────────────────────────────────────────────
+
+    %{
+      "name" => "view_image",
+      "description" =>
+        "Load an image file and see its contents. Use this to actually look at " <>
+        "photos (e.g. after camera_snap), images from disk, or any visual content. " <>
+        "Returns the image data so you can describe and analyze what you see. " <>
+        "IMPORTANT: Without calling this tool, you CANNOT see image contents — " <>
+        "you only get file paths as text.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "path" => %{
+            "type" => "string",
+            "description" => "Path to the image file (JPEG, PNG, GIF, or WebP)"
+          }
+        },
+        "required" => ["path"]
+      }
     }
   ]
 

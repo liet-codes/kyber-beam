@@ -586,6 +586,47 @@ defmodule Kyber.ToolExecutor do
     end
   end
 
+  # ── Phase 10: Vision ──────────────────────────────────────────────────────
+
+  def execute("view_image", %{"path" => path}) do
+    expanded = Path.expand(path)
+
+    unless read_path_allowed?(expanded) do
+      {:error, "path not in allowed directories: #{expanded}"}
+    else
+      unless File.exists?(expanded) do
+        {:error, "File not found: #{expanded}"}
+      else
+        case File.read(expanded) do
+          {:ok, data} ->
+            # Detect media type from extension
+            media_type =
+              case Path.extname(expanded) |> String.downcase() do
+                ".jpg" -> "image/jpeg"
+                ".jpeg" -> "image/jpeg"
+                ".png" -> "image/png"
+                ".gif" -> "image/gif"
+                ".webp" -> "image/webp"
+                _ -> "image/jpeg"
+              end
+
+            base64_data = Base.encode64(data)
+
+            # Return a special tuple that the LLM plugin recognizes as an image
+            {:ok_image, %{
+              "media_type" => media_type,
+              "base64" => base64_data,
+              "path" => expanded,
+              "size_bytes" => byte_size(data)
+            }}
+
+          {:error, reason} ->
+            {:error, "Failed to read image: #{inspect(reason)}"}
+        end
+      end
+    end
+  end
+
   # ── Catch-all ─────────────────────────────────────────────────────────────
 
   def execute(name, _input) do
