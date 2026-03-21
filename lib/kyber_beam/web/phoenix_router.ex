@@ -38,6 +38,7 @@ defmodule Kyber.Web.PhoenixRouter do
     live "/dashboard", Kyber.Web.DashboardLive, :overview
     live "/dashboard/deltas", Kyber.Web.DashboardLive, :deltas
     live "/dashboard/nodes", Kyber.Web.DashboardLive, :nodes
+    live "/dashboard/traces", Kyber.Web.DashboardLive, :traces
 
     live_dashboard "/sys",
       metrics: Kyber.Telemetry,
