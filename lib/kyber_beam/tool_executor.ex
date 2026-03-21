@@ -23,7 +23,7 @@ defmodule Kyber.ToolExecutor do
   # Strict allowlist for the exec tool.
   # Only these command stems are permitted — anything else is rejected.
   # This prevents LLM prompt injection from running arbitrary shell commands.
-  @allowed_exec_commands ~w(ls cat grep mix git)
+  @allowed_exec_commands ~w(ls cat grep mix git python3 python node elixir erl head tail wc sort uniq find file du df echo date cd mkdir touch cp mv rm chmod)
 
   # NOTE: @allowed_write_roots, @allowed_read_roots, and @vault_path are
   # intentionally defined as private functions below (not module attributes)
