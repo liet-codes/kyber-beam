@@ -594,6 +594,127 @@ defmodule Kyber.ToolExecutor do
     end
   end
 
+  # ── Phase 13: Computer Use ──────────────────────────────────────────────
+
+  def execute("computer_use", %{"action" => "screenshot"}) do
+    case Kyber.Tools.ComputerUse.Screenshot.capture() do
+      {:ok, %{base64: base64, width: w, height: h}} ->
+        {:ok_image, %{
+          "media_type" => "image/png",
+          "base64" => base64,
+          "path" => "screenshot",
+          "size_bytes" => byte_size(Base.decode64!(base64)),
+          "meta" => "#{w}x#{h} PNG screenshot"
+        }}
+
+      {:error, reason} ->
+        {:error, "Screenshot failed: #{reason}"}
+    end
+  end
+
+  def execute("computer_use", %{"action" => action} = input)
+      when action in ["click", "double_click", "right_click", "move"] do
+    x = Map.get(input, "x")
+    y = Map.get(input, "y")
+
+    if is_nil(x) or is_nil(y) do
+      {:error, "#{action} requires x and y coordinates"}
+    else
+      action_atom = String.to_existing_atom(action)
+
+      case Kyber.Tools.ComputerUse.Actions.execute({action_atom, x, y}) do
+        {:ok, msg} ->
+          # Auto-capture follow-up screenshot
+          case Kyber.Tools.ComputerUse.Screenshot.capture() do
+            {:ok, %{base64: base64, width: w, height: h}} ->
+              {:ok_image, %{
+                "media_type" => "image/png",
+                "base64" => base64,
+                "path" => "screenshot",
+                "size_bytes" => byte_size(Base.decode64!(base64)),
+                "meta" => "#{msg} | Follow-up screenshot: #{w}x#{h}"
+              }}
+
+            {:error, _} ->
+              {:ok, msg <> " (follow-up screenshot failed)"}
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  def execute("computer_use", %{"action" => "type", "text" => text}) do
+    case Kyber.Tools.ComputerUse.Actions.execute({:type, text}) do
+      {:ok, msg} ->
+        take_followup_screenshot(msg)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def execute("computer_use", %{"action" => "type"}) do
+    {:error, "type action requires 'text' parameter"}
+  end
+
+  def execute("computer_use", %{"action" => "key", "key" => key}) do
+    case Kyber.Tools.ComputerUse.Actions.execute({:key, key}) do
+      {:ok, msg} ->
+        take_followup_screenshot(msg)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def execute("computer_use", %{"action" => "key"}) do
+    {:error, "key action requires 'key' parameter"}
+  end
+
+  def execute("computer_use", %{"action" => "scroll"} = input) do
+    direction =
+      case Map.get(input, "scroll_direction", "down") do
+        "up" -> :up
+        _ -> :down
+      end
+
+    amount = Map.get(input, "scroll_amount", 3)
+
+    case Kyber.Tools.ComputerUse.Actions.execute({:scroll, direction, amount}) do
+      {:ok, msg} ->
+        take_followup_screenshot(msg)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def execute("computer_use", %{"action" => action}) do
+    {:error, "Unknown computer_use action: #{action}"}
+  end
+
+  # Helper: take a follow-up screenshot after an action
+  defp take_followup_screenshot(action_msg) do
+    # Small delay to let the UI update
+    Process.sleep(200)
+
+    case Kyber.Tools.ComputerUse.Screenshot.capture() do
+      {:ok, %{base64: base64, width: w, height: h}} ->
+        {:ok_image, %{
+          "media_type" => "image/png",
+          "base64" => base64,
+          "path" => "screenshot",
+          "size_bytes" => byte_size(Base.decode64!(base64)),
+          "meta" => "#{action_msg} | Follow-up screenshot: #{w}x#{h}"
+        }}
+
+      {:error, _} ->
+        {:ok, action_msg <> " (follow-up screenshot failed)"}
+    end
+  end
+
   # ── cleanup_tmp ──────────────────────────────────────────────────────────
 
   def execute("cleanup_tmp", input) do
@@ -791,6 +912,13 @@ defmodule Kyber.ToolExecutor do
     end
   rescue
     e -> {:error, "research failed: #{inspect(e)}"}
+  end
+
+  # ── Phase 13: Browser Control ────────────────────────────────────────────
+
+  def execute("browser", %{"action" => action} = input) do
+    Logger.info("[Kyber.ToolExecutor] browser: #{action}")
+    Kyber.Tools.Browser.execute(action, input)
   end
 
   # ── Catch-all ─────────────────────────────────────────────────────────────

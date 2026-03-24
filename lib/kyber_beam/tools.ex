@@ -526,6 +526,105 @@ defmodule Kyber.Tools do
       }
     },
 
+    # ── Phase 13: Computer Use ──────────────────────────────────────────────
+
+    %{
+      "name" => "computer_use",
+      "description" =>
+        "Control the macOS desktop: take screenshots and execute mouse/keyboard actions. " <>
+        "Use \"screenshot\" to see the current screen state. For click/type/key actions, " <>
+        "a follow-up screenshot is automatically taken so you can see the result. " <>
+        "Requires macOS. Install `cliclick` for best results: `brew install cliclick`.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "action" => %{
+            "type" => "string",
+            "enum" => [
+              "screenshot",
+              "click",
+              "double_click",
+              "right_click",
+              "type",
+              "key",
+              "scroll",
+              "move"
+            ],
+            "description" =>
+              "Action to perform: screenshot, click, double_click, right_click, type, key, scroll, move"
+          },
+          "x" => %{
+            "type" => "integer",
+            "description" => "Screen x coordinate (for click/double_click/right_click/move)"
+          },
+          "y" => %{
+            "type" => "integer",
+            "description" => "Screen y coordinate (for click/double_click/right_click/move)"
+          },
+          "text" => %{
+            "type" => "string",
+            "description" => "Text to type (for type action)"
+          },
+          "key" => %{
+            "type" => "string",
+            "description" =>
+              "Key to press, e.g. \"return\", \"tab\", \"escape\", \"cmd+c\", \"cmd+shift+s\" (for key action)"
+          },
+          "scroll_direction" => %{
+            "type" => "string",
+            "enum" => ["up", "down"],
+            "description" => "Scroll direction (for scroll action)"
+          },
+          "scroll_amount" => %{
+            "type" => "integer",
+            "description" => "Number of scroll steps (for scroll action, default 3)"
+          }
+        },
+        "required" => ["action"]
+      }
+    },
+
+    # ── Phase 13: Browser Control ──────────────────────────────────────────
+
+    %{
+      "name" => "browser",
+      "description" =>
+        "Control a Chrome browser via the Chrome DevTools Protocol. " <>
+        "Supports navigation, clicking, typing, reading elements, screenshots, " <>
+        "and JavaScript evaluation. Use 'launch' first to start Chrome with debugging, " <>
+        "then use other actions to interact with the page.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "action" => %{
+            "type" => "string",
+            "enum" => ["launch", "navigate", "click", "type", "read", "screenshot", "evaluate", "get_text"],
+            "description" =>
+              "Browser action: launch (start Chrome), navigate (go to URL), " <>
+              "click (click element), type (type into element), read (get element content), " <>
+              "screenshot (capture page), evaluate (run JS), get_text (get page text)"
+          },
+          "url" => %{
+            "type" => "string",
+            "description" => "URL for navigate action"
+          },
+          "selector" => %{
+            "type" => "string",
+            "description" => "CSS selector for click/type/read actions"
+          },
+          "text" => %{
+            "type" => "string",
+            "description" => "Text for type action"
+          },
+          "javascript" => %{
+            "type" => "string",
+            "description" => "JavaScript code for evaluate action"
+          }
+        },
+        "required" => ["action"]
+      }
+    },
+
     %{
       "name" => "cleanup_tmp",
       "description" =>
