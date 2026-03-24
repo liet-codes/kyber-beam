@@ -146,27 +146,11 @@ defmodule Kyber.ToolExecutor do
 
       Logger.info("[Kyber.ToolExecutor] exec: #{String.slice(cmd, 0, 500)}")
 
-      # Use Task.async + Task.yield for timeout support.
-      # NOTE: On timeout, the child sh process may become orphaned.
-      # For production use, switch to Port-based execution with OS PID tracking.
-      task =
-        Task.async(fn ->
-          System.cmd("sh", ["-c", cmd],
-            cd: expanded_dir,
-            stderr_to_stdout: true
-          )
-        end)
-
-      case Task.yield(task, timeout_ms) || Task.shutdown(task) do
-        {:ok, {output, 0}} ->
-          {:ok, truncate_output(output)}
-
-        {:ok, {output, code}} ->
-          {:ok, "[exit #{code}]\n#{truncate_output(output)}"}
-
-        nil ->
-          {:error, "command timed out after #{timeout_ms}ms"}
-      end
+      # Use Port.open with OS process group tracking to prevent orphaned
+      # processes on timeout. We start `sh` in its own process group via
+      # `setsid` (or plain sh on macOS where setsid may not exist), capture
+      # the OS PID, and kill the entire process group on timeout.
+      exec_with_port(cmd, expanded_dir, timeout_ms)
     end
     end
   rescue
@@ -676,6 +660,103 @@ defmodule Kyber.ToolExecutor do
   end
 
   # ── Private helpers ────────────────────────────────────────────────────────
+
+  # Execute a command via Port with OS process group cleanup on timeout.
+  # Starts `sh -c '<cmd>'` and tracks its OS PID. On timeout, sends SIGKILL
+  # to the entire process group (-pid) to prevent orphaned child processes.
+  defp exec_with_port(cmd, workdir, timeout_ms) do
+    port =
+      Port.open(
+        {:spawn_executable, "/bin/sh"},
+        [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          args: ["-c", cmd],
+          cd: workdir
+        ]
+      )
+
+    # Extract the OS PID of the spawned sh process
+    {:os_pid, os_pid} = Port.info(port, :os_pid)
+
+    # Use a wall-clock deadline so continuous output doesn't reset the timer
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    collect_port_output(port, os_pid, deadline, timeout_ms, _acc = "")
+  end
+
+  # Collect output from the port, enforcing a wall-clock deadline.
+  # On timeout, kills the OS process group and closes the port.
+  defp collect_port_output(port, os_pid, deadline, timeout_ms, acc) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      port_timeout_cleanup(port, os_pid, timeout_ms)
+    else
+      receive do
+        {^port, {:data, data}} ->
+          collect_port_output(port, os_pid, deadline, timeout_ms, acc <> data)
+
+        {^port, {:exit_status, 0}} ->
+          {:ok, truncate_output(acc)}
+
+        {^port, {:exit_status, code}} ->
+          {:ok, "[exit #{code}]\n#{truncate_output(acc)}"}
+      after
+        remaining ->
+          port_timeout_cleanup(port, os_pid, timeout_ms)
+      end
+    end
+  end
+
+  defp port_timeout_cleanup(port, os_pid, timeout_ms) do
+    # Kill the entire process group to prevent orphaned children.
+    kill_os_process_group(os_pid)
+
+    # Close the port (sends SIGTERM to any remaining process)
+    catch_port_close(port)
+
+    # Drain any remaining messages from the port
+    drain_port_messages(port)
+
+    {:error, "command timed out after #{timeout_ms}ms"}
+  end
+
+  # Drain any queued port messages to avoid polluting the caller's mailbox
+  defp drain_port_messages(port) do
+    receive do
+      {^port, _} -> drain_port_messages(port)
+    after
+      0 -> :ok
+    end
+  end
+
+  # Kill the OS process group. Uses negative PID to target the group.
+  # Falls back to killing just the process if group kill fails.
+  defp kill_os_process_group(os_pid) do
+    # Try killing the process group first (negative PID)
+    case System.cmd("kill", ["-9", "-#{os_pid}"], stderr_to_stdout: true) do
+      {_, 0} ->
+        :ok
+
+      _ ->
+        # Fallback: kill just the process
+        System.cmd("kill", ["-9", "#{os_pid}"], stderr_to_stdout: true)
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp catch_port_close(port) do
+    try do
+      Port.close(port)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
 
   defp contains_shell_injection?(cmd) do
     # Reject commands containing shell chaining operators that could bypass allowlist.

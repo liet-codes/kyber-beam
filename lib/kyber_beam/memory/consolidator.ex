@@ -158,15 +158,21 @@ defmodule Kyber.Memory.Consolidator do
         :"memory_pool_#{suffix}"
       end
 
-    table =
-      case :ets.whereis(table_name) do
-        :undefined ->
-          :ets.new(table_name, [:named_table, :set, :protected, read_concurrency: true])
-
-        existing ->
-          :ets.delete_all_objects(existing)
-          existing
+    # Named ETS tables are automatically deleted when their owning process dies,
+    # so after a crash+restart :ets.whereis will return :undefined. We always
+    # create a fresh table. If a table with this name somehow still exists
+    # (e.g. race during rapid restarts), delete it first to avoid :badarg.
+    if :ets.whereis(table_name) != :undefined do
+      try do
+        :ets.delete(table_name)
+      rescue
+        _ -> :ok
+      catch
+        _, _ -> :ok
       end
+    end
+
+    table = :ets.new(table_name, [:named_table, :set, :protected, read_concurrency: true])
 
     # Populate ETS from loaded pool
     Enum.each(pool, fn mem -> :ets.insert(table, {mem.id, mem}) end)
