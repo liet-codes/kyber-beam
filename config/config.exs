@@ -8,6 +8,10 @@ config :kyber_beam, :vault_path, Path.expand("~/.kyber/vault")
 # Example: config :kyber_beam, :model, "claude-opus-4-20250514"
 config :kyber_beam, :model, "claude-sonnet-4-20250514"
 
+# LLM rate limiting: maximum API calls per minute (P3-6).
+# Override in runtime.exs or environment-specific configs.
+config :kyber_beam, :max_llm_calls_per_minute, 30
+
 # Phoenix Endpoint for LiveView Dashboard (port 4001)
 config :kyber_beam, Kyber.Web.Endpoint,
   adapter: Bandit.PhoenixAdapter,

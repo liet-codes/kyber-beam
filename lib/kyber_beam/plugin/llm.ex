@@ -1,4 +1,5 @@
 defmodule Kyber.Plugin.LLM do
+  @behaviour Kyber.Plugin.Behaviour
   @moduledoc """
   Anthropic API integration as a Kyber plugin.
 
@@ -222,7 +223,8 @@ defmodule Kyber.Plugin.LLM do
       session: session,
       auth_config: nil,
       auth_path: auth_path,
-      executor_monitor: nil
+      executor_monitor: nil,
+      api_calls: []
     }
 
     # Load auth config asynchronously so init doesn't block if file is missing
@@ -305,6 +307,13 @@ defmodule Kyber.Plugin.LLM do
     {:reply, state.auth_config, state}
   end
 
+  def handle_call(:check_rate_limit, _from, state) do
+    case check_rate_limit(state) do
+      {:ok, new_state} -> {:reply, :ok, new_state}
+      {:error, :rate_limited} = err -> {:reply, err, state}
+    end
+  end
+
   @impl true
   def terminate(reason, _state) do
     Logger.info("[Kyber.Plugin.LLM] terminating: #{inspect(reason)}")
@@ -344,8 +353,16 @@ defmodule Kyber.Plugin.LLM do
     plugin_pid = self()
 
     handler = fn effect ->
-      auth_config = GenServer.call(plugin_pid, :get_auth_config)
-      handle_llm_call(effect, core, session, auth_config)
+      case GenServer.call(plugin_pid, :check_rate_limit) do
+        :ok ->
+          auth_config = GenServer.call(plugin_pid, :get_auth_config)
+          handle_llm_call(effect, core, session, auth_config)
+
+        {:error, :rate_limited} ->
+          origin = Map.get(effect, :origin)
+          parent_id = Map.get(effect, :delta_id)
+          emit_error(core, "rate limited: too many LLM calls, please wait", 429, origin, parent_id)
+      end
     end
 
     try do
@@ -948,6 +965,27 @@ Confabulating a plausible-sounding answer when you have files you didn't check i
   end
 
   defp extract_token(_), do: nil
+
+  # ── Rate limiting (P3-6) ─────────────────────────────────────────────────
+
+  # Check whether the current API call exceeds the configured rate limit.
+  # Tracks call timestamps in state.api_calls (monotonic ms).
+  # Returns {:ok, updated_state} if under the limit, {:error, :rate_limited} if not.
+  defp check_rate_limit(state) do
+    window = 60_000  # 1 minute in milliseconds
+    max_calls = Application.get_env(:kyber_beam, :max_llm_calls_per_minute, 30)
+    now = System.monotonic_time(:millisecond)
+    recent = Enum.filter(state.api_calls, &(&1 > now - window))
+
+    if length(recent) >= max_calls do
+      Logger.warning(
+        "[Kyber.Plugin.LLM] rate limit reached (#{length(recent)}/#{max_calls} calls in last 60s)"
+      )
+      {:error, :rate_limited}
+    else
+      {:ok, %{state | api_calls: [now | recent]}}
+    end
+  end
 
   # ── HTTP retry helpers (P1-4) ─────────────────────────────────────────────
 
