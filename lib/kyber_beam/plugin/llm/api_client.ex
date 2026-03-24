@@ -276,6 +276,16 @@ defmodule Kyber.Plugin.LLM.ApiClient do
       {:ok, %{status: 200, body: response}} ->
         {:ok, response}
 
+      {:ok, %{status: 401, body: resp_body}} ->
+        Logger.error("""
+        [Kyber.Plugin.LLM] ⛔ Authentication failed (401).
+        OAuth token expired or revoked — re-authenticate by running `claude` in a terminal.
+        Response: #{inspect(resp_body)}
+        """)
+
+        error_msg = get_in(resp_body, ["error", "message"]) || "OAuth token expired — re-authenticate with `claude` CLI"
+        {:error, %{error: error_msg, status: 401}}
+
       {:ok, %{status: 429, headers: resp_headers}} when retries_left > 0 ->
         delay = parse_retry_after(resp_headers, 5_000)
         Logger.warning("[Kyber.Plugin.LLM] rate limited (429), retrying after #{delay}ms")
