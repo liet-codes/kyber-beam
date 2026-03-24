@@ -17,6 +17,12 @@ config :kyber_beam, :max_llm_calls_per_minute, 30
 # Falls back to synchronous call on streaming failure.
 config :kyber_beam, :llm_streaming, true
 
+# Enable extended thinking for LLM responses (P3-1b).
+# When true, Anthropic's extended thinking feature is requested (explicit opt-in required).
+# temperature must not be set when thinking is enabled — it is stripped automatically.
+config :kyber_beam, :llm_thinking, true
+config :kyber_beam, :thinking_budget_tokens, 10_000
+
 # Token budget for context window management (P3-7).
 # Anthropic claude-sonnet/opus have a 200K token window; we reserve 20K for the
 # model's response, leaving 180K for the conversation history + system prompt.

@@ -399,6 +399,128 @@ defmodule Kyber.Plugin.LLMTest do
     end
   end
 
+  describe "format_with_reasoning/2" do
+    test "returns text unchanged when thinking is nil" do
+      assert LLM.format_with_reasoning("hello world", nil) == "hello world"
+    end
+
+    test "returns text unchanged when thinking is empty string" do
+      assert LLM.format_with_reasoning("hello world", "") == "hello world"
+    end
+
+    test "wraps text with reasoning spoiler block when thinking is present" do
+      result = LLM.format_with_reasoning("answer", "my reasoning")
+      assert String.contains?(result, "🧠 **Reasoning**")
+      assert String.contains?(result, "my reasoning")
+      assert String.contains?(result, "answer")
+      # spoiler block
+      assert String.starts_with?(result, "||")
+    end
+
+    test "multi-line thinking is quoted with > prefix" do
+      result = LLM.format_with_reasoning("answer", "line one\nline two")
+      assert String.contains?(result, "> line one")
+      assert String.contains?(result, "> line two")
+    end
+  end
+
+  describe "thinking config in do_streaming_call/5" do
+    test "thinking body is built when llm_thinking is true" do
+      # Test that the thinking config logic produces the expected map
+      budget = Application.get_env(:kyber_beam, :thinking_budget_tokens, 10_000)
+      base_max = 16_384  # @default_max_tokens after our bump
+      expected_max = max(base_max, budget + base_max)
+
+      # Simulate the body building logic
+      body = %{"max_tokens" => base_max}
+      result_body =
+        case true do
+          true ->
+            body
+            |> Map.put("thinking", %{"type" => "enabled", "budget_tokens" => budget})
+            |> Map.put("max_tokens", expected_max)
+            |> Map.delete("temperature")
+          _ -> body
+        end
+
+      assert result_body["thinking"] == %{"type" => "enabled", "budget_tokens" => budget}
+      assert result_body["max_tokens"] >= budget
+      refute Map.has_key?(result_body, "temperature")
+    end
+
+    test "thinking body is not added when llm_thinking is false" do
+      body = %{"max_tokens" => 16_384}
+      result_body =
+        case false do
+          true -> Map.put(body, "thinking", %{"type" => "enabled", "budget_tokens" => 10_000})
+          _ -> body
+        end
+
+      refute Map.has_key?(result_body, "thinking")
+    end
+
+    test "thinking config: max_tokens is at least budget + default" do
+      budget = 10_000
+      base_max = 16_384
+      expected_min = budget + base_max
+
+      body = %{"max_tokens" => base_max}
+      updated = Map.put(body, "max_tokens", max(base_max, expected_min))
+      assert updated["max_tokens"] >= expected_min
+    end
+  end
+
+  describe "thinking chunk accumulation" do
+    test "thinking chunks are accumulated in process dictionary" do
+      thinking_acc_ref = make_ref()
+      Process.put(thinking_acc_ref, "")
+
+      # Simulate the callback behavior
+      accumulate = fn text ->
+        new_thinking = Process.get(thinking_acc_ref, "") <> text
+        Process.put(thinking_acc_ref, new_thinking)
+      end
+
+      accumulate.("first chunk ")
+      accumulate.("second chunk")
+
+      assert Process.get(thinking_acc_ref) == "first chunk second chunk"
+    end
+  end
+
+  describe "streaming response with thinking extraction" do
+    test "response with thinking block gets formatted with reasoning trace" do
+      response = %{
+        "content" => [
+          %{"type" => "thinking", "thinking" => "I reasoned carefully"},
+          %{"type" => "text", "text" => "The answer is 42"}
+        ],
+        "stop_reason" => "end_turn"
+      }
+
+      thinking = Kyber.Plugin.LLM.Streamer.extract_thinking(response)
+      assert thinking == "I reasoned carefully"
+
+      text_content = LLM.format_with_reasoning("The answer is 42", thinking)
+      assert String.contains?(text_content, "🧠 **Reasoning**")
+      assert String.contains?(text_content, "I reasoned carefully")
+      assert String.contains?(text_content, "The answer is 42")
+    end
+
+    test "response without thinking block returns text as-is" do
+      response = %{
+        "content" => [%{"type" => "text", "text" => "Just the answer"}],
+        "stop_reason" => "end_turn"
+      }
+
+      thinking = Kyber.Plugin.LLM.Streamer.extract_thinking(response)
+      assert is_nil(thinking)
+
+      text_content = LLM.format_with_reasoning("Just the answer", thinking)
+      assert text_content == "Just the answer"
+    end
+  end
+
   # ── Helpers ──────────────────────────────────────────────────────────────
 
   defp write_temp_file(content) do

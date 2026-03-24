@@ -32,7 +32,7 @@ defmodule Kyber.Plugin.LLM do
 
   @anthropic_url "https://api.anthropic.com/v1/messages"
   @default_model "claude-sonnet-4-20250514"
-  @default_max_tokens 8192
+  @default_max_tokens 16_384
   @auth_profiles_path "~/.openclaw/agents/main/agent/auth-profiles.json"
 
   defp configured_model do
@@ -795,9 +795,30 @@ defmodule Kyber.Plugin.LLM do
           body
       end
 
+    # Enable extended thinking if configured
+    body =
+      case Application.get_env(:kyber_beam, :llm_thinking, true) do
+        true ->
+          budget = Application.get_env(:kyber_beam, :thinking_budget_tokens, 10_000)
+          # Anthropic requires max_tokens >= thinking budget; ensure it's large enough
+          current_max = body["max_tokens"]
+          new_max = max(current_max, budget + @default_max_tokens)
+          body
+          |> Map.put("thinking", %{"type" => "enabled", "budget_tokens" => budget})
+          |> Map.put("max_tokens", new_max)
+          # temperature must not be set when thinking is enabled
+          |> Map.delete("temperature")
+        _ ->
+          body
+      end
+
     # Accumulate text for stream_chunk emissions
     chunk_acc_ref = make_ref()
     Process.put(chunk_acc_ref, "")
+
+    # Accumulate thinking text for reasoning trace
+    thinking_acc_ref = make_ref()
+    Process.put(thinking_acc_ref, "")
 
     chat_id =
       case origin do
@@ -824,8 +845,9 @@ defmodule Kyber.Plugin.LLM do
           safe_emit(core, stream_delta)
         end
 
-      {:thinking_chunk, _text} ->
-        :ok
+      {:thinking_chunk, text} ->
+        new_thinking = Process.get(thinking_acc_ref, "") <> text
+        Process.put(thinking_acc_ref, new_thinking)
 
       {:done, _stop_reason} ->
         :ok
@@ -836,8 +858,18 @@ defmodule Kyber.Plugin.LLM do
 
     case Kyber.Plugin.LLM.Streamer.stream_request(@anthropic_url, body, headers, callback) do
       {:ok, response} ->
+        thinking = Kyber.Plugin.LLM.Streamer.extract_thinking(response)
         Logger.info("[LLM] streaming complete, stop_reason=#{response["stop_reason"]}")
-        {:ok, response}
+
+        # If thinking was present, wrap the response content with reasoning trace
+        if thinking do
+          text_content = extract_content(response)
+          formatted = format_with_reasoning(text_content, thinking)
+          new_content = [%{"type" => "text", "text" => formatted}]
+          {:ok, Map.put(response, "content", new_content)}
+        else
+          {:ok, response}
+        end
 
       {:error, reason} ->
         Logger.warning("[LLM] streaming failed: #{inspect(reason)}, falling back to sync")
