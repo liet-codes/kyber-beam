@@ -6,16 +6,14 @@
 
 ## P0 — Security (fix before any deployment)
 
-- [ ] **Exec allowlist bypass** — `String.split(~r/[\s|;&]/)` only checks first token; `git; rm -rf /` passes. Switch to `System.cmd/3` with explicit argv (no `sh -c`) or reject commands containing shell metacharacters. *(Harness Expert, Elixir Expert)*
+- [x] **Exec allowlist bypass** — `String.split(~r/[\s|;&]/)` only checks first token; `git; rm -rf /` passes. Added `contains_shell_injection?/1` guard that rejects shell metacharacters before allowlist check. *(Fixed 2026-03-23)*
   - File: `lib/kyber_beam/tool_executor.ex`
 
-- [ ] **BearerAuth plug not wired** — `POST /api/deltas` is fully unauthenticated. Plug exists (`web/plugs/bearer_auth.ex`) but is never added to the router pipeline. Anyone on the network can inject arbitrary deltas → trigger LLM calls.
+- [x] **BearerAuth plug not wired** — `POST /api/deltas` was fully unauthenticated. Wired `BearerAuth` plug into router pipeline, excluded `/health` endpoint. *(Fixed 2026-03-23)*
   - File: `lib/kyber_beam/web/router.ex`
-  - Fix: Add `plug(Kyber.Web.Plugs.BearerAuth)` to pipeline
 
-- [ ] **Web router bypasses Core.emit** — `POST /api/deltas` calls `Delta.Store.append` directly, skipping ephemeral filtering and `system` key stripping. External caller can inject `cron.fired` deltas or smuggle system prompts.
-  - File: `lib/kyber_beam/web/router.ex` ~line 40
-  - Fix: Route through `Kyber.Core.emit/2`
+- [x] **Web router bypasses Core.emit** — `POST /api/deltas` now routes through `Kyber.Core.emit/2` instead of direct `Store.append`. Ensures ephemeral filtering and system key stripping. *(Fixed 2026-03-23)*
+  - File: `lib/kyber_beam/web/router.ex`
 
 ---
 
@@ -106,4 +104,4 @@
 
 ---
 
-*Total: 6 P0 (security) + 6 P1 (perf/reliability) + 4 P2 (architecture) + 10 P3 (features) + 6 P4 (doc gaps) + 8 nits = 40 items*
+*Total: ~~3~~ 0 P0 (all fixed!) + 6 P1 (perf/reliability) + 4 P2 (architecture) + 10 P3 (features) + 6 P4 (doc gaps) + 8 nits = 34 remaining items*
