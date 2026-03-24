@@ -1,5 +1,4 @@
 defmodule Kyber.Plugin.Discord do
-  @behaviour Kyber.Plugin.Behaviour
   @moduledoc """
   Discord bot integration as a Kyber plugin.
 

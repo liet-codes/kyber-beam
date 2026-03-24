@@ -9,7 +9,6 @@ defmodule KyberBeam.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       test_coverage: [tool: ExCoveralls],
-      preferred_cli_env: [coveralls: :test],
       aliases: aliases()
     ]
   end
@@ -19,6 +18,10 @@ defmodule KyberBeam.MixProject do
       extra_applications: [:logger, :runtime_tools, :os_mon],
       mod: {KyberBeam.Application, []}
     ]
+  end
+
+  def cli do
+    [preferred_envs: [coveralls: :test]]
   end
 
   defp deps do

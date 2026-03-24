@@ -181,7 +181,7 @@ defmodule Kyber.Plugin.Manager do
     end
   end
 
-  defp plugin_child_spec(module, opts \\ []) do
+  defp plugin_child_spec(module, opts) do
     if function_exported?(module, :child_spec, 1) do
       module.child_spec(opts)
     else

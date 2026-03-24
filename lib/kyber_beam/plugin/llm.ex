@@ -1,5 +1,4 @@
 defmodule Kyber.Plugin.LLM do
-  @behaviour Kyber.Plugin.Behaviour
   @moduledoc """
   Anthropic API integration as a Kyber plugin.
 
@@ -159,7 +158,7 @@ defmodule Kyber.Plugin.LLM do
     # Include tools if provided
     body =
       case params["tools"] do
-        tools when is_list(tools) and length(tools) > 0 ->
+        [_ | _] = tools ->
           Map.put(body, "tools", tools)
 
         _ ->
@@ -774,7 +773,7 @@ defmodule Kyber.Plugin.LLM do
 
     body =
       case params["tools"] do
-        tools when is_list(tools) and length(tools) > 0 -> Map.put(body, "tools", tools)
+        [_ | _] = tools -> Map.put(body, "tools", tools)
         _ -> body
       end
 
@@ -1234,7 +1233,7 @@ Confabulating a plausible-sounding answer when you have files you didn't check i
     end
   end
 
-  defp parse_retry_after_value(val, default_ms) when is_integer(val) and val > 0,
+  defp parse_retry_after_value(val, _default_ms) when is_integer(val) and val > 0,
     do: val * 1_000
 
   defp parse_retry_after_value(_, default_ms), do: default_ms
