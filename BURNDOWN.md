@@ -60,7 +60,7 @@
 - [ ] **Multi-channel support** — Discord only. No WhatsApp, Telegram, Signal, etc.
 - [ ] **Rate limiting** — no cost protection on LLM calls.
 - [ ] **Token budget management** — 20-message heuristic instead of actual token counting.
-- [ ] **README / onboarding** — README says "TODO: Add description". No getting started guide.
+- [x] **README / onboarding** — README says "TODO: Add description". No getting started guide. *(Fixed 2026-03-23)*
 - [ ] **Skills system** — no equivalent to OpenClaw's AgentSkills (SKILL.md).
 - [ ] **Multi-model support** — hardcoded claude-sonnet-4 in several places.
 
@@ -90,4 +90,4 @@
 
 ---
 
-*Total: 0 P0 + 0 P1 + 0 P2 (all fixed!) + 10 P3 (features) + 6 P4 (doc gaps) + 3 nits = 19 remaining items*
+*Total: 0 P0 + 0 P1 + 0 P2 (all fixed!) + 9 P3 (features) + 6 P4 (doc gaps) + 3 nits = 18 remaining items*

@@ -22,8 +22,8 @@ defmodule Kyber.DistributionTest do
     dist_name = unique_name(:kyber_dist)
     {:ok, dist} = Kyber.Distribution.start_link(store: store_name, name: dist_name)
     Process.unlink(dist)
-    # Let handle_continue finish subscribing
-    Process.sleep(50)
+    # Sync call ensures handle_continue (store subscription) has completed
+    _ = Kyber.Distribution.nodes(dist)
 
     on_exit(fn ->
       if Process.alive?(dist), do: GenServer.stop(dist, :normal)
@@ -94,36 +94,36 @@ defmodule Kyber.DistributionTest do
     test "no-op when no nodes connected — does not crash", %{dist: dist} do
       delta = Kyber.Delta.new("local.event", %{})
       Kyber.Distribution.broadcast_delta(dist, delta)
-      Process.sleep(50)
-      assert Process.alive?(dist)
+      # Sync call drains the mailbox and confirms process is responsive
+      assert is_list(Kyber.Distribution.nodes(dist))
     end
 
     test "skips re-broadcasting remote-originated deltas", %{dist: dist} do
       delta = Kyber.Delta.new("foreign.event", %{"source_node" => "other@host"})
       Kyber.Distribution.broadcast_delta(dist, delta)
-      Process.sleep(50)
-      assert Process.alive?(dist)
+      # Sync call drains the mailbox and confirms process is responsive
+      assert is_list(Kyber.Distribution.nodes(dist))
     end
   end
 
   describe "nodeup / nodedown events" do
     test "handles :nodeup for unknown node without crashing", %{dist: dist} do
       send(dist, {:nodeup, :"unknown@host"})
-      Process.sleep(50)
-      assert Process.alive?(dist)
+      # Sync call ensures the message was processed and process is responsive
+      assert is_list(Kyber.Distribution.nodes(dist))
     end
 
     test "handles :nodedown and survives", %{dist: dist} do
       send(dist, {:nodedown, :"remote@host"})
-      Process.sleep(50)
-      assert Process.alive?(dist)
+      # Sync call ensures the message was processed and process is responsive
+      assert is_list(Kyber.Distribution.nodes(dist))
     end
 
     test "nodedown then nodeup cycles cleanly", %{dist: dist} do
       send(dist, {:nodedown, :"node_a@host"})
       send(dist, {:nodeup, :"node_a@host"})
-      Process.sleep(100)
-      assert Process.alive?(dist)
+      # Sync call ensures both messages were processed and process is responsive
+      assert is_list(Kyber.Distribution.nodes(dist))
     end
 
     test "GenServer stays responsive immediately after :nodeup for known node", %{dist: dist} do
@@ -144,15 +144,15 @@ defmodule Kyber.DistributionTest do
     test "distribution stays alive after new delta appended to store", %{dist: dist, store_name: sn} do
       delta = Kyber.Delta.new("test.store_subscribe", %{})
       :ok = Kyber.Delta.Store.append(sn, delta)
-      Process.sleep(100)
-      assert Process.alive?(dist)
+      # Sync call drains any pending messages from the store subscription
+      assert is_list(Kyber.Distribution.nodes(dist))
     end
 
     test "local delta broadcast path runs without crash", %{dist: dist, store_name: sn} do
       delta = Kyber.Delta.new("tag.test", %{})
       :ok = Kyber.Delta.Store.append(sn, delta)
-      Process.sleep(100)
-      assert Process.alive?(dist)
+      # Sync call drains any pending messages from the store subscription
+      assert is_list(Kyber.Distribution.nodes(dist))
     end
   end
 
@@ -239,7 +239,8 @@ defmodule Kyber.DistributionTest do
 
       # Simulate what the sync Task would cast back
       GenServer.cast(dist, {:sync_results, :"remote@host", [delta]})
-      Process.sleep(50)
+      # Sync call drains cast from mailbox before querying store
+      _ = Kyber.Distribution.nodes(dist)
 
       assert Process.alive?(dist)
       stored = Kyber.Delta.Store.query(sn)
@@ -257,7 +258,8 @@ defmodule Kyber.DistributionTest do
 
       # Now sync_results with the same delta — should be deduped
       GenServer.cast(dist, {:sync_results, :"remote@host", [delta]})
-      Process.sleep(50)
+      # Sync call drains cast from mailbox before querying store
+      _ = Kyber.Distribution.nodes(dist)
 
       stored_after = Kyber.Delta.Store.query(sn)
       count_after = length(Enum.filter(stored_after, &(&1.id == delta.id)))
@@ -271,7 +273,8 @@ defmodule Kyber.DistributionTest do
         end
 
       GenServer.cast(dist, {:sync_results, :"remote@host", deltas})
-      Process.sleep(100)
+      # Sync call drains cast from mailbox before querying store
+      _ = Kyber.Distribution.nodes(dist)
 
       stored = Kyber.Delta.Store.query(sn)
       for delta <- deltas do

@@ -424,8 +424,8 @@ defmodule Kyber.Memory.ConsolidatorTest do
       # Sending vault_changed without auth configured should not crash
       send(pid, {:vault_changed, ["concepts/new-note.md", "memory/2026-03-19.md"]})
 
-      # Give it a moment to process
-      Process.sleep(100)
+      # Sync call ensures the vault_changed message was processed before we check
+      Consolidator.get_config(pid)
 
       # Consolidator should still be alive
       assert Process.alive?(pid)
