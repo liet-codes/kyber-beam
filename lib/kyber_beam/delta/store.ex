@@ -104,6 +104,9 @@ defmodule Kyber.Delta.Store do
           io_device: io_device,
           deltas: [],
           delta_count: 0,
+          # Timestamp of the oldest in-memory delta, used by needs_disk_fallback?/2
+          # to avoid O(n) List.last/1 on every query. Updated on load and trim.
+          oldest_ts: nil,
           name: name,
           subs: %{},
           task_sup: task_sup,
@@ -127,8 +130,10 @@ defmodule Kyber.Delta.Store do
     deltas = load_from_disk(state.path)
     count = length(deltas)
     Logger.info("[Kyber.Delta.Store] started, loaded #{count} deltas from #{state.path}")
-    # Store in newest-first order for O(1) prepend on append
-    {:noreply, %{state | deltas: Enum.reverse(deltas), delta_count: count}}
+    # Store in newest-first order for O(1) prepend on append.
+    # Track oldest_ts so needs_disk_fallback?/2 is O(1) instead of O(n).
+    oldest_ts = if deltas == [], do: nil, else: hd(deltas).ts
+    {:noreply, %{state | deltas: Enum.reverse(deltas), delta_count: count, oldest_ts: oldest_ts}}
   end
 
   @impl true
@@ -138,8 +143,11 @@ defmodule Kyber.Delta.Store do
     # Trim oldest deltas from memory when limit exceeded; they remain on disk.
     # Use delta_count (tracked in state) instead of length/1 for O(1) check.
     new_count = state.delta_count + 1
-    {new_deltas, final_count} = trim_memory([delta | state.deltas], new_count, state.max_memory_deltas)
-    state = %{state | deltas: new_deltas, delta_count: final_count}
+    # On first append to an empty store, this delta becomes the oldest.
+    current_oldest = state.oldest_ts || delta.ts
+    {new_deltas, final_count, new_oldest_ts} =
+      trim_memory([delta | state.deltas], new_count, state.max_memory_deltas, current_oldest)
+    state = %{state | deltas: new_deltas, delta_count: final_count, oldest_ts: new_oldest_ts}
 
     broadcast(state, delta)
     {:reply, :ok, state}
@@ -157,7 +165,7 @@ defmodule Kyber.Delta.Store do
   def handle_call({:query, filters}, from, state) do
     since = Keyword.get(filters, :since)
 
-    if needs_disk_fallback?(state.deltas, since) do
+    if needs_disk_fallback?(state.oldest_ts, since) do
       # The requested window predates our in-memory data — we must read from
       # disk. Rather than blocking the GenServer with Task.yield/2, we spawn
       # an unlinked process (spawn_monitor), defer the reply, and continue
@@ -320,18 +328,22 @@ defmodule Kyber.Delta.Store do
   # Keep only the most recent `max` deltas in memory; oldest are still on disk.
   # Accepts pre-computed `count` so we avoid O(n) length/1 on every append.
   # Deltas are stored newest-first, so take the first `max` to keep newest.
-  defp trim_memory(deltas, count, max) when count > max do
-    {Enum.take(deltas, max), max}
+  # Returns {deltas, count, oldest_ts} — oldest_ts is updated when trimming
+  # occurs (O(n) here is acceptable since trim is infrequent vs. query).
+  defp trim_memory(deltas, count, max, _oldest_ts) when count > max do
+    trimmed = Enum.take(deltas, max)
+    new_oldest_ts = List.last(trimmed).ts
+    {trimmed, max, new_oldest_ts}
   end
 
-  defp trim_memory(deltas, count, _max), do: {deltas, count}
+  defp trim_memory(deltas, count, _max, oldest_ts), do: {deltas, count, oldest_ts}
 
   # True when the oldest in-memory delta is newer than `since`, meaning the
   # caller wants data that was already trimmed from the in-memory list.
-  # Deltas are stored newest-first, so oldest is at the tail.
-  defp needs_disk_fallback?([], _since), do: false
-  defp needs_disk_fallback?(_deltas, nil), do: false
-  defp needs_disk_fallback?(deltas, since), do: List.last(deltas).ts > since
+  # Uses pre-tracked oldest_ts for O(1) instead of O(n) List.last/1.
+  defp needs_disk_fallback?(_oldest_ts, nil), do: false
+  defp needs_disk_fallback?(nil, _since), do: false
+  defp needs_disk_fallback?(oldest_ts, since), do: oldest_ts > since
 
   defp apply_since(deltas, nil), do: deltas
   defp apply_since(deltas, since), do: Enum.filter(deltas, &(&1.ts >= since))
