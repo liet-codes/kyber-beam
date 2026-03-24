@@ -58,11 +58,11 @@
 - [ ] **Browser automation** — no equivalent to OpenClaw's browser tool.
 - [ ] **Web search** — only `web_fetch` (raw HTTP), no search index integration.
 - [ ] **Multi-channel support** — Discord only. No WhatsApp, Telegram, Signal, etc.
-- [ ] **Rate limiting** — no cost protection on LLM calls.
+- [x] **Rate limiting** — 30 calls/min rolling window, configurable. *(Fixed 2026-03-24)*
 - [ ] **Token budget management** — 20-message heuristic instead of actual token counting.
 - [x] **README / onboarding** — README says "TODO: Add description". No getting started guide. *(Fixed 2026-03-23)*
 - [ ] **Skills system** — no equivalent to OpenClaw's AgentSkills (SKILL.md).
-- [ ] **Multi-model support** — hardcoded claude-sonnet-4 in several places.
+- [x] **Multi-model support** — configurable via `Application.get_env(:kyber_beam, :model)`. *(Fixed 2026-03-24)*
 
 ---
 
@@ -73,7 +73,7 @@
 - [ ] **L0/L1 auto-generation** — docs describe Haiku generating L0/L1 summaries from L2. Currently L0 = title+tags, L1 = first paragraph.
 - [ ] **Semantic vault search** — keyword only until Phase 3.
 - [ ] **Tool trust rings** — docs describe per-tool trust levels. Not implemented.
-- [ ] **Formal Plugin behaviour** — docs describe `init/1`, `handle_effect/2`, `shutdown/1`, `secrets/0`, `capabilities/0`. No `@callback` definitions exist.
+- [x] **Formal Plugin behaviour** — `Kyber.Plugin.Behaviour` with `@callback` specs. LLM + Discord declare it. *(Fixed 2026-03-24)*
 
 ---
 
@@ -90,4 +90,4 @@
 
 ---
 
-*Total: 0 P0 + 0 P1 + 0 P2 + 10 P3 (features) + 6 P4 (doc gaps) + 1 nit = 17 remaining items*
+*Total: 0 P0 + 0 P1 + 0 P2 + 7 P3 (features) + 5 P4 (doc gaps) + 1 nit = 13 remaining items*
