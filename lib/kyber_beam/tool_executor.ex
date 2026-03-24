@@ -967,20 +967,20 @@ defmodule Kyber.ToolExecutor do
 
   # ── camera helpers ────────────────────────────────────────────────────────
 
-  # Poll /tmp/snap_result every 500ms for up to max_attempts × 500ms total.
-  defp poll_snap_result(attempt, max_attempts) when attempt >= max_attempts do
-    File.rm("/tmp/snap_request")
+  # Poll snap_result every 500ms for up to max_attempts × 500ms total.
+  defp poll_snap_result(attempt, max_attempts, req_path, _res_path) when attempt >= max_attempts do
+    File.rm(req_path)
     {:error, "Camera snap timed out after 5 seconds — snap daemon may not be running"}
   end
 
-  defp poll_snap_result(attempt, max_attempts) do
+  defp poll_snap_result(attempt, max_attempts, req_path, res_path) do
     :timer.sleep(500)
 
-    case File.read("/tmp/snap_result") do
+    case File.read(res_path) do
       {:ok, result} ->
         # Always clean up both sentinel files
-        File.rm("/tmp/snap_request")
-        File.rm("/tmp/snap_result")
+        File.rm(req_path)
+        File.rm(res_path)
 
         result = String.trim(result)
 
@@ -998,10 +998,10 @@ defmodule Kyber.ToolExecutor do
         end
 
       {:error, :enoent} ->
-        poll_snap_result(attempt + 1, max_attempts)
+        poll_snap_result(attempt + 1, max_attempts, req_path, res_path)
 
       {:error, reason} ->
-        File.rm("/tmp/snap_request")
+        File.rm(req_path)
         {:error, "Error polling snap result: #{inspect(reason)}"}
     end
   end

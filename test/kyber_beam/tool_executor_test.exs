@@ -422,25 +422,26 @@ defmodule Kyber.ToolExecutorTest do
     @describetag :camera_daemon
 
     setup do
+      req = Application.get_env(:kyber_beam, :snap_request_path, "/tmp/snap_request")
+      res = Application.get_env(:kyber_beam, :snap_result_path, "/tmp/snap_result")
       # Clean up sentinel files before and after each test
-      File.rm("/tmp/snap_request")
-      File.rm("/tmp/snap_result")
+      File.rm(req)
+      File.rm(res)
       on_exit(fn ->
-        File.rm("/tmp/snap_request")
-        File.rm("/tmp/snap_result")
+        File.rm(req)
+        File.rm(res)
       end)
-      :ok
+      {:ok, snap_request_path: req, snap_result_path: res}
     end
 
-    test "returns photo path when daemon responds with ok:" do
+    test "returns photo path when daemon responds with ok:", %{snap_result_path: res} do
       output_path = "/tmp/stilgar_test_snap_#{:rand.uniform(999_999)}.jpg"
 
       # Simulate the snap daemon: write result ~300ms after the request is written
       parent = self()
       Task.start(fn ->
         :timer.sleep(300)
-        # Ensure the request was written before responding
-        File.write!("/tmp/snap_result", "ok:#{output_path}")
+        File.write!(res, "ok:#{output_path}")
         send(parent, :result_written)
       end)
 
@@ -449,25 +450,25 @@ defmodule Kyber.ToolExecutorTest do
       assert String.contains?(msg, "Photo saved")
     end
 
-    test "returns error when daemon responds with error:" do
+    test "returns error when daemon responds with error:", %{snap_result_path: res} do
       output_path = "/tmp/stilgar_test_snap_#{:rand.uniform(999_999)}.jpg"
 
       Task.start(fn ->
         :timer.sleep(300)
-        File.write!("/tmp/snap_result", "error:camera permission denied")
+        File.write!(res, "error:camera permission denied")
       end)
 
       assert {:error, msg} = ToolExecutor.execute("camera_snap", %{"output_path" => output_path})
       assert String.contains?(msg, "camera permission denied")
     end
 
-    test "uses default output path when none provided" do
+    test "uses default output path when none provided", %{snap_request_path: req, snap_result_path: res} do
       Task.start(fn ->
         :timer.sleep(300)
         # Read the requested path back from snap_request and echo it
         :timer.sleep(50)
-        path = File.read!("/tmp/snap_request") |> String.trim()
-        File.write!("/tmp/snap_result", "ok:#{path}")
+        path = File.read!(req) |> String.trim()
+        File.write!(res, "ok:#{path}")
       end)
 
       assert {:ok, msg} = ToolExecutor.execute("camera_snap", %{})
@@ -475,44 +476,42 @@ defmodule Kyber.ToolExecutorTest do
       assert String.contains?(msg, ".jpg")
     end
 
-    test "cleans up sentinel files after success" do
+    test "cleans up sentinel files after success", %{snap_request_path: req, snap_result_path: res} do
       output_path = "/tmp/stilgar_test_snap_cleanup_#{:rand.uniform(999_999)}.jpg"
 
       Task.start(fn ->
         :timer.sleep(300)
-        File.write!("/tmp/snap_result", "ok:#{output_path}")
+        File.write!(res, "ok:#{output_path}")
       end)
 
       assert {:ok, _} = ToolExecutor.execute("camera_snap", %{"output_path" => output_path})
 
-      refute File.exists?("/tmp/snap_request")
-      refute File.exists?("/tmp/snap_result")
+      refute File.exists?(req)
+      refute File.exists?(res)
     end
 
-    test "cleans up sentinel files after daemon error" do
+    test "cleans up sentinel files after daemon error", %{snap_request_path: req, snap_result_path: res} do
       output_path = "/tmp/stilgar_test_snap_err_#{:rand.uniform(999_999)}.jpg"
 
       Task.start(fn ->
         :timer.sleep(300)
-        File.write!("/tmp/snap_result", "error:shutter failed")
+        File.write!(res, "error:shutter failed")
       end)
 
       assert {:error, _} = ToolExecutor.execute("camera_snap", %{"output_path" => output_path})
 
-      refute File.exists?("/tmp/snap_request")
-      refute File.exists?("/tmp/snap_result")
+      refute File.exists?(req)
+      refute File.exists?(res)
     end
 
     @tag timeout: 10_000
     @tag :slow
-    @tag :skip_with_daemon
     test "returns timeout error when daemon never responds" do
-      # This test assumes the snap daemon is NOT running. If it is, the daemon
-      # picks up /tmp/snap_request and writes a result before the timeout.
-      # Skip this test when the daemon is active (tagged :skip_with_daemon).
+      # With test-specific sentinel paths (configured in config/test.exs),
+      # the real snap daemon cannot intercept — so this test will always
+      # hit the timeout regardless of whether the daemon is running.
       output_path = "/tmp/stilgar_test_snap_nodaemon_#{:rand.uniform(999_999)}.jpg"
 
-      # Use a non-standard request path so the real daemon can't intercept
       assert {:error, msg} = ToolExecutor.execute("camera_snap", %{"output_path" => output_path})
       assert String.contains?(msg, "timed out")
     end
