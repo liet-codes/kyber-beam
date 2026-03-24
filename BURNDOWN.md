@@ -53,13 +53,13 @@
 
 ## P3 — Missing Features (for daily-driver viability)
 
-- [ ] **LLM streaming** — 60s synchronous waits. Poor UX, Discord shows "thinking..." indefinitely.
+- [x] **LLM streaming** — SSE streaming with reasoning trace UI (spoiler-tagged). *(Fixed 2026-03-24)*
 - [ ] **Sub-agent orchestration** — no spawn, no delegation, no parallel work. Biggest feature gap vs OpenClaw.
 - [ ] **Browser automation** — no equivalent to OpenClaw's browser tool.
 - [ ] **Web search** — only `web_fetch` (raw HTTP), no search index integration.
 - [ ] **Multi-channel support** — Discord only. No WhatsApp, Telegram, Signal, etc.
 - [x] **Rate limiting** — 30 calls/min rolling window, configurable. *(Fixed 2026-03-24)*
-- [ ] **Token budget management** — 20-message heuristic instead of actual token counting.
+- [x] **Token budget management** — TokenCounter module, 180K budget, newest-first trimming. *(Fixed 2026-03-24)*
 - [x] **README / onboarding** — README says "TODO: Add description". No getting started guide. *(Fixed 2026-03-23)*
 - [ ] **Skills system** — no equivalent to OpenClaw's AgentSkills (SKILL.md).
 - [x] **Multi-model support** — configurable via `Application.get_env(:kyber_beam, :model)`. *(Fixed 2026-03-24)*
@@ -90,4 +90,4 @@
 
 ---
 
-*Total: 0 P0 + 0 P1 + 0 P2 + 7 P3 (features) + 5 P4 (doc gaps) + 1 nit = 13 remaining items*
+*Total: 0 P0 + 0 P1 + 0 P2 + 5 P3 (features) + 5 P4 (doc gaps) + 1 nit = 11 remaining items*
