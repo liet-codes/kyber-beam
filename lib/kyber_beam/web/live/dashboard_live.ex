@@ -105,6 +105,8 @@ defmodule Kyber.Web.DashboardLive do
   end
 
   def handle_event("toggle_trace", %{"id" => id}, socket) do
+    require Logger
+    Logger.info("[Dashboard] toggle_trace id=#{id}")
     expanded = socket.assigns.expanded_ids
 
     expanded =
@@ -112,7 +114,9 @@ defmodule Kyber.Web.DashboardLive do
         do: MapSet.delete(expanded, id),
         else: MapSet.put(expanded, id)
 
+    Logger.info("[Dashboard] expanded_ids now has #{MapSet.size(expanded)} entries")
     trace_entries = build_trace_tree(socket.assigns.all_deltas, expanded)
+    Logger.info("[Dashboard] trace_entries count: #{length(trace_entries)}")
     {:noreply, assign(socket, expanded_ids: expanded, trace_entries: trace_entries)}
   end
 
@@ -137,14 +141,28 @@ defmodule Kyber.Web.DashboardLive do
               <%= if token_summary do %>
                 <div class="trace-token-summary"><%= token_summary %></div>
               <% end %>
+              <div class="wf-legend">
+                <div class="wf-legend-item">
+                  <div class="wf-legend-swatch" style="background:#68d391;"></div>
+                  External input
+                </div>
+                <div class="wf-legend-item">
+                  <div class="wf-legend-swatch" style="background:#63b3ed;"></div>
+                  Remote service
+                </div>
+                <div class="wf-legend-item">
+                  <div class="wf-legend-swatch" style="background:#fbd38d;"></div>
+                  Internal operation
+                </div>
+              </div>
               <div class="waterfall-container">
                 <%= for bar <- waterfall do %>
                   <div class="wf-row">
-                    <div class="wf-label"><%= bar.label %></div>
+                    <div class="wf-label" title={bar.label}><%= bar.label %></div>
                     <div class="wf-track">
                       <div
                         class="wf-bar"
-                        style={"left:#{bar.offset_pct}%;width:#{bar.width_pct}%;background:#{waterfall_color(bar.kind)};"}
+                        style={"left:#{bar.offset_pct}%;width:#{bar.width_pct}%;background:#{waterfall_color(bar.category)};"}
                       >
                         <span class="wf-ms"><%= bar.duration_ms %>ms</span>
                       </div>
@@ -154,10 +172,12 @@ defmodule Kyber.Web.DashboardLive do
               </div>
             </div>
           <% end %>
-          <%!-- Tree node --%>
+          <%!-- Tree node — uses <button> for native iOS touch support --%>
           <div
+            role="button"
+            tabindex="0"
             class={"trace-node #{if depth == 0, do: "trace-root", else: "trace-child"}"}
-            style={"padding-left:#{12 + depth * 20}px;"}
+            style={"padding-left:#{12 + depth * 20}px;cursor:pointer;-webkit-tap-highlight-color:rgba(99,179,237,0.3);"}
             phx-click="toggle_trace"
             phx-value-id={delta.id}
           >
@@ -171,9 +191,7 @@ defmodule Kyber.Web.DashboardLive do
               <span class="trace-ts"><%= format_ts(delta.ts) %></span>
             </div>
             <div class="trace-summary">
-              <%= for line <- String.split(delta_summary(delta), "\n") do %>
-                <div><%= line %></div>
-              <% end %>
+              <%= Phoenix.HTML.raw(delta_summary_html(delta)) %>
             </div>
             <%= if token_badge(delta) do %>
               <div class="trace-tokens"><%= token_badge(delta) %></div>
@@ -657,6 +675,18 @@ defmodule Kyber.Web.DashboardLive do
     "#{kind_emoji(kind)} #{kind}" <> if(preview != "", do: ": #{preview}", else: "")
   end
 
+  # Convert delta_summary markdown to safe HTML
+  defp delta_summary_html(delta) do
+    bold_re = Regex.compile!("\\*\\*(.+?)\\*\\*")
+
+    delta
+    |> delta_summary()
+    |> Phoenix.HTML.html_escape()
+    |> Phoenix.HTML.safe_to_string()
+    |> then(fn s -> Regex.replace(bold_re, s, "<strong>\\1</strong>") end)
+    |> String.replace("\n", "<br/>")
+  end
+
   defp inspect_short(v) when is_binary(v) do
     if String.length(v) > 60, do: "\"#{String.slice(v, 0, 60)}…\"", else: "\"#{v}\""
   end
@@ -721,17 +751,18 @@ defmodule Kyber.Web.DashboardLive do
     |> Enum.sort_by(& &1.ts)
     |> Enum.map(fn d ->
       offset_ms = d.ts - root_ts
-      offset_pct = offset_ms / total_duration * 100
+      offset_pct = offset_ms / total_duration * 100.0
 
       # Estimate duration: for pairs like tool.call->tool.result, use next sibling
       duration_ms = estimate_duration(d, all_in_trace, total_duration)
-      width_pct = max(duration_ms / total_duration * 100, 2)
+      width_pct = max(duration_ms / total_duration * 100.0, 2.0)
 
       %{
         id: d.id,
         kind: d.kind,
-        offset_pct: Float.round(offset_pct, 1),
-        width_pct: Float.round(min(width_pct, 100 - offset_pct), 1),
+        category: delta_category(d),
+        offset_pct: Float.round(offset_pct * 1.0, 1),
+        width_pct: Float.round(min(width_pct, 100.0 - offset_pct) * 1.0, 1),
         offset_ms: offset_ms,
         duration_ms: duration_ms,
         label: waterfall_label(d)
@@ -757,12 +788,50 @@ defmodule Kyber.Web.DashboardLive do
   defp waterfall_label(%{kind: "tool.result", payload: p}), do: "←#{p["name"] || "tool"}"
   defp waterfall_label(%{kind: kind}), do: kind
 
-  defp waterfall_color("message.received"), do: "#68d391"
-  defp waterfall_color("llm.call"), do: "#63b3ed"
-  defp waterfall_color("llm.response"), do: "#b794f4"
-  defp waterfall_color("tool.call"), do: "#fbd38d"
-  defp waterfall_color("tool.result"), do: "#f6e05e"
+  # Category-based waterfall colors
+  # External input (incoming signals): green
+  # Remote service (outbound calls): blue
+  # Internal operation (local work): amber
+  defp waterfall_color(:external_input), do: "#68d391"
+  defp waterfall_color(:remote_service), do: "#63b3ed"
+  defp waterfall_color(:internal), do: "#fbd38d"
   defp waterfall_color(_), do: "#a0aec0"
+
+  # Classify a delta into a category based on kind + tool name
+  defp delta_category(%{kind: "message.received"}), do: :external_input
+  defp delta_category(%{kind: "familiard.escalation"}), do: :external_input
+  defp delta_category(%{kind: "llm.call"}), do: :remote_service
+  defp delta_category(%{kind: "llm.response"}), do: :remote_service
+  defp delta_category(%{kind: "llm.error"}), do: :remote_service
+  defp delta_category(%{kind: "send_message"}), do: :remote_service
+  defp delta_category(%{kind: "cron.fired"}), do: :internal
+
+  defp delta_category(%{kind: kind, payload: p}) when kind in ["tool.call", "tool.result"] do
+    name = (p["name"] || "") |> String.downcase()
+
+    cond do
+      # Remote service tools — outbound API calls
+      name in ["message", "web_search", "web_fetch", "browser", "image"] ->
+        :remote_service
+
+      # Internal tools — local file/compute operations
+      name in ["read", "write", "edit", "exec", "process", "memory_search", "memory_get"] ->
+        :internal
+
+      # Heuristics for other tool names
+      String.contains?(name, ["api", "http", "fetch", "search", "send", "upload"]) ->
+        :remote_service
+
+      String.contains?(name, ["read", "write", "file", "vault", "memory", "local", "exec"]) ->
+        :internal
+
+      # Default tool calls to internal
+      true ->
+        :internal
+    end
+  end
+
+  defp delta_category(_), do: :internal
 
   defp token_badge(%{kind: "llm.response", payload: p}) do
     usage = p["usage"] || %{}
