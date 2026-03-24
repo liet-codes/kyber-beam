@@ -412,9 +412,9 @@ defmodule Kyber.KnowledgeTest do
 
       # Trigger poll with no changes on disk
       send(pid, :poll_vault)
-      Process.sleep(300)
 
-      refute_receive {:vault_changed, _}, 100
+      # Extend the refute window to cover full async reload; no sleep needed
+      refute_receive {:vault_changed, _}, 500
     end
 
     test "duplicate subscribe is idempotent", %{pid: pid, vault_dir: vault_dir} do
@@ -445,9 +445,11 @@ defmodule Kyber.KnowledgeTest do
       new_file = Path.join(vault_dir, "new-from-disk.md")
       File.write!(new_file, "---\ntitle: New\n---\n\nNew file.")
 
+      :ok = Knowledge.subscribe(pid)
+
       # Trigger incremental reload — only new-from-disk.md has a new mtime
       send(pid, :poll_vault)
-      Process.sleep(200)
+      assert_receive {:vault_changed, _}, 500
 
       count_after = Knowledge.note_count(pid)
 
@@ -471,9 +473,11 @@ defmodule Kyber.KnowledgeTest do
       abs_path = Path.join(vault_dir, "mtime-test.md")
       File.write!(abs_path, "---\ntitle: V2\n---\n\nVersion 2.")
 
-      # Trigger reload
+      :ok = Knowledge.subscribe(pid)
+
+      # Trigger reload and wait for notification (replaces Process.sleep)
       send(pid, :poll_vault)
-      Process.sleep(200)
+      assert_receive {:vault_changed, _}, 500
 
       assert {:ok, v2} = Knowledge.get_note(pid, "mtime-test.md")
       assert v2.frontmatter["title"] == "V2"
