@@ -674,6 +674,29 @@ defmodule Kyber.ToolExecutor do
       if(deleted != [], do: "\nDeleted: #{Enum.join(deleted, ", ")}", else: "")}
   end
 
+  # ── Phase 11: Web Search ─────────────────────────────────────────────────
+
+  def execute("web_search", %{"query" => query} = input) do
+    max_results =
+      input
+      |> Map.get("max_results", 5)
+      |> min(20)
+      |> max(1)
+
+    Logger.info("[Kyber.ToolExecutor] web_search: #{query} (max_results: #{max_results})")
+
+    case Kyber.Tools.WebSearch.search(query, max_results: max_results) do
+      {:ok, results} ->
+        formatted = format_search_results(query, results)
+        {:ok, formatted}
+
+      {:error, reason} ->
+        {:error, "Web search failed: #{reason}"}
+    end
+  rescue
+    e -> {:error, "web_search error: #{inspect(e)}"}
+  end
+
   # ── Catch-all ─────────────────────────────────────────────────────────────
 
   def execute(name, _input) do
@@ -830,6 +853,31 @@ defmodule Kyber.ToolExecutor do
   end
 
   defp extract_text(body), do: inspect(body)
+
+  # ── Search result formatting ───────────────────────────────────────────────
+
+  defp format_search_results(query, []) do
+    "No results found for: #{query}"
+  end
+
+  defp format_search_results(query, results) do
+    header = "Search results for: #{query}\n\n"
+
+    body =
+      results
+      |> Enum.with_index(1)
+      |> Enum.map(fn {result, i} ->
+        date_str = if result.date, do: " (#{result.date})", else: ""
+        """
+        #{i}. #{result.title}#{date_str}
+           URL: #{result.url}
+           #{result.snippet}
+        """
+      end)
+      |> Enum.join("\n")
+
+    header <> body
+  end
 
   # ── Memory helpers (grouped below all execute/2 clauses) ─────────────────
 

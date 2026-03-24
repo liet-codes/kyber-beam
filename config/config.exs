@@ -46,4 +46,12 @@ config :kyber_beam, Kyber.Web.Endpoint,
 config :kyber_beam, Kyber.PubSub,
   name: Kyber.PubSub
 
+# Web search tool configuration.
+# Set BRAVE_SEARCH_API_KEY env var to enable Brave Search.
+# Alternatively, configure :google provider with GOOGLE_SEARCH_API_KEY + google_cx.
+config :kyber_beam, Kyber.Tools.WebSearch,
+  provider: :brave,
+  api_key: System.get_env("BRAVE_SEARCH_API_KEY", ""),
+  max_results: 5
+
 import_config "#{config_env()}.exs"

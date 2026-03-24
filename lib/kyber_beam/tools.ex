@@ -433,6 +433,30 @@ defmodule Kyber.Tools do
         "required" => ["path"]
       }
     },
+    # ── Phase 11: Web Search ──────────────────────────────────────────────────
+
+    %{
+      "name" => "web_search",
+      "description" =>
+        "Search the web for information. Returns a list of results with title, URL, " <>
+        "snippet, and date. Use this to find current information, research topics, " <>
+        "or verify facts. Results can be cited in your response.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "query" => %{
+            "type" => "string",
+            "description" => "Search query string"
+          },
+          "max_results" => %{
+            "type" => "integer",
+            "description" => "Maximum number of results to return (default 5, max 20)"
+          }
+        },
+        "required" => ["query"]
+      }
+    },
+
     %{
       "name" => "cleanup_tmp",
       "description" =>

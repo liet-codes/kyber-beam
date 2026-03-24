@@ -207,6 +207,12 @@ defmodule Kyber.Reducer do
     {state, []}
   end
 
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "search.results"}) do
+    # Search results are informational — visible to LLM in subsequent turns
+    # via the delta stream. No state change or effects needed.
+    {state, []}
+  end
+
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "voice.audio"}) do
     # Audio data is passed through; no state change.
     # Downstream effect handlers (e.g. :send_audio) are not emitted here —

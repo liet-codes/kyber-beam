@@ -134,6 +134,7 @@ defmodule Kyber.Effect.Executor do
     plugin_loaded
     message_received
     spawn_task
+    web_search
   )a
 
   defp safe_to_atom(t) when t in @known_effect_types, do: String.to_existing_atom(t)
