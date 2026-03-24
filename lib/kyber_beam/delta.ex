@@ -7,7 +7,7 @@ defmodule Kyber.Delta do
   persistently, and drive state mutations via the Reducer.
   """
 
-  @typedoc "Unique identifier for a delta (UUID or similar)"
+  @typedoc "Unique identifier for a delta (32-char lowercase hex string, 128 bits of entropy)"
   @type id :: String.t()
 
   @typedoc "Unix timestamp in milliseconds"
@@ -23,7 +23,7 @@ defmodule Kyber.Delta do
   A Delta struct representing a single immutable event.
 
   Fields:
-  - `id` — unique identifier (UUID string)
+  - `id` — unique identifier (32-char hex string, see `t:id/0`)
   - `ts` — timestamp in milliseconds since epoch
   - `origin` — where this delta came from (see `Kyber.Delta.Origin`)
   - `kind` — event type string (e.g. \"message.received\")
@@ -94,7 +94,12 @@ defmodule Kyber.Delta do
     }
   end
 
-  # Generate a random 16-byte hex ID (no UUID dep required)
+  # Generate a random 32-char lowercase hex ID.
+  #
+  # This is 16 random bytes (128 bits) encoded as hex — the same entropy as a
+  # UUID v4, but without the UUID formatting (no hyphens, no version/variant
+  # bits). It is NOT a standards-compliant UUID; it is Kyber's own opaque ID
+  # format. Example: "4a7f3c1e9b02d856af31c78e04b26d90"
   defp generate_id do
     :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
   end

@@ -177,20 +177,6 @@ defmodule Kyber.Cron do
     end
   end
 
-  def handle_call({:toggle_job, name}, _from, state) do
-    # Fallback clause — missing enabled arg; default to true
-    case Map.get(state.jobs, name) do
-      nil ->
-        {:reply, {:error, :not_found}, state}
-
-      job ->
-        new_job = Map.put(job, :enabled, true)
-        new_state = %{state | jobs: Map.put(state.jobs, name, new_job)}
-        persist_jobs(new_state)
-        {:reply, :ok, new_state}
-    end
-  end
-
   def handle_call({:toggle_job, name, enabled}, _from, state) do
     case Map.get(state.jobs, name) do
       nil ->
