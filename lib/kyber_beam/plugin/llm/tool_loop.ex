@@ -371,7 +371,14 @@ defmodule Kyber.Plugin.LLM.ToolLoop do
             %{
               "name" => tool_name,
               "status" => "ok",
-              "output" => truncate_output("Image: #{path} (#{size} bytes)")
+              "output" => truncate_output("Image: #{path} (#{size} bytes)"),
+              "images" => [
+                %{
+                  "label" => image_label(tool_name, path),
+                  "media_type" => media_type,
+                  "base64" => b64
+                }
+              ]
             },
             origin,
             call_delta.id
@@ -455,4 +462,14 @@ defmodule Kyber.Plugin.LLM.ToolLoop do
   defp process_alive?(name) when is_atom(name), do: Process.whereis(name) != nil
   defp process_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
   defp process_alive?(_), do: false
+
+  defp image_label("computer_use", _path), do: "Screenshot"
+  defp image_label("browser", _path), do: "Browser Screenshot"
+  defp image_label("camera", _path), do: "Camera Snap"
+  defp image_label(tool_name, path) do
+    cond do
+      String.contains?(to_string(path), "screenshot") -> "Screenshot (#{tool_name})"
+      true -> "Image (#{tool_name})"
+    end
+  end
 end

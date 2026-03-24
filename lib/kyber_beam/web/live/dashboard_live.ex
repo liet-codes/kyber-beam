@@ -14,6 +14,8 @@ defmodule Kyber.Web.DashboardLive do
   use Phoenix.LiveView
   require Logger
 
+  alias Kyber.Web.ImageDetector
+
   @refresh_interval_ms 5_000
   @max_displayed_deltas 50
 
@@ -39,6 +41,7 @@ defmodule Kyber.Web.DashboardLive do
       |> assign(:started_at, System.system_time(:millisecond))
       |> assign(:node_name, node())
       |> assign(:expanded, MapSet.new())
+      |> assign(:image_modal, nil)
       |> load_state()
 
     {:ok, socket}
@@ -102,6 +105,27 @@ defmodule Kyber.Web.DashboardLive do
     expanded = socket.assigns.expanded
     expanded = if MapSet.member?(expanded, id), do: MapSet.delete(expanded, id), else: MapSet.put(expanded, id)
     {:noreply, assign(socket, :expanded, expanded)}
+  end
+
+  def handle_event("noop", _params, socket), do: {:noreply, socket}
+
+  def handle_event("show_image", %{"delta-id" => delta_id, "index" => idx_str}, socket) do
+    idx = String.to_integer(idx_str)
+    # Find the delta and extract its images
+    delta = find_delta(socket, delta_id)
+    images = if delta, do: ImageDetector.extract_images(delta.payload), else: []
+
+    case Enum.at(images, idx) do
+      {label, media_type, base64} ->
+        {:noreply, assign(socket, :image_modal, %{label: label, media_type: media_type, base64: base64})}
+
+      _ ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_event("close_image_modal", _params, socket) do
+    {:noreply, assign(socket, :image_modal, nil)}
   end
 
   def handle_event("toggle_trace", %{"id" => id}, socket) do
@@ -173,6 +197,7 @@ defmodule Kyber.Web.DashboardLive do
             </div>
           <% end %>
           <%!-- Tree node — uses <button> for native iOS touch support --%>
+          <% delta_images = ImageDetector.extract_images(delta.payload) %>
           <div
             role="button"
             tabindex="0"
@@ -188,6 +213,9 @@ defmodule Kyber.Web.DashboardLive do
                 <span class="trace-toggle-spacer"></span>
               <% end %>
               <span class="trace-kind" style={"color:#{delta_kind_color(delta.kind)};"}><%= delta.kind %></span>
+              <%= if delta_images != [] do %>
+                <span title={"#{length(delta_images)} image(s)"} style="margin-left:4px;">🖼️</span>
+              <% end %>
               <span class="trace-ts"><%= format_ts(delta.ts) %></span>
             </div>
             <div class="trace-summary">
@@ -196,9 +224,36 @@ defmodule Kyber.Web.DashboardLive do
             <%= if token_badge(delta) do %>
               <div class="trace-tokens"><%= token_badge(delta) %></div>
             <% end %>
+            <%!-- Inline image thumbnails (only rendered when expanded) --%>
+            <%= if expanded and delta_images != [] do %>
+              <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;" phx-click="noop" phx-value-id={delta.id}>
+                <%= for {{label, media_type, base64}, idx} <- Enum.with_index(delta_images) do %>
+                  <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
+                    <div
+                      phx-click="show_image"
+                      phx-value-delta-id={delta.id}
+                      phx-value-index={idx}
+                      style="cursor:zoom-in;border:1px solid #4a5568;border-radius:6px;overflow:hidden;background:#0d1117;"
+                    >
+                      <img
+                        src={"data:#{media_type};base64,#{base64}"}
+                        style="max-width:300px;max-height:200px;display:block;"
+                        loading="lazy"
+                        onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"
+                      />
+                      <div style="display:none;width:300px;height:100px;align-items:center;justify-content:center;color:#fc8181;font-size:0.8rem;">
+                        ⚠️ Broken image
+                      </div>
+                    </div>
+                    <span style="color:#a0aec0;font-size:0.7rem;"><%= label %></span>
+                  </div>
+                <% end %>
+              </div>
+            <% end %>
           </div>
         <% end %>
       </div>
+      <.image_modal image_modal={@image_modal} />
     </div>
     """
   end
@@ -225,9 +280,37 @@ defmodule Kyber.Web.DashboardLive do
                 <span style="color:#718096;margin-left:8px;">origin: <%= inspect_origin(delta.origin) %></span>
               <% end %>
             </div>
+            <% delta_imgs = ImageDetector.extract_images(delta.payload) %>
             <%= if MapSet.member?(@expanded, delta.id) do %>
               <div style="margin-top:12px;padding-top:12px;border-top:1px solid #2d3748;">
-                <pre style="color:#e2e8f0;font-size:0.8rem;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;"><%= Jason.encode!(delta.payload, pretty: true) %></pre>
+                <%!-- Inline images --%>
+                <%= if delta_imgs != [] do %>
+                  <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:8px;">
+                    <%= for {{label, media_type, base64}, idx} <- Enum.with_index(delta_imgs) do %>
+                      <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
+                        <div
+                          phx-click="show_image"
+                          phx-value-delta-id={delta.id}
+                          phx-value-index={idx}
+                          style="cursor:zoom-in;border:1px solid #4a5568;border-radius:6px;overflow:hidden;background:#0d1117;"
+                        >
+                          <img
+                            src={"data:#{media_type};base64,#{base64}"}
+                            style="max-width:300px;max-height:200px;display:block;"
+                            loading="lazy"
+                            onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"
+                          />
+                          <div style="display:none;width:300px;height:100px;align-items:center;justify-content:center;color:#fc8181;font-size:0.8rem;">
+                            ⚠️ Broken image
+                          </div>
+                        </div>
+                        <span style="color:#a0aec0;font-size:0.7rem;"><%= label %></span>
+                      </div>
+                    <% end %>
+                  </div>
+                <% end %>
+                <%!-- JSON payload (with base64 truncated for readability) --%>
+                <pre style="color:#e2e8f0;font-size:0.8rem;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;"><%= Jason.encode!(truncate_base64_in_payload(delta.payload), pretty: true) %></pre>
                 <%= if delta.parent_id do %>
                   <div style="color:#718096;font-size:0.75rem;margin-top:8px;">parent: <span style="color:#b794f4;"><%= delta.parent_id %></span></div>
                 <% end %>
@@ -235,7 +318,11 @@ defmodule Kyber.Web.DashboardLive do
             <% else %>
               <%= if map_size(delta.payload) > 0 do %>
                 <div style="color:#4a5568;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.8rem;">
-                  <%= delta.payload |> Map.keys() |> Enum.join(", ") %>  — tap to expand
+                  <%= delta.payload |> Map.keys() |> Enum.join(", ") %>
+                  <%= if delta_imgs != [] do %>
+                    <span style="margin-left:4px;">🖼️ <%= length(delta_imgs) %> image(s)</span>
+                  <% end %>
+                  — tap to expand
                 </div>
               <% end %>
             <% end %>
@@ -245,6 +332,7 @@ defmodule Kyber.Web.DashboardLive do
           <div style="color:#4a5568;text-align:center;padding:32px;">No deltas yet…</div>
         <% end %>
       </div>
+      <.image_modal image_modal={@image_modal} />
     </div>
     """
   end
@@ -342,8 +430,23 @@ defmodule Kyber.Web.DashboardLive do
               <span style="color:#4a5568;"><%= format_ts(delta.ts) %></span>
             </div>
             <%= if MapSet.member?(@expanded, delta.id) do %>
+              <% overview_imgs = ImageDetector.extract_images(delta.payload) %>
               <div style="padding:8px 0 12px;border-bottom:1px solid #2d3748;">
-                <pre style="color:#e2e8f0;font-size:0.75rem;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;"><%= Jason.encode!(delta.payload, pretty: true) %></pre>
+                <%= if overview_imgs != [] do %>
+                  <div style="margin-bottom:8px;display:flex;flex-wrap:wrap;gap:6px;">
+                    <%= for {{label, media_type, base64}, idx} <- Enum.with_index(overview_imgs) do %>
+                      <div
+                        phx-click="show_image"
+                        phx-value-delta-id={delta.id}
+                        phx-value-index={idx}
+                        style="cursor:zoom-in;border:1px solid #4a5568;border-radius:4px;overflow:hidden;"
+                      >
+                        <img src={"data:#{media_type};base64,#{base64}"} style="max-width:200px;max-height:120px;display:block;" loading="lazy" title={label} />
+                      </div>
+                    <% end %>
+                  </div>
+                <% end %>
+                <pre style="color:#e2e8f0;font-size:0.75rem;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;"><%= Jason.encode!(truncate_base64_in_payload(delta.payload), pretty: true) %></pre>
               </div>
             <% end %>
           <% end %>
@@ -371,6 +474,11 @@ defmodule Kyber.Web.DashboardLive do
   end
 
   # ── Private ───────────────────────────────────────────────────────────────
+
+  defp find_delta(socket, delta_id) do
+    all = Map.get(socket.assigns, :all_deltas, []) ++ Map.get(socket.assigns, :recent_deltas, [])
+    Enum.find(all, &(&1.id == delta_id))
+  end
 
   defp load_state(socket) do
     {delta_count, recent_deltas} = fetch_deltas()
@@ -859,4 +967,94 @@ defmodule Kyber.Web.DashboardLive do
   defp error_count_style(_) do
     "color:#68d391;font-size:1.4rem;font-weight:bold;margin-top:4px;"
   end
+
+  # ── Image helpers ──────────────────────────────────────────────────────
+
+  @doc false
+  def image_modal(assigns) do
+    ~H"""
+    <%= if @image_modal do %>
+      <div
+        phx-click="close_image_modal"
+        style="position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;padding:20px;cursor:pointer;"
+      >
+        <div style="max-width:95vw;max-height:95vh;display:flex;flex-direction:column;align-items:center;gap:12px;" phx-click="close_image_modal">
+          <div style="color:#e2e8f0;font-size:0.9rem;font-weight:bold;"><%= @image_modal.label %></div>
+          <img
+            src={"data:#{@image_modal.media_type};base64,#{@image_modal.base64}"}
+            style="max-width:90vw;max-height:85vh;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.6);"
+            onerror="this.style.display='none';this.nextElementSibling.style.display='block';"
+          />
+          <div style="display:none;color:#fc8181;font-size:1rem;padding:20px;">⚠️ Failed to load image</div>
+          <div style="display:flex;gap:12px;align-items:center;">
+            <span style="color:#718096;font-size:0.75rem;"><%= @image_modal.media_type %> · <%= format_base64_size(@image_modal.base64) %></span>
+            <button
+              phx-click="close_image_modal"
+              style="background:#2d3748;color:#e2e8f0;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:0.8rem;"
+            >
+              Close (ESC)
+            </button>
+          </div>
+        </div>
+      </div>
+    <% end %>
+    """
+  end
+
+  defp format_base64_size(base64) when is_binary(base64) do
+    bytes = div(byte_size(base64) * 3, 4)
+
+    cond do
+      bytes > 1_048_576 -> "#{Float.round(bytes / 1_048_576, 1)} MB"
+      bytes > 1024 -> "#{Float.round(bytes / 1024, 1)} KB"
+      true -> "#{bytes} B"
+    end
+  end
+
+  defp format_base64_size(_), do: "unknown size"
+
+  defp truncate_base64_in_payload(payload) when is_map(payload) do
+    Map.new(payload, fn
+      {"images", images} when is_list(images) ->
+        truncated =
+          Enum.map(images, fn img ->
+            case img do
+              %{"base64" => b64} when is_binary(b64) and byte_size(b64) > 100 ->
+                Map.put(img, "base64", "[#{byte_size(b64)} chars base64 — rendered above]")
+
+              other ->
+                other
+            end
+          end)
+
+        {"images", truncated}
+
+      {"content", content} when is_list(content) ->
+        truncated =
+          Enum.map(content, fn
+            %{"type" => "image", "source" => %{"data" => d} = src} = block when is_binary(d) and byte_size(d) > 100 ->
+              %{block | "source" => Map.put(src, "data", "[#{byte_size(d)} chars base64 — rendered above]")}
+
+            other ->
+              other
+          end)
+
+        {"content", truncated}
+
+      {key, val} when is_binary(val) and byte_size(val) > 1000 ->
+        if Kyber.Web.ImageDetector.guess_media_type_public(val) do
+          {key, "[#{byte_size(val)} chars base64 image — rendered above]"}
+        else
+          {key, val}
+        end
+
+      {key, val} when is_map(val) ->
+        {key, truncate_base64_in_payload(val)}
+
+      other ->
+        other
+    end)
+  end
+
+  defp truncate_base64_in_payload(other), do: other
 end
