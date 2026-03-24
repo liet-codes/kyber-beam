@@ -534,15 +534,9 @@ defmodule Kyber.Knowledge do
     end
   end
 
-  defp yaml_value(v) when is_list(v) do
-    "[#{Enum.join(v, ", ")}]"
-  end
+  defp yaml_value(v) when is_list(v), do: Jason.encode!(v)
 
-  defp yaml_value(v) when is_map(v) do
-    # Nested map: JSON is valid YAML; prefer flat frontmatter where possible
-    Logger.debug("[Kyber.Knowledge] frontmatter_to_yaml: nested map serialized as JSON inline — consider flattening frontmatter")
-    Jason.encode!(v)
-  end
+  defp yaml_value(v) when is_map(v), do: Jason.encode!(v)
 
   defp yaml_value(v), do: to_string(v)
 

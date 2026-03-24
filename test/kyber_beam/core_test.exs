@@ -5,6 +5,25 @@ defmodule Kyber.CoreTest do
 
   defp unique_name, do: :"core_test_#{:rand.uniform(9_999_999)}"
 
+  # Poll a condition until it returns truthy or timeout (ms) expires.
+  defp poll_until(fun, timeout \\ 500, interval \\ 10) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_poll(fun, deadline, interval)
+  end
+
+  defp do_poll(fun, deadline, interval) do
+    if fun.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("poll_until: condition not met within timeout")
+      else
+        :timer.sleep(interval)
+        do_poll(fun, deadline, interval)
+      end
+    end
+  end
+
   defp start_core(extra_opts \\ []) do
     path = System.tmp_dir!() |> Path.join("kyber_core_test_#{:rand.uniform(999_999)}.jsonl")
     name = unique_name()
@@ -32,8 +51,8 @@ defmodule Kyber.CoreTest do
     # subscription, but emit is still async (runs via Task in Delta.Store)
     delta = Delta.new("test.event", %{"data" => 1})
     :ok = Core.emit(name, delta)
-    Process.sleep(50)
 
+    # Store.append is a sync GenServer.call — delta is available immediately
     deltas = Core.query_deltas(name)
     assert Enum.any?(deltas, &(&1.id == delta.id))
   end
