@@ -33,23 +33,28 @@ defmodule Kyber.Web.Plugs.BearerAuth do
 
   @impl Plug
   def call(conn, _opts) do
-    configured_token = api_token()
-
-    if is_nil(configured_token) or configured_token == "" do
-      # No token configured — dev mode. Log a warning on every request so it
-      # shows up in dev logs (the startup warning may scroll away).
-      Logger.debug("[BearerAuth] no API token configured — skipping auth (dev mode)")
+    # Skip auth for health check (no token required for /health)
+    if conn.method == "GET" and conn.path_info == ["health"] do
       conn
     else
-      case get_bearer_token(conn) do
-        {:ok, token} when token == configured_token ->
-          conn
+      configured_token = api_token()
 
-        _ ->
-          conn
-          |> put_status(401)
-          |> json(%{ok: false, error: "unauthorized"})
-          |> halt()
+      if is_nil(configured_token) or configured_token == "" do
+        # No token configured — dev mode. Log a warning on every request so it
+        # shows up in dev logs (the startup warning may scroll away).
+        Logger.debug("[BearerAuth] no API token configured — skipping auth (dev mode)")
+        conn
+      else
+        case get_bearer_token(conn) do
+          {:ok, token} when token == configured_token ->
+            conn
+
+          _ ->
+            conn
+            |> put_status(401)
+            |> json(%{ok: false, error: "unauthorized"})
+            |> halt()
+        end
       end
     end
   end

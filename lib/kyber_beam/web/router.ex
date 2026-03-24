@@ -19,6 +19,7 @@ defmodule Kyber.Web.Router do
     parsers: [:json],
     json_decoder: Jason
   )
+  plug(Kyber.Web.Plugs.BearerAuth)
   plug(:dispatch)
 
   # ── Routes ─────────────────────────────────────────────────────────────────
@@ -44,8 +45,8 @@ defmodule Kyber.Web.Router do
       parent_id = Map.get(body, "parent_id")
 
       delta = Kyber.Delta.new(kind, payload, origin, parent_id)
-      store = store_pid()
-      :ok = Kyber.Delta.Store.append(store, delta)
+      core = core_pid()
+      :ok = Kyber.Core.emit(core, delta)
       send_json(conn, 201, %{ok: true, id: delta.id})
     else
       :error ->
@@ -103,6 +104,12 @@ defmodule Kyber.Web.Router do
     # The Core supervisor registers the store as :"Elixir.Kyber.Core.Store"
     # (derived from the core name), not as Kyber.Delta.Store.
     Process.get(:kyber_store_pid) || :"Elixir.Kyber.Core.Store"
+  end
+
+  defp core_pid do
+    # The Core GenServer is registered as Kyber.Core in the supervisor.
+    # In tests, can be overridden via process dictionary.
+    Process.get(:kyber_core_pid) || Kyber.Core
   end
 end
 

@@ -124,12 +124,27 @@ defmodule Kyber.ToolExecutor do
     end
   end
 
+  defp contains_shell_injection?(cmd) do
+    # Reject commands containing shell chaining operators that could bypass allowlist.
+    # This prevents "git; rm -rf /" (which would split to stem="git") from executing both parts.
+    # NOTE: bare `&` is intentionally excluded from the regex — `2>&1` redirects are legitimate.
+    # `&&` is still caught by the String.contains check below.
+    String.match?(cmd, ~r/[;|`$()]/) or String.contains?(cmd, ["&&", "||", "$(", "`"])
+  end
+
   def execute("exec", %{"command" => cmd} = input) do
-    # Enforce a strict command allowlist — only safe, read-only tools.
-    # The first token of the command (before any spaces, pipes, or flags)
-    # must be one of the approved stems. This blocks arbitrary shell injection
-    # while still allowing useful inspection commands.
-    cmd_stem = cmd |> String.trim() |> String.split(~r/[\s|;&]/, parts: 2) |> List.first("")
+    # P0-1: Check for shell injection BEFORE allowlist check.
+    # The allowlist checks only the first token (stem), so "git; rm -rf /" splits to "git"
+    # and would pass. We reject the entire command if it contains shell metacharacters.
+    if contains_shell_injection?(cmd) do
+      Logger.warning("[Kyber.ToolExecutor] exec blocked (shell injection): #{String.slice(cmd, 0, 200)}")
+      {:error, "Command contains disallowed shell operators"}
+    else
+      # Enforce a strict command allowlist — only safe, read-only tools.
+      # The first token of the command (before any spaces, pipes, or flags)
+      # must be one of the approved stems. This blocks arbitrary shell injection
+      # while still allowing useful inspection commands.
+      cmd_stem = cmd |> String.trim() |> String.split(~r/[\s|;&]/, parts: 2) |> List.first("")
 
     if cmd_stem not in @allowed_exec_commands do
       Logger.warning("[Kyber.ToolExecutor] exec blocked (not in allowlist): #{String.slice(cmd, 0, 200)}")
@@ -162,6 +177,7 @@ defmodule Kyber.ToolExecutor do
         nil ->
           {:error, "command timed out after #{timeout_ms}ms"}
       end
+    end
     end
   rescue
     e -> {:error, "exec failed: #{inspect(e)}"}
