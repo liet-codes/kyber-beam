@@ -8,6 +8,9 @@ defmodule KyberBeam.Application do
   def start(_type, _args) do
     Logger.info("[KyberBeam] starting application v#{Application.spec(:kyber_beam, :vsn)}")
 
+    # Populate :persistent_term config cache before any children start
+    Kyber.Config.load!()
+
     vault_path = Application.get_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
     heartbeat_interval = Application.get_env(:kyber_beam, :heartbeat_interval, nil)
 

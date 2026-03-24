@@ -14,7 +14,7 @@ defmodule Kyber.Plugin.LLM.ApiClient do
   @max_retries 3
 
   defp configured_model do
-    Application.get_env(:kyber_beam, :model, @default_model)
+    Kyber.Config.get(:model, @default_model)
   end
 
   # ── Auth ──────────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ defmodule Kyber.Plugin.LLM.ApiClient do
   Returns same format as `call_api/2`: `{:ok, response}` or `{:error, ...}`.
   """
   def call_api_maybe_stream(auth_config, params, core, origin, parent_id) do
-    if Application.get_env(:kyber_beam, :llm_streaming, true) do
+    if Kyber.Config.get(:llm_streaming, true) do
       do_streaming_call(auth_config, params, core, origin, parent_id)
     else
       call_api(auth_config, params)
@@ -156,9 +156,9 @@ defmodule Kyber.Plugin.LLM.ApiClient do
 
     # Enable extended thinking if configured
     body =
-      case Application.get_env(:kyber_beam, :llm_thinking, true) do
+      case Kyber.Config.get(:llm_thinking, true) do
         true ->
-          budget = Application.get_env(:kyber_beam, :thinking_budget_tokens, 10_000)
+          budget = Kyber.Config.get(:thinking_budget_tokens, 10_000)
           current_max = body["max_tokens"]
           new_max = max(current_max, budget + @default_max_tokens)
 

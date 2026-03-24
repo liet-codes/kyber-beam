@@ -47,7 +47,7 @@ defmodule Kyber.Plugin.LLM.ToolLoop do
             %{"role" => role, "content" => content}
           end)
 
-        budget = Application.get_env(:kyber_beam, :max_context_tokens, 180_000)
+        budget = Kyber.Config.get(:max_context_tokens, 180_000)
 
         {trimmed, dropped, est_tokens} =
           Kyber.TokenCounter.trim_to_budget(raw_history, budget: budget)

@@ -40,7 +40,10 @@ defmodule Kyber.Cron do
   use GenServer
   require Logger
 
-  @check_interval_ms 1_000  # check every second for due jobs
+  # Maximum sleep between checks — fallback when no jobs are scheduled
+  @max_check_interval_ms 60_000
+  # Legacy default for opts[:check_interval] compatibility
+  @check_interval_ms 1_000
   # A job is "missed" if now is this many ms past its scheduled next_run
   @missed_threshold_ms 5_000
   # Minimum allowed interval for {:every, ms} schedules (10 seconds)
@@ -136,7 +139,8 @@ defmodule Kyber.Cron do
       jobs: %{},
       check_interval: check_interval,
       min_interval_ms: min_interval_ms,
-      persist_path: persist
+      persist_path: persist,
+      timer_ref: nil
     }
 
     # Reload persisted jobs (before adding heartbeat, so heartbeat isn't duplicated)
@@ -151,7 +155,7 @@ defmodule Kyber.Cron do
         state
       end
 
-    schedule_check(check_interval)
+    state = schedule_next_check(state)
     Logger.info("[Kyber.Cron] started (#{map_size(state.jobs)} jobs loaded)")
     {:ok, state}
   end
@@ -163,6 +167,7 @@ defmodule Kyber.Cron do
       schedule ->
         new_state = add_job_to_state(state, name, schedule, callback, %{})
         persist_jobs(new_state)
+        new_state = schedule_next_check(new_state)
         {:reply, :ok, new_state}
     end
   end
@@ -173,6 +178,7 @@ defmodule Kyber.Cron do
       schedule ->
         new_state = add_job_to_state(state, name, schedule, callback, metadata)
         persist_jobs(new_state)
+        new_state = schedule_next_check(new_state)
         {:reply, :ok, new_state}
     end
   end
@@ -199,6 +205,7 @@ defmodule Kyber.Cron do
         new_jobs = Map.delete(state.jobs, name)
         new_state = %{state | jobs: new_jobs}
         persist_jobs(new_state)
+        new_state = schedule_next_check(new_state)
         {:reply, :ok, new_state}
     end
   end
@@ -256,7 +263,7 @@ defmodule Kyber.Cron do
     new_state = %{state | jobs: new_jobs}
     if one_shots_fired, do: persist_jobs(new_state)
 
-    schedule_check(state.check_interval)
+    new_state = schedule_next_check(new_state)
     {:noreply, new_state}
   end
 
@@ -290,8 +297,33 @@ defmodule Kyber.Cron do
 
   defp enforce_min_interval(schedule, _min), do: schedule
 
-  defp schedule_check(interval) do
-    Process.send_after(self(), :check_jobs, interval)
+  # Cancel any pending timer and schedule the next check based on the soonest
+  # job's next_run. Falls back to @max_check_interval_ms when no jobs exist.
+  defp schedule_next_check(state) do
+    if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
+
+    delay_ms = compute_next_delay(state.jobs)
+    ref = Process.send_after(self(), :check_jobs, delay_ms)
+    %{state | timer_ref: ref}
+  end
+
+  # Finds the minimum next_run across all enabled jobs and returns the ms
+  # delta from now, clamped to [1, @max_check_interval_ms].
+  defp compute_next_delay(jobs) when map_size(jobs) == 0, do: @max_check_interval_ms
+
+  defp compute_next_delay(jobs) do
+    now = DateTime.utc_now()
+
+    soonest_ms =
+      jobs
+      |> Enum.filter(fn {_name, job} -> Map.get(job, :enabled, true) end)
+      |> Enum.map(fn {_name, job} -> DateTime.diff(job.next_run, now, :millisecond) end)
+      |> Enum.min(fn -> @max_check_interval_ms end)
+
+    # If a job is overdue (negative delta), fire immediately (1ms)
+    soonest_ms
+    |> max(1)
+    |> min(@max_check_interval_ms)
   end
 
   defp check_and_fire(jobs, now, _check_interval) do

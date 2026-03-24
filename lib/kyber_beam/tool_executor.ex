@@ -921,9 +921,18 @@ defmodule Kyber.ToolExecutor do
   defp contains_shell_injection?(cmd) do
     # Reject commands containing shell chaining operators that could bypass allowlist.
     # This prevents "git; rm -rf /" (which would split to stem="git") from executing both parts.
-    # NOTE: bare `&` is intentionally excluded from the regex — `2>&1` redirects are legitimate.
-    # `&&` is still caught by the String.contains check below.
-    String.match?(cmd, ~r/[;|`$()]/) or String.contains?(cmd, ["&&", "||", "$(", "`"])
+    #
+    # Blocked characters/sequences:
+    #   ; | ` $ ( )  — chaining, subshell, command substitution
+    #   > <          — file redirection (could overwrite arbitrary files)
+    #   { }          — brace expansion
+    #   \n \r        — newline injection (shell treats as command separator)
+    #   && || $( `)  — compound operators (also caught by character-level check)
+    #
+    # NOTE: `2>&1` stderr redirects are NOT needed in commands — Port.open
+    # already uses :stderr_to_stdout. Blocking `>` and `<` is safe.
+    String.match?(cmd, ~r/[;|`$(){}<>\n\r]/) or
+      String.contains?(cmd, ["&&", "||", "$(", "`"])
   end
 
   # Evaluate allowed roots at runtime so Path.expand uses the actual $HOME.

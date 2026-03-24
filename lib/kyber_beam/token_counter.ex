@@ -113,7 +113,7 @@ defmodule Kyber.TokenCounter do
   """
   @spec trim_to_budget([map()], keyword()) :: {[map()], non_neg_integer(), non_neg_integer()}
   def trim_to_budget(messages, opts \\ []) when is_list(messages) do
-    budget = Keyword.get(opts, :budget, Application.get_env(:kyber_beam, :max_context_tokens, 180_000))
+    budget = Keyword.get(opts, :budget, Kyber.Config.get(:max_context_tokens, 180_000))
     do_trim(messages, budget)
   end
 

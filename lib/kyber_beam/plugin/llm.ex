@@ -9,6 +9,8 @@ defmodule Kyber.Plugin.LLM do
   - `Streamer` — SSE streaming
   """
 
+  @behaviour Kyber.Plugin.Behaviour
+
   use GenServer
   require Logger
 
@@ -18,6 +20,7 @@ defmodule Kyber.Plugin.LLM do
 
   # ── Plugin behaviour ──────────────────────────────────────────────────────
 
+  @impl Kyber.Plugin.Behaviour
   def name, do: "llm"
 
   # ── Public API (delegates) ────────────────────────────────────────────────
@@ -29,6 +32,7 @@ defmodule Kyber.Plugin.LLM do
   defdelegate format_with_reasoning(text, thinking), to: ApiClient
 
   @doc "Start the LLM plugin."
+  @impl Kyber.Plugin.Behaviour
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
@@ -227,7 +231,7 @@ defmodule Kyber.Plugin.LLM do
 
   defp check_rate_limit(state) do
     window = 60_000
-    max_calls = Application.get_env(:kyber_beam, :max_llm_calls_per_minute, 30)
+    max_calls = Kyber.Config.get(:max_llm_calls_per_minute, 30)
     now = System.monotonic_time(:millisecond)
     recent = Enum.filter(state.api_calls, &(&1 > now - window))
 

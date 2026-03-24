@@ -174,6 +174,7 @@ defmodule Kyber.TokenCounterTest do
     test "uses application config for default budget" do
       # With a tight budget, older messages should be dropped
       Application.put_env(:kyber_beam, :max_context_tokens, 10)
+      Kyber.Config.reload!()
 
       messages = [
         %{"role" => "user", "content" => String.duplicate("x", 200)},
@@ -185,6 +186,7 @@ defmodule Kyber.TokenCounterTest do
 
       # Restore default
       Application.put_env(:kyber_beam, :max_context_tokens, 180_000)
+      Kyber.Config.reload!()
     end
 
     test "estimated tokens are reasonable" do
