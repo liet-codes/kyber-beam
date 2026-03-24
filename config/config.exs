@@ -12,6 +12,11 @@ config :kyber_beam, :model, "claude-sonnet-4-20250514"
 # Override in runtime.exs or environment-specific configs.
 config :kyber_beam, :max_llm_calls_per_minute, 30
 
+# Token budget for context window management (P3-7).
+# Anthropic claude-sonnet/opus have a 200K token window; we reserve 20K for the
+# model's response, leaving 180K for the conversation history + system prompt.
+config :kyber_beam, :max_context_tokens, 180_000
+
 # Phoenix Endpoint for LiveView Dashboard (port 4001)
 config :kyber_beam, Kyber.Web.Endpoint,
   adapter: Bandit.PhoenixAdapter,

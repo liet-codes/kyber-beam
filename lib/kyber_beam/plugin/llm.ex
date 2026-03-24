@@ -405,16 +405,28 @@ defmodule Kyber.Plugin.LLM do
     chat_id = chat_id_from_origin(origin)
 
     # Get conversation history from session — preserving proper roles.
-    # Cap to the last 20 messages to prevent unbounded history growth and API failures.
+    # Apply token-budget trimming: keep as many recent messages as fit in the
+    # configured context window (default 180K tokens) instead of a fixed count.
     history =
       if chat_id && process_alive?(session) do
-        Kyber.Session.get_history(session, chat_id)
-        |> Enum.take(-20)
-        |> Enum.map(fn delta ->
-          role = Map.get(delta.payload, "role", "user")
-          content = Map.get(delta.payload, "content", "")
-          %{"role" => role, "content" => content}
-        end)
+        raw_history =
+          Kyber.Session.get_history(session, chat_id)
+          |> Enum.map(fn delta ->
+            role = Map.get(delta.payload, "role", "user")
+            content = Map.get(delta.payload, "content", "")
+            %{"role" => role, "content" => content}
+          end)
+
+        budget = Application.get_env(:kyber_beam, :max_context_tokens, 180_000)
+        {trimmed, dropped, est_tokens} = Kyber.TokenCounter.trim_to_budget(raw_history, budget: budget)
+
+        if dropped > 0 do
+          Logger.info(
+            "[LLM] trimmed #{dropped} messages (estimated #{Float.round(est_tokens / 1_000, 1)}k tokens, budget #{Float.round(budget / 1_000, 1)}k)"
+          )
+        end
+
+        trimmed
       else
         []
       end
@@ -485,11 +497,24 @@ defmodule Kyber.Plugin.LLM do
                 _ -> nil
               end
 
+            # Extract and log actual token usage from Anthropic response for observability.
+            # This gives real data to calibrate the ~4 chars/token estimator over time.
+            usage = response["usage"]
+
+            if is_map(usage) do
+              input_tokens = Map.get(usage, "input_tokens", 0)
+              output_tokens = Map.get(usage, "output_tokens", 0)
+
+              Logger.debug(
+                "[LLM] usage: input=#{input_tokens} output=#{output_tokens} total=#{input_tokens + output_tokens}"
+              )
+            end
+
             response_payload =
               %{
                 "content" => content,
                 "model" => response["model"],
-                "usage" => response["usage"],
+                "usage" => usage,
                 "stop_reason" => response["stop_reason"]
               }
               |> then(fn p ->
