@@ -3,15 +3,31 @@ defmodule Kyber.Web.RouterTest do
   use Plug.Test
 
   alias Kyber.Web.Router
-  alias Kyber.{Delta, Delta.Store}
+  alias Kyber.{Core, Delta, Delta.Store}
 
-  # Set up a store process and wire it to the router via process dictionary
+  # Set up a Core (supervisor + store + pipeline) and wire it to the router
+  # via process dictionary. POST /api/deltas routes through Core.emit, so
+  # the test must start a Core — not just a bare Store — for posted deltas to
+  # land in the same store that GET /api/deltas reads from.
   setup do
     path = System.tmp_dir!() |> Path.join("kyber_web_test_#{:rand.uniform(999_999)}.jsonl")
+    core_name = :"web_core_#{:rand.uniform(999_999)}"
     on_exit(fn -> File.rm(path) end)
 
-    {:ok, store} = Store.start_link(path: path, name: :"web_store_#{:rand.uniform(999_999)}")
-    # Make the store available to the router handler via process dictionary
+    {:ok, core_pid} = Core.start_link(name: core_name, store_path: path)
+
+    on_exit(fn ->
+      try do
+        if Process.alive?(core_pid), do: Supervisor.stop(core_pid, :normal, 1_000)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    store = :"#{core_name}.Store"
+
+    # Wire core and store for the router handler
+    Process.put(:kyber_core_pid, core_name)
     Process.put(:kyber_store_pid, store)
 
     {:ok, store: store}
