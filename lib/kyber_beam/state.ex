@@ -88,10 +88,10 @@ defmodule Kyber.State do
   # Prevents unbounded memory growth under sustained error conditions.
   @max_errors 100
 
-  @doc "Append an error to the state (returns new struct). Keeps the last #{@max_errors}."
+  @doc "Prepend an error to the state (returns new struct). Keeps the most recent #{@max_errors}."
   @spec add_error(t(), map()) :: t()
   def add_error(%__MODULE__{} = state, error) when is_map(error) do
-    trimmed = Enum.take(state.errors ++ [error], -@max_errors)
+    trimmed = [error | state.errors] |> Enum.take(@max_errors)
     %{state | errors: trimmed}
   end
 

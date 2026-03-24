@@ -37,6 +37,11 @@ defmodule Kyber.Knowledge do
   @poll_interval_ms 5_000
   @valid_note_types ~w(identity memory people projects concepts tools decisions)a
 
+  # Pre-compiled regexes — avoid Regex.compile! on every function call
+  @frontmatter_regex Regex.compile!("^---\\s*$", "m")
+  @wikilink_regex ~r/\[\[([^\]]+)\]\]/
+  @paragraph_split_regex ~r/\n\n+/
+
   @type note_type :: :identity | :memory | :people | :projects | :concepts | :tools | :decisions
 
   @type note :: %{
@@ -494,8 +499,7 @@ defmodule Kyber.Knowledge do
 
   @doc false
   def parse_frontmatter(content) do
-    {:ok, frontmatter_re} = Regex.compile("^---\\s*$", "m")
-    case String.split(content, frontmatter_re, parts: 3) do
+    case String.split(content, @frontmatter_regex, parts: 3) do
       ["", yaml_str, rest] ->
         frontmatter = parse_yaml(yaml_str)
         {frontmatter, String.trim_leading(rest)}
@@ -542,7 +546,7 @@ defmodule Kyber.Knowledge do
 
   @doc false
   def extract_wikilinks(body) do
-    Regex.compile!("\\[\\[([^\\]]+)\\]\\]")
+    @wikilink_regex
     |> Regex.scan(body, capture: :all_but_first)
     |> Enum.map(fn [link] ->
       # Support display text: [[path|display]] — take only path part
@@ -614,7 +618,7 @@ defmodule Kyber.Knowledge do
   defp tiered_context(note, :l1) do
     first_para =
       note.body
-      |> String.split(Regex.compile!("\\n\\n+"), parts: 2)
+      |> String.split(@paragraph_split_regex, parts: 2)
       |> hd()
       |> String.trim()
 

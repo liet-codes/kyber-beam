@@ -127,7 +127,8 @@ defmodule Kyber.Delta.Store do
     deltas = load_from_disk(state.path)
     count = length(deltas)
     Logger.info("[Kyber.Delta.Store] started, loaded #{count} deltas from #{state.path}")
-    {:noreply, %{state | deltas: deltas, delta_count: count}}
+    # Store in newest-first order for O(1) prepend on append
+    {:noreply, %{state | deltas: Enum.reverse(deltas), delta_count: count}}
   end
 
   @impl true
@@ -137,7 +138,7 @@ defmodule Kyber.Delta.Store do
     # Trim oldest deltas from memory when limit exceeded; they remain on disk.
     # Use delta_count (tracked in state) instead of length/1 for O(1) check.
     new_count = state.delta_count + 1
-    {new_deltas, final_count} = trim_memory(state.deltas ++ [delta], new_count, state.max_memory_deltas)
+    {new_deltas, final_count} = trim_memory([delta | state.deltas], new_count, state.max_memory_deltas)
     state = %{state | deltas: new_deltas, delta_count: final_count}
 
     broadcast(state, delta)
@@ -176,6 +177,7 @@ defmodule Kyber.Delta.Store do
     else
       results =
         state.deltas
+        |> Enum.reverse()
         |> apply_since(since)
         |> apply_kind(Keyword.get(filters, :kind))
         |> apply_limit(Keyword.get(filters, :limit))
@@ -243,6 +245,7 @@ defmodule Kyber.Delta.Store do
 
         results =
           state.deltas
+          |> Enum.reverse()
           |> apply_since(Keyword.get(filters, :since))
           |> apply_kind(Keyword.get(filters, :kind))
           |> apply_limit(Keyword.get(filters, :limit))
@@ -316,17 +319,19 @@ defmodule Kyber.Delta.Store do
 
   # Keep only the most recent `max` deltas in memory; oldest are still on disk.
   # Accepts pre-computed `count` so we avoid O(n) length/1 on every append.
+  # Deltas are stored newest-first, so take the first `max` to keep newest.
   defp trim_memory(deltas, count, max) when count > max do
-    {Enum.take(deltas, -max), max}
+    {Enum.take(deltas, max), max}
   end
 
   defp trim_memory(deltas, count, _max), do: {deltas, count}
 
   # True when the oldest in-memory delta is newer than `since`, meaning the
   # caller wants data that was already trimmed from the in-memory list.
+  # Deltas are stored newest-first, so oldest is at the tail.
   defp needs_disk_fallback?([], _since), do: false
   defp needs_disk_fallback?(_deltas, nil), do: false
-  defp needs_disk_fallback?([oldest | _], since), do: oldest.ts > since
+  defp needs_disk_fallback?(deltas, since), do: List.last(deltas).ts > since
 
   defp apply_since(deltas, nil), do: deltas
   defp apply_since(deltas, since), do: Enum.filter(deltas, &(&1.ts >= since))

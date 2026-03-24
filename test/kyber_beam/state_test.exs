@@ -33,10 +33,10 @@ defmodule Kyber.StateTest do
     assert "plugin_x" in s.plugins
   end
 
-  test "add_error/2 appends an error", %{state: _pid} do
+  test "add_error/2 prepends an error (newest first)", %{state: _pid} do
     s = %State{} |> State.add_error(%{code: 500}) |> State.add_error(%{code: 404})
     assert length(s.errors) == 2
-    assert List.last(s.errors) == %{code: 404}
+    assert hd(s.errors) == %{code: 404}
   end
 
   test "put_session/3 inserts a session", %{state: _pid} do
