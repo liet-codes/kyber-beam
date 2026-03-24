@@ -41,21 +41,13 @@
 
 ## P2 — Architecture Consistency (fix for code health)
 
-- [ ] **LLM + Discord plugins bypass Plugin.Manager** — started directly in `application.ex`, violating "plugins all the way down" principle. Not hot-reloadable, not in plugin list, no `plugin.loaded` deltas.
-  - File: `lib/kyber_beam/application.ex`
-  - Fix: Start via `Plugin.Manager`, define formal `Plugin` behaviour
+- [x] **LLM + Discord plugins bypass Plugin.Manager** — Now routed through Plugin.Manager via `plugins:` opt. Hot-reloadable, emits `plugin.loaded` deltas. *(Fixed 2026-03-23)*
 
-- [ ] **Effect struct vs plain maps** — `Kyber.Effect` struct exists but reducer produces plain maps. Struct's `data` field is never used.
-  - Files: `lib/kyber_beam/effect.ex`, `lib/kyber_beam/reducer.ex`
-  - Fix: Either delete struct or migrate reducer to use it
+- [x] **Effect struct vs plain maps** — Deleted unused `Kyber.Effect` struct. Effects are plain maps with `:type` key, documented via `@typedoc`. *(Fixed 2026-03-23)*
 
-- [ ] **Session started before Core** — `Kyber.Session` in supervisor before `Kyber.Core`. Rehydration with `delta_store:` would reference an unstarted store.
-  - File: `lib/kyber_beam/application.ex`
-  - Fix: Move Session after Core in children list
+- [x] **Session started before Core** — Moved Session after Core in supervisor children. *(Fixed 2026-03-23)*
 
-- [ ] **`reinforce_memories/1` hardcodes ETS table name** — `:ets.whereis(:memory_pool)` bypasses Consolidator API.
-  - File: `lib/kyber_beam/plugin/llm.ex`
-  - Fix: Call through `Kyber.Memory.Consolidator` public API
+- [x] **`reinforce_memories/1` hardcodes ETS table name** — Uses `Consolidator.get_pool/0` now. *(Fixed 2026-03-23)*
 
 ---
 
@@ -98,4 +90,4 @@
 
 ---
 
-*Total: 0 P0 + 0 P1 (all fixed!) + 4 P2 (architecture) + 10 P3 (features) + 6 P4 (doc gaps) + 8 nits = 28 remaining items*
+*Total: 0 P0 + 0 P1 + 0 P2 (all fixed!) + 10 P3 (features) + 6 P4 (doc gaps) + 8 nits = 24 remaining items*
