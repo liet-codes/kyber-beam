@@ -62,9 +62,9 @@ defmodule Kyber.CoreTest do
 
     delta = Delta.new("message.received", %{"text" => "hi"})
     :ok = Core.emit(name, delta)
-    Process.sleep(100)
 
-    # State should not change for message.received (no state change, only effect)
+    # Reducer runs async via Task — poll until pipeline settles
+    poll_until(fn -> match?(%Kyber.State{}, Core.get_state(name)) end)
     state = Core.get_state(name)
     assert %Kyber.State{} = state
   end
@@ -74,8 +74,9 @@ defmodule Kyber.CoreTest do
 
     delta = Delta.new("plugin.loaded", %{"name" => "test_plugin"})
     :ok = Core.emit(name, delta)
-    Process.sleep(100)
 
+    # Reducer runs async via Task — poll until state reflects the change
+    poll_until(fn -> "test_plugin" in Core.get_state(name).plugins end)
     state = Core.get_state(name)
     assert "test_plugin" in state.plugins
   end
@@ -85,8 +86,9 @@ defmodule Kyber.CoreTest do
 
     delta = Delta.new("error.route", %{"message" => "test error"})
     :ok = Core.emit(name, delta)
-    Process.sleep(100)
 
+    # Reducer runs async via Task — poll until state reflects the change
+    poll_until(fn -> length(Core.get_state(name).errors) == 1 end)
     state = Core.get_state(name)
     assert length(state.errors) == 1
   end
@@ -114,8 +116,8 @@ defmodule Kyber.CoreTest do
     d2 = Delta.new("event.b", %{})
     Core.emit(name, d1)
     Core.emit(name, d2)
-    Process.sleep(50)
 
+    # Store.append is sync — deltas available immediately
     deltas = Core.query_deltas(name)
     ids = Enum.map(deltas, & &1.id)
     assert d1.id in ids
@@ -129,7 +131,8 @@ defmodule Kyber.CoreTest do
       Core.emit(name, Delta.new("plugin.loaded", %{"name" => "p#{i}"}))
     end
 
-    Process.sleep(300)
+    # Reducer runs async — poll until all 5 plugins are registered
+    poll_until(fn -> length(Core.get_state(name).plugins) == 5 end, 1000)
     state = Core.get_state(name)
     assert length(state.plugins) == 5
   end
