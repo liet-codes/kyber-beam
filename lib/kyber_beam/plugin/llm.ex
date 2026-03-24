@@ -200,18 +200,7 @@ defmodule Kyber.Plugin.LLM do
         "messages=#{length(body["messages"] || [])}, system=#{system_info}, tools=#{tools_info}"
     )
 
-    case Req.post(@anthropic_url, headers: headers, json: body, receive_timeout: 60_000) do
-      {:ok, %{status: 200, body: response}} ->
-        {:ok, response}
-
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("[Kyber.Plugin.LLM] API error #{status}: #{inspect(body)}")
-        error_msg = get_in(body, ["error", "message"]) || inspect(body)
-        {:error, %{error: error_msg, status: status}}
-
-      {:error, reason} ->
-        {:error, %{error: inspect(reason), status: 0}}
-    end
+    call_api_with_retry(@anthropic_url, headers, body)
   end
 
   # ── GenServer callbacks ───────────────────────────────────────────────────
@@ -262,12 +251,25 @@ defmodule Kyber.Plugin.LLM do
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{executor_monitor: ref} = state) do
     Logger.warning(
       "[Kyber.Plugin.LLM] Effect.Executor went down (#{inspect(reason)}) — " <>
-        "will re-register handler once it's back"
+        "attempting immediate re-registration"
     )
 
-    # Poll until the executor is up again, then re-register
-    send(self(), :reregister_after_core_restart)
-    {:noreply, %{state | executor_monitor: nil}}
+    state = %{state | executor_monitor: nil}
+
+    # Due to :rest_for_one restart order, the new Executor may already be up.
+    # Try to re-register immediately to minimize the window where llm_call
+    # effects would be silently dropped. Fall back to polling if not ready yet.
+    executor = find_executor(state.core)
+
+    if executor && Process.alive?(executor) do
+      state = register_effect_handler(state)
+      Logger.info("[Kyber.Plugin.LLM] effect handler re-registered immediately after :DOWN")
+      {:noreply, state}
+    else
+      # Not ready yet — fall back to polling loop
+      Process.send_after(self(), :reregister_after_core_restart, 500)
+      {:noreply, state}
+    end
   end
 
   def handle_info(:reregister_after_core_restart, state) do
@@ -941,4 +943,97 @@ Confabulating a plausible-sounding answer when you have files you didn't check i
   end
 
   defp extract_token(_), do: nil
+
+  # ── HTTP retry helpers (P1-4) ─────────────────────────────────────────────
+
+  # Wraps Req.post with exponential backoff retry for transient failures.
+  # Retries on:
+  #   - 5xx server errors  (backoff 1s / 2s / 4s)
+  #   - 429 rate-limited   (respects Retry-After header, default 5s)
+  #   - network errors     (same backoff as 5xx)
+  # Halts immediately on 2xx / 4xx (except 429).
+  @max_retries 3
+
+  defp call_api_with_retry(url, headers, body, retries_left \\ @max_retries) do
+    case Req.post(url, headers: headers, json: body, receive_timeout: 60_000) do
+      {:ok, %{status: 200, body: response}} ->
+        {:ok, response}
+
+      {:ok, %{status: 429, headers: resp_headers}} when retries_left > 0 ->
+        delay = parse_retry_after(resp_headers, 5_000)
+        Logger.warning("[Kyber.Plugin.LLM] rate limited (429), retrying after #{delay}ms")
+        Process.sleep(delay)
+        call_api_with_retry(url, headers, body, retries_left - 1)
+
+      {:ok, %{status: 429, body: resp_body}} ->
+        Logger.error("[Kyber.Plugin.LLM] rate limited (429), no retries left: #{inspect(resp_body)}")
+        error_msg = get_in(resp_body, ["error", "message"]) || inspect(resp_body)
+        {:error, %{error: error_msg, status: 429}}
+
+      {:ok, %{status: status}} when status >= 500 and retries_left > 0 ->
+        backoff = backoff_ms(@max_retries - retries_left)
+        Logger.warning("[Kyber.Plugin.LLM] API error #{status}, retrying in #{backoff}ms (#{retries_left} left)")
+        Process.sleep(backoff)
+        call_api_with_retry(url, headers, body, retries_left - 1)
+
+      {:ok, %{status: status, body: resp_body}} ->
+        Logger.error("[Kyber.Plugin.LLM] API error #{status}: #{inspect(resp_body)}")
+        error_msg = get_in(resp_body, ["error", "message"]) || inspect(resp_body)
+        {:error, %{error: error_msg, status: status}}
+
+      {:error, reason} when retries_left > 0 ->
+        backoff = backoff_ms(@max_retries - retries_left)
+        Logger.warning("[Kyber.Plugin.LLM] network error #{inspect(reason)}, retrying in #{backoff}ms (#{retries_left} left)")
+        Process.sleep(backoff)
+        call_api_with_retry(url, headers, body, retries_left - 1)
+
+      {:error, reason} ->
+        {:error, %{error: inspect(reason), status: 0}}
+    end
+  end
+
+  # Exponential backoff: attempt 0 → 1s, 1 → 2s, 2 → 4s
+  defp backoff_ms(attempt) do
+    :math.pow(2, attempt) |> round() |> Kernel.*(1_000)
+  end
+
+  # Parse Retry-After header value (seconds integer or HTTP date).
+  # Returns delay in milliseconds; falls back to `default_ms` if unparseable.
+  defp parse_retry_after(headers, default_ms) when is_list(headers) do
+    case find_header(headers, "retry-after") do
+      nil -> default_ms
+      val -> parse_retry_after_value(val, default_ms)
+    end
+  end
+
+  defp parse_retry_after(headers, default_ms) when is_map(headers) do
+    val = Map.get(headers, "retry-after") || Map.get(headers, "Retry-After")
+    parse_retry_after_value(val, default_ms)
+  end
+
+  defp parse_retry_after(_, default_ms), do: default_ms
+
+  defp parse_retry_after_value(nil, default_ms), do: default_ms
+
+  defp parse_retry_after_value(val, default_ms) when is_binary(val) do
+    case Integer.parse(val) do
+      {secs, _} when secs > 0 -> secs * 1_000
+      _ -> default_ms
+    end
+  end
+
+  defp parse_retry_after_value(val, default_ms) when is_integer(val) and val > 0,
+    do: val * 1_000
+
+  defp parse_retry_after_value(_, default_ms), do: default_ms
+
+  defp find_header(headers, name) when is_list(headers) do
+    Enum.find_value(headers, fn
+      {k, v} when is_binary(k) ->
+        if String.downcase(k) == name, do: to_string(v)
+
+      _ ->
+        nil
+    end)
+  end
 end
