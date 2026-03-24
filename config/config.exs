@@ -23,6 +23,15 @@ config :kyber_beam, :llm_streaming, true
 config :kyber_beam, :llm_thinking, true
 config :kyber_beam, :thinking_budget_tokens, 10_000
 
+# Computer use mode (Anthropic beta feature).
+# When enabled, adds the computer_use tool in Anthropic's special format
+# and sends the required beta header. The display dimensions should match
+# the actual screen resolution (or the resolution screenshots are scaled to).
+config :kyber_beam, :computer_use,
+  enabled: true,
+  display_width: 1280,
+  display_height: 800
+
 # Token budget for context window management (P3-7).
 # Anthropic claude-sonnet/opus have a 200K token window; we reserve 20K for the
 # model's response, leaving 180K for the conversation history + system prompt.

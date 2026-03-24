@@ -13,10 +13,19 @@ defmodule Kyber.ToolsTest do
     test "each tool has required Anthropic format fields" do
       for tool <- Tools.definitions() do
         assert is_binary(tool["name"]), "tool name must be a string"
-        assert is_binary(tool["description"]), "tool description must be a string"
-        assert is_map(tool["input_schema"]), "tool input_schema must be a map"
-        assert tool["input_schema"]["type"] == "object"
-        assert is_map(tool["input_schema"]["properties"])
+
+        # Anthropic computer use tools use a special format with "type" instead
+        # of "description" + "input_schema" (e.g. type: "computer_20251124")
+        if String.starts_with?(tool["type"] || "", "computer_") do
+          assert is_binary(tool["type"]), "computer use tool type must be a string"
+          assert is_integer(tool["display_width_px"]), "display_width_px must be an integer"
+          assert is_integer(tool["display_height_px"]), "display_height_px must be an integer"
+        else
+          assert is_binary(tool["description"]), "tool description must be a string"
+          assert is_map(tool["input_schema"]), "tool input_schema must be a map"
+          assert tool["input_schema"]["type"] == "object"
+          assert is_map(tool["input_schema"]["properties"])
+        end
       end
     end
 

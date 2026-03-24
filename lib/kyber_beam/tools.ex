@@ -647,11 +647,41 @@ defmodule Kyber.Tools do
     }
   ]
 
-  @doc "Return all tool definitions in Anthropic format."
+  @doc """
+  Return all tool definitions in Anthropic format.
+
+  When computer use is enabled, replaces the regular `computer_use` tool
+  definition with Anthropic's special computer use tool format (which uses
+  `type: "computer_20251124"` or `"computer_20250124"` instead of the
+  standard function-call schema).
+  """
   @spec definitions() :: [map()]
-  def definitions, do: @tools
+  def definitions do
+    computer_use_config = Application.get_env(:kyber_beam, :computer_use, [])
+    enabled = Keyword.get(computer_use_config, :enabled, false)
+
+    if enabled do
+      model = Kyber.Config.get(:model, "claude-sonnet-4-20250514")
+      tool_type = Kyber.Plugin.LLM.ApiClient.computer_use_tool_type(model)
+      width = Keyword.get(computer_use_config, :display_width, 1280)
+      height = Keyword.get(computer_use_config, :display_height, 800)
+
+      anthropic_computer_tool = %{
+        "type" => tool_type,
+        "name" => "computer",
+        "display_width_px" => width,
+        "display_height_px" => height
+      }
+
+      # Replace the regular computer_use tool with the Anthropic-format one
+      regular_tools = Enum.reject(@tools, &(&1["name"] == "computer_use"))
+      regular_tools ++ [anthropic_computer_tool]
+    else
+      @tools
+    end
+  end
 
   @doc "Return all tool names."
   @spec names() :: [String.t()]
-  def names, do: Enum.map(@tools, & &1["name"])
+  def names, do: Enum.map(definitions(), & &1["name"])
 end

@@ -267,7 +267,67 @@ defmodule Kyber.Plugin.LLM.ToolLoop do
 
   # ── Private: Tool execution ───────────────────────────────────────────────
 
+  # Map Anthropic's computer use actions to our computer_use tool format.
+  # Anthropic sends: %{"name" => "computer", "input" => %{"action" => "left_click", "coordinate" => [x, y]}}
+  # We translate to: %{"name" => "computer_use", "input" => %{"action" => "click", "x" => x, "y" => y}}
+  defp translate_computer_tool(%{"name" => "computer", "input" => input} = tu) do
+    action = Map.get(input, "action", "screenshot")
+
+    translated_input =
+      case action do
+        "screenshot" ->
+          %{"action" => "screenshot"}
+
+        act when act in ["left_click", "right_click", "double_click", "mouse_move"] ->
+          [x, y] = Map.get(input, "coordinate", [0, 0])
+
+          mapped_action =
+            case act do
+              "left_click" -> "click"
+              "right_click" -> "right_click"
+              "double_click" -> "double_click"
+              "mouse_move" -> "move"
+            end
+
+          %{"action" => mapped_action, "x" => x, "y" => y}
+
+        "type" ->
+          %{"action" => "type", "text" => Map.get(input, "text", "")}
+
+        "key" ->
+          %{"action" => "key", "key" => Map.get(input, "text", "")}
+
+        "scroll" ->
+          [_x, _y] = Map.get(input, "coordinate", [0, 0])
+          delta_x = Map.get(input, "delta_x", 0)
+          delta_y = Map.get(input, "delta_y", 0)
+
+          {direction, amount} =
+            cond do
+              delta_y < 0 -> {"up", abs(delta_y)}
+              delta_y > 0 -> {"down", delta_y}
+              delta_x != 0 -> {"down", abs(delta_x)}
+              true -> {"down", 3}
+            end
+
+          %{
+            "action" => "scroll",
+            "scroll_direction" => direction,
+            "scroll_amount" => max(1, div(amount, 100))
+          }
+
+        _ ->
+          %{"action" => action}
+      end
+
+    %{tu | "name" => "computer_use", "input" => translated_input}
+  end
+
+  defp translate_computer_tool(tu), do: tu
+
   defp execute_tool(tu, core, origin, parent_id) do
+    # Translate Anthropic's "computer" tool to our "computer_use" tool
+    tu = translate_computer_tool(tu)
     tool_name = tu["name"]
     tool_input = tu["input"] || %{}
 

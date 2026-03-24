@@ -67,6 +67,75 @@ defmodule Kyber.Plugin.LLM.ApiClient do
     ]
   end
 
+  # ── Computer Use Beta ───────────────────────────────────────────────────
+
+  @computer_use_beta_header_new "computer-use-2025-11-24"
+  @computer_use_beta_header_legacy "computer-use-2025-01-24"
+
+  # Models that use the newer computer_20251124 tool type
+  @new_computer_use_models ["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5"]
+
+  @doc """
+  Check if a list of tools includes any Anthropic computer use tool definitions
+  (identified by type starting with "computer_").
+  """
+  @spec has_computer_use_tools?(list()) :: boolean()
+  def has_computer_use_tools?(tools) when is_list(tools) do
+    Enum.any?(tools, fn
+      %{"type" => "computer_" <> _} -> true
+      _ -> false
+    end)
+  end
+
+  def has_computer_use_tools?(_), do: false
+
+  @doc """
+  Return the appropriate computer use beta header value for the given model.
+  """
+  @spec computer_use_beta_for_model(String.t()) :: String.t()
+  def computer_use_beta_for_model(model) do
+    if Enum.any?(@new_computer_use_models, &String.starts_with?(model, &1)) do
+      @computer_use_beta_header_new
+    else
+      @computer_use_beta_header_legacy
+    end
+  end
+
+  @doc """
+  Return the appropriate computer use tool type for the given model.
+  """
+  @spec computer_use_tool_type(String.t()) :: String.t()
+  def computer_use_tool_type(model) do
+    if Enum.any?(@new_computer_use_models, &String.starts_with?(model, &1)) do
+      "computer_20251124"
+    else
+      "computer_20250124"
+    end
+  end
+
+  @doc """
+  Add the computer use beta header to headers if computer use tools are present.
+  """
+  @spec maybe_add_computer_use_header([{String.t(), String.t()}], list(), String.t()) ::
+          [{String.t(), String.t()}]
+  def maybe_add_computer_use_header(headers, tools, model) do
+    if has_computer_use_tools?(tools) do
+      beta_value = computer_use_beta_for_model(model)
+
+      # Check if there's already an anthropic-beta header and append to it
+      case List.keyfind(headers, "anthropic-beta", 0) do
+        {"anthropic-beta", existing} ->
+          updated = existing <> "," <> beta_value
+          List.keyreplace(headers, "anthropic-beta", 0, {"anthropic-beta", updated})
+
+        nil ->
+          [{"anthropic-beta", beta_value} | headers]
+      end
+    else
+      headers
+    end
+  end
+
   # ── API calls ─────────────────────────────────────────────────────────────
 
   @doc """
@@ -78,6 +147,9 @@ defmodule Kyber.Plugin.LLM.ApiClient do
   def call_api(auth_config, params) do
     headers = build_headers(auth_config)
     body = build_api_body(auth_config, params)
+    tools = body["tools"] || []
+    model = body["model"] || @default_model
+    headers = maybe_add_computer_use_header(headers, tools, model)
 
     system_info =
       case body["system"] do
@@ -153,6 +225,11 @@ defmodule Kyber.Plugin.LLM.ApiClient do
 
     headers = build_headers(auth_config)
     body = build_api_body(auth_config, params)
+
+    # Add computer use beta header if needed
+    tools = body["tools"] || []
+    model = body["model"] || @default_model
+    headers = maybe_add_computer_use_header(headers, tools, model)
 
     # Enable extended thinking if configured
     body =
