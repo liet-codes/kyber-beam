@@ -85,5 +85,17 @@ defmodule Kyber.Web.Plugs.BearerAuthTest do
       assert result.halted
       assert result.status == 401
     end
+
+    test "uses constant-time comparison (token with matching prefix is still rejected)" do
+      # A token sharing a prefix with the real token must still be rejected,
+      # verifying we don't short-circuit on partial matches.
+      conn =
+        conn(:get, "/api/test")
+        |> put_req_header("authorization", "Bearer test-secret-token-extra")
+
+      result = call_plug(conn)
+      assert result.halted
+      assert result.status == 401
+    end
   end
 end

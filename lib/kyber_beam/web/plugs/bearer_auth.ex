@@ -46,8 +46,15 @@ defmodule Kyber.Web.Plugs.BearerAuth do
         conn
       else
         case get_bearer_token(conn) do
-          {:ok, token} when token == configured_token ->
-            conn
+          {:ok, token} ->
+            if Plug.Crypto.secure_compare(token, configured_token) do
+              conn
+            else
+              conn
+              |> put_status(401)
+              |> json(%{ok: false, error: "unauthorized"})
+              |> halt()
+            end
 
           _ ->
             conn
