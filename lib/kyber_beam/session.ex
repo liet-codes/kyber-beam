@@ -51,9 +51,12 @@ defmodule Kyber.Session do
 
     # Guard against the ETS table not existing (e.g. Session GenServer is between
     # crash and restart). Returns [] rather than raising :badarg.
+    #
+    # History is stored newest-first (prepend on write) for O(1) appends.
+    # We reverse here so callers always receive chronological order (oldest first).
     try do
       case :ets.lookup(table, chat_id) do
-        [{^chat_id, history}] -> history
+        [{^chat_id, history}] -> Enum.reverse(history)
         [] -> []
       end
     rescue
@@ -108,7 +111,8 @@ defmodule Kyber.Session do
         [] -> []
       end
 
-    :ets.insert(table, {chat_id, history ++ [delta]})
+    # Prepend instead of append for O(1) writes. get_history/2 reverses on read.
+    :ets.insert(table, {chat_id, [delta | history]})
     {:reply, :ok, state}
   end
 
@@ -154,7 +158,9 @@ defmodule Kyber.Session do
           |> Enum.sort_by(fn {_cid, d} -> d.ts end)
           |> Enum.map(fn {_cid, d} -> d end)
 
-        :ets.insert(table, {chat_id, sorted})
+        # Store newest-first to match the prepend strategy used by add_message/3.
+        # get_history/2 will reverse before returning to callers.
+        :ets.insert(table, {chat_id, Enum.reverse(sorted)})
         Logger.debug("[Kyber.Session] rehydrated #{length(sorted)} messages for chat #{chat_id}")
       end)
 

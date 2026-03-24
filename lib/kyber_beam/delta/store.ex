@@ -103,6 +103,7 @@ defmodule Kyber.Delta.Store do
           path: path,
           io_device: io_device,
           deltas: [],
+          delta_count: 0,
           name: name,
           subs: %{},
           task_sup: task_sup,
@@ -122,8 +123,9 @@ defmodule Kyber.Delta.Store do
   @impl true
   def handle_continue(:load_from_disk, state) do
     deltas = load_from_disk(state.path)
-    Logger.info("[Kyber.Delta.Store] started, loaded #{length(deltas)} deltas from #{state.path}")
-    {:noreply, %{state | deltas: deltas}}
+    count = length(deltas)
+    Logger.info("[Kyber.Delta.Store] started, loaded #{count} deltas from #{state.path}")
+    {:noreply, %{state | deltas: deltas, delta_count: count}}
   end
 
   @impl true
@@ -131,8 +133,10 @@ defmodule Kyber.Delta.Store do
     :ok = write_line(state.io_device, delta)
 
     # Trim oldest deltas from memory when limit exceeded; they remain on disk.
-    new_deltas = trim_memory(state.deltas ++ [delta], state.max_memory_deltas)
-    state = %{state | deltas: new_deltas}
+    # Use delta_count (tracked in state) instead of length/1 for O(1) check.
+    new_count = state.delta_count + 1
+    {new_deltas, final_count} = trim_memory(state.deltas ++ [delta], new_count, state.max_memory_deltas)
+    state = %{state | deltas: new_deltas, delta_count: final_count}
 
     broadcast(state, delta)
     {:reply, :ok, state}
@@ -262,11 +266,12 @@ defmodule Kyber.Delta.Store do
   end
 
   # Keep only the most recent `max` deltas in memory; oldest are still on disk.
-  defp trim_memory(deltas, max) when length(deltas) > max do
-    Enum.take(deltas, -max)
+  # Accepts pre-computed `count` so we avoid O(n) length/1 on every append.
+  defp trim_memory(deltas, count, max) when count > max do
+    {Enum.take(deltas, -max), max}
   end
 
-  defp trim_memory(deltas, _max), do: deltas
+  defp trim_memory(deltas, count, _max), do: {deltas, count}
 
   # True when the oldest in-memory delta is newer than `since`, meaning the
   # caller wants data that was already trimmed from the in-memory list.
