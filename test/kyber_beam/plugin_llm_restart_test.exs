@@ -96,9 +96,6 @@ defmodule Kyber.Plugin.LLMRestartTest do
     Process.exit(executor_pid, :kill)
     assert_receive {:DOWN, ^ref, :process, ^executor_pid, _}, 1_000
 
-    # Give the supervisor time to restart the Executor
-    Process.sleep(200)
-
     # The handler we registered is GONE (this is expected — confirms the problem is real)
     # In a real deployment, Plugin.LLM would re-register via its :DOWN monitor.
     # This test documents the behavior and verifies the Executor restarted cleanly.
@@ -131,6 +128,7 @@ defmodule Kyber.Plugin.LLMRestartTest do
     case find_executor(core_name) do
       nil ->
         if System.monotonic_time(:millisecond) < deadline do
+          # Polling interval — this is already a poll-based wait pattern
           Process.sleep(50)
           do_wait_executor(core_name, deadline)
         else

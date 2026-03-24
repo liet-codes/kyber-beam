@@ -89,6 +89,7 @@ defmodule Kyber.TaskSpawnerTest do
 
       # Register a slow task
       TaskRegistry.register(ctx.registry, "slow", fn _params ->
+        # Simulates a long-running task — sleep is the task payload, not test timing
         Process.sleep(10_000)
         :done
       end)
@@ -145,6 +146,7 @@ defmodule Kyber.TaskSpawnerTest do
 
       # Register a task that returns its name after a short delay
       TaskRegistry.register(ctx.registry, "identify", fn params ->
+        # Simulates async work — sleep is the task payload, not test timing
         Process.sleep(50)
         %{"id" => params["id"]}
       end)

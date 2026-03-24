@@ -466,7 +466,7 @@ defmodule Kyber.KnowledgeTest do
       assert {:ok, v1} = Knowledge.get_note(pid, "mtime-test.md")
       assert v1.frontmatter["title"] == "V1"
 
-      # Wait a moment so mtime changes (filesystem has ~1s resolution on HFS+)
+      # HFS+ filesystem has ~1s mtime resolution — need real time to pass
       Process.sleep(1100)
 
       # Overwrite the file directly with new content

@@ -87,12 +87,13 @@ defmodule Kyber.EffectTest do
 
       # Should not crash the executor
       {:ok, _ref} = Executor.execute(pid, %{type: :crash_type})
-      Process.sleep(100)
 
-      # Executor is still alive and functional
-      assert Process.alive?(pid)
-      result = Executor.execute(pid, %{type: :nonexistent})
-      assert result == {:error, :no_handler}
+      # Executor is still alive and functional (poll until async handler completes)
+      TestHelpers.eventually(fn ->
+        assert Process.alive?(pid)
+        # Verify executor is still responsive
+        assert Executor.execute(pid, %{type: :nonexistent}) == {:error, :no_handler}
+      end)
     end
 
     test "executes plain map effect (struct removed, P2-2)", %{executor: pid} do

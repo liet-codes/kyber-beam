@@ -354,9 +354,8 @@ defmodule Kyber.Plugin.LLMTest do
       # Inject an updated auth config via handle_info
       new_config = %{token: "sk-ant-api03-new-token", type: :api_key}
       send(pid, {:update_auth, new_config})
-      Process.sleep(20)
 
-      # get_auth_config must now return the updated config
+      # Issue a sync call to flush the mailbox — ensures the send above is processed
       assert GenServer.call(pid, :get_auth_config) == new_config
     end
   end

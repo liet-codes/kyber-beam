@@ -193,10 +193,11 @@ defmodule Kyber.CronTest do
 
       assert_receive :one_shot_fired, 500
 
-      # Wait a bit and verify the job was removed
-      Process.sleep(100)
-      jobs = Cron.list_jobs(pid)
-      refute Enum.any?(jobs, fn j -> j.name == "one-shot" end)
+      # Verify the job was removed (poll until state converges)
+      TestHelpers.eventually(fn ->
+        jobs = Cron.list_jobs(pid)
+        refute Enum.any?(jobs, fn j -> j.name == "one-shot" end)
+      end)
 
       GenServer.stop(pid)
     end

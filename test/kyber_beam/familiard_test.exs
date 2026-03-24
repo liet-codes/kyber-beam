@@ -92,8 +92,11 @@ defmodule Kyber.FamiliardTest do
 
       assert :ok = Familiard.emit_escalation(pid, event)
 
-      # Give the delta time to be appended
-      Process.sleep(50)
+      # Poll until the delta is appended
+      TestHelpers.eventually(fn ->
+        deltas = Kyber.Core.query_deltas(core, kind: "familiard.escalation")
+        assert length(deltas) == before_count + 1
+      end)
 
       deltas = Kyber.Core.query_deltas(core, kind: "familiard.escalation")
       # There should be exactly one more delta than before

@@ -56,6 +56,7 @@ defmodule Kyber.Delta.StoreTest do
   test "query filters by since", %{store: store} do
     d1 = Delta.new("test.event", %{})
     Store.append(store, d1)
+    # Need actual time to pass so d2.ts > d1.ts for since-filter testing
     Process.sleep(5)
     d2 = Delta.new("test.event", %{})
     Store.append(store, d2)
@@ -102,7 +103,6 @@ defmodule Kyber.Delta.StoreTest do
 
     # Now unsubscribe
     unsubscribe.()
-    Process.sleep(10)
 
     # This one should NOT be received
     Store.append(store, Delta.new("test.event", %{"after" => true}))
@@ -229,6 +229,7 @@ defmodule Kyber.Delta.StoreTest do
     # Append 5 deltas — last 3 in memory, first 2 on disk only
     d_old = Delta.new("test.event", %{"old" => true})
     Store.append(store, d_old)
+    # Need actual time to pass so subsequent deltas have later timestamps
     Process.sleep(5)
 
     for i <- 1..4 do

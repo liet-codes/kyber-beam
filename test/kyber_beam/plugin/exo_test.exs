@@ -50,40 +50,46 @@ defmodule Kyber.Plugin.ExoTest do
   describe "get_inference_status/1" do
     test "returns available status when exo responds" do
       exo = start_exo(&mock_client_available/1)
-      Process.sleep(100)
 
-      assert {:ok, status} = Kyber.Plugin.Exo.get_inference_status(exo)
-      assert status.available == true
-      assert is_list(status.models)
-      assert "llama-3.1-8b" in status.models
-      assert "mistral-7b" in status.models
+      TestHelpers.eventually(fn ->
+        assert {:ok, status} = Kyber.Plugin.Exo.get_inference_status(exo)
+        assert status.available == true
+        assert is_list(status.models)
+        assert "llama-3.1-8b" in status.models
+        assert "mistral-7b" in status.models
+      end)
     end
 
     test "returns {:error, :not_available} when exo is down" do
       exo = start_exo(&mock_client_unavailable/1)
-      Process.sleep(100)
 
-      assert Kyber.Plugin.Exo.get_inference_status(exo) == {:error, :not_available}
+      TestHelpers.eventually(fn ->
+        assert Kyber.Plugin.Exo.get_inference_status(exo) == {:error, :not_available}
+      end)
     end
 
     test "includes node and memory info when nodes available" do
       exo = start_exo(&mock_client_with_nodes/1)
-      Process.sleep(100)
 
-      assert {:ok, status} = Kyber.Plugin.Exo.get_inference_status(exo)
-      assert status.available == true
-      assert length(status.nodes) == 2
-      assert status.memory_pool_gb == 24.0
+      TestHelpers.eventually(fn ->
+        assert {:ok, status} = Kyber.Plugin.Exo.get_inference_status(exo)
+        assert status.available == true
+        assert length(status.nodes) == 2
+        assert status.memory_pool_gb == 24.0
+      end)
     end
   end
 
   describe "refresh/1" do
     test "forces a status refresh without crashing" do
       exo = start_exo(&mock_client_available/1)
-      Process.sleep(100)
+      TestHelpers.eventually(fn ->
+        assert {:ok, _} = Kyber.Plugin.Exo.get_inference_status(exo)
+      end)
       assert :ok = Kyber.Plugin.Exo.refresh(exo)
-      Process.sleep(100)
-      assert {:ok, _} = Kyber.Plugin.Exo.get_inference_status(exo)
+      TestHelpers.eventually(fn ->
+        assert {:ok, _} = Kyber.Plugin.Exo.get_inference_status(exo)
+      end)
     end
   end
 
@@ -92,14 +98,14 @@ defmodule Kyber.Plugin.ExoTest do
       exo = start_exo(&mock_client_available/1)
       assert Process.alive?(exo)
       GenServer.stop(exo, :normal)
-      Process.sleep(50)
       refute Process.alive?(exo)
     end
 
     test "handles unexpected messages gracefully" do
       exo = start_exo(&mock_client_available/1)
       send(exo, :unexpected_message)
-      Process.sleep(50)
+      # Issue a sync call to flush the mailbox
+      _ = Kyber.Plugin.Exo.get_inference_status(exo)
       assert Process.alive?(exo)
     end
   end
@@ -108,19 +114,21 @@ defmodule Kyber.Plugin.ExoTest do
     test "handles empty model list" do
       empty_client = fn _url -> {:ok, Jason.encode!(%{"data" => []})} end
       exo = start_exo(empty_client)
-      Process.sleep(100)
 
-      assert {:ok, status} = Kyber.Plugin.Exo.get_inference_status(exo)
-      assert status.models == []
-      assert status.available == true
+      TestHelpers.eventually(fn ->
+        assert {:ok, status} = Kyber.Plugin.Exo.get_inference_status(exo)
+        assert status.models == []
+        assert status.available == true
+      end)
     end
 
     test "handles malformed JSON response gracefully" do
       bad_client = fn _url -> {:ok, "not json {{{"} end
       exo = start_exo(bad_client)
-      Process.sleep(100)
 
-      assert Kyber.Plugin.Exo.get_inference_status(exo) == {:error, :not_available}
+      TestHelpers.eventually(fn ->
+        assert Kyber.Plugin.Exo.get_inference_status(exo) == {:error, :not_available}
+      end)
     end
 
     test "nil memory_pool when nodes have no memory field" do
@@ -136,10 +144,11 @@ defmodule Kyber.Plugin.ExoTest do
       end
 
       exo = start_exo(client)
-      Process.sleep(100)
 
-      assert {:ok, status} = Kyber.Plugin.Exo.get_inference_status(exo)
-      assert status.memory_pool_gb == nil
+      TestHelpers.eventually(fn ->
+        assert {:ok, status} = Kyber.Plugin.Exo.get_inference_status(exo)
+        assert status.memory_pool_gb == nil
+      end)
     end
   end
 end

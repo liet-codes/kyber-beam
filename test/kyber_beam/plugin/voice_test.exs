@@ -102,10 +102,7 @@ defmodule Kyber.Plugin.VoiceTest do
         api_key: "test_key"
       )
 
-      # Give the handler time to register
-      Process.sleep(50)
-
-      # We can't easily test the actual TTS call, but we verify the plugin is alive
+      # Verify the plugin is alive (handler registration is sync in start_link)
       assert Process.alive?(voice_pid)
 
       GenServer.stop(voice_pid)

@@ -62,8 +62,9 @@ defmodule Kyber.Plugin.ManagerTest do
     assert "mock_plugin" in Manager.list(mgr)
 
     :ok = Manager.unregister(mgr, "mock_plugin")
-    Process.sleep(50)
-    refute "mock_plugin" in Manager.list(mgr)
+    TestHelpers.eventually(fn ->
+      refute "mock_plugin" in Manager.list(mgr)
+    end)
   end
 
   test "unregister returns {:error, :not_found} for unknown name", %{mgr: mgr} do
@@ -73,7 +74,9 @@ defmodule Kyber.Plugin.ManagerTest do
   test "reload restarts a plugin", %{mgr: mgr} do
     {:ok, pid1} = Manager.register(mgr, MockPlugin)
     :ok = Manager.reload(mgr, MockPlugin)
-    Process.sleep(50)
+    TestHelpers.eventually(fn ->
+      assert "mock_plugin" in Manager.list(mgr)
+    end)
 
     names = Manager.list(mgr)
     assert "mock_plugin" in names
@@ -90,9 +93,10 @@ defmodule Kyber.Plugin.ManagerTest do
 
     # Kill plugin 1 brutally
     Process.exit(pid1, :kill)
-    Process.sleep(100)
 
-    # Plugin 2 should still be listed
-    assert "mock_plugin_2" in Manager.list(mgr)
+    # Plugin 2 should still be listed (wait for supervisor to process the EXIT)
+    TestHelpers.eventually(fn ->
+      assert "mock_plugin_2" in Manager.list(mgr)
+    end)
   end
 end
