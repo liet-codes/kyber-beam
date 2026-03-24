@@ -19,9 +19,10 @@ defmodule KyberBeam.Application do
         # PubSub for Phoenix LiveView
         {Phoenix.PubSub, name: Kyber.PubSub},
 
-        # Core OTP components
-        {Kyber.Session, name: Kyber.Session},
+        # Core OTP components — Core must start before Session so the delta
+        # store is ready before Session can rehydrate from it.
         {Kyber.Core, name: Kyber.Core},
+        {Kyber.Session, name: Kyber.Session},
 
         # Hot code deployment (Phase 2)
         {Kyber.Deployment, name: Kyber.Deployment},

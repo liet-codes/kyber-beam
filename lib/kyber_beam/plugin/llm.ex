@@ -832,16 +832,15 @@ Confabulating a plausible-sounding answer when you have files you didn't check i
   )
 
   defp reinforce_memories(content) when is_binary(content) and content != "" do
-    # Get existing memory tags from ETS so we only match real memory tags
+    # Get existing memory tags via the Consolidator public API so we only match
+    # real memory tags. Using get_pool/0 avoids hard-coding the ETS table name.
     existing_tags =
-      case :ets.whereis(:memory_pool) do
-        :undefined ->
-          MapSet.new()
-
-        _table ->
-          :ets.tab2list(:memory_pool)
-          |> Enum.flat_map(fn {_, mem} -> mem.tags || [] end)
-          |> MapSet.new()
+      if Process.whereis(Kyber.Memory.Consolidator) do
+        Kyber.Memory.Consolidator.get_pool()
+        |> Enum.flat_map(fn mem -> mem.tags || [] end)
+        |> MapSet.new()
+      else
+        MapSet.new()
       end
 
     words =
