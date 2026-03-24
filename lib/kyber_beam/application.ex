@@ -38,6 +38,9 @@ defmodule KyberBeam.Application do
         # Core OTP components
         {Kyber.Session, name: Kyber.Session},
 
+        # Periodic session cleanup — sweeps stale sessions to prevent ETS growth
+        {Kyber.SessionCleaner, name: Kyber.SessionCleaner, session: Kyber.Session},
+
         # Kyber.Core starts with initial plugins routed through Plugin.Manager.
         # This ensures they appear in the plugin list, are hot-reloadable, and
         # emit "plugin.loaded" deltas — rather than bypassing the manager as

@@ -35,6 +35,13 @@ defmodule Kyber.Session do
   # Kinds persisted to the delta store that we use to rebuild session history.
   @rehydration_kinds ~w(message.received llm.response)
 
+  # Default maximum number of messages kept per chat_id.
+  @default_max_history 100
+
+  # Default TTL for stale session cleanup (milliseconds). Sessions with no
+  # write activity for longer than this are eligible for sweeping.
+  @default_stale_ttl_ms :timer.hours(1)
+
   # ── Public API ────────────────────────────────────────────────────────────
 
   @doc "Start the Session GenServer."
@@ -42,6 +49,14 @@ defmodule Kyber.Session do
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, opts, name: name)
+  end
+
+  @doc """
+  Return the configured max_history for this session server.
+  """
+  @spec max_history(GenServer.server()) :: pos_integer()
+  def max_history(pid \\ __MODULE__) do
+    GenServer.call(pid, :get_max_history)
   end
 
   @doc "Return the message history for a given chat_id."
@@ -84,6 +99,24 @@ defmodule Kyber.Session do
     :ets.tab2list(table) |> Enum.map(fn {chat_id, _} -> chat_id end)
   end
 
+  @doc """
+  Remove sessions that have been inactive longer than `ttl_ms` milliseconds.
+
+  Returns the list of chat_ids that were swept.
+  """
+  @spec sweep_stale(GenServer.server(), pos_integer()) :: [String.t()]
+  def sweep_stale(pid \\ __MODULE__, ttl_ms \\ @default_stale_ttl_ms) do
+    GenServer.call(pid, {:sweep_stale, ttl_ms})
+  end
+
+  @doc """
+  Return the last-write timestamp (epoch ms) for a chat_id, or `nil` if unknown.
+  """
+  @spec last_active(GenServer.server(), String.t()) :: integer() | nil
+  def last_active(pid \\ __MODULE__, chat_id) when is_binary(chat_id) do
+    GenServer.call(pid, {:last_active, chat_id})
+  end
+
   # ── GenServer callbacks ───────────────────────────────────────────────────
 
   @impl true
@@ -91,6 +124,7 @@ defmodule Kyber.Session do
     Process.flag(:trap_exit, true)
     name = Keyword.get(opts, :name, __MODULE__)
     table = :"#{name}.Sessions"
+    max_history = Keyword.get(opts, :max_history, @default_max_history)
     # :protected allows concurrent reads from any process (fast path for get_history)
     # while restricting writes to the owning GenServer (ordering guarantee).
     :ets.new(table, [:named_table, :protected, :set, read_concurrency: true])
@@ -98,13 +132,18 @@ defmodule Kyber.Session do
     delta_store = Keyword.get(opts, :delta_store, nil)
     rehydrate_from_store(table, delta_store)
 
+    # Build initial activity map from rehydrated sessions.
+    now = System.system_time(:millisecond)
+    activity =
+      :ets.tab2list(table)
+      |> Enum.into(%{}, fn {chat_id, _msgs} -> {chat_id, now} end)
 
-    Logger.info("[Kyber.Session] started (table: #{table})")
-    {:ok, %{table: table, delta_store: delta_store}}
+    Logger.info("[Kyber.Session] started (table: #{table}, max_history: #{max_history})")
+    {:ok, %{table: table, delta_store: delta_store, max_history: max_history, activity: activity}}
   end
 
   @impl true
-  def handle_call({:add_message, chat_id, delta}, _from, %{table: table} = state) do
+  def handle_call({:add_message, chat_id, delta}, _from, %{table: table, max_history: max_history} = state) do
     history =
       case :ets.lookup(table, chat_id) do
         [{^chat_id, existing}] -> existing
@@ -112,17 +151,64 @@ defmodule Kyber.Session do
       end
 
     # Prepend instead of append for O(1) writes. get_history/2 reverses on read.
-    :ets.insert(table, {chat_id, [delta | history]})
-    {:reply, :ok, state}
+    updated = [delta | history]
+
+    # Cap the history length. History is stored newest-first, so dropping from
+    # the tail trims the oldest messages.
+    capped =
+      if length(updated) > max_history do
+        Enum.take(updated, max_history)
+      else
+        updated
+      end
+
+    :ets.insert(table, {chat_id, capped})
+
+    # Track last-write activity for stale session sweeping.
+    activity = Map.put(state.activity, chat_id, System.system_time(:millisecond))
+    {:reply, :ok, %{state | activity: activity}}
   end
 
   def handle_call({:clear, chat_id}, _from, %{table: table} = state) do
     :ets.delete(table, chat_id)
-    {:reply, :ok, state}
+    activity = Map.delete(state.activity, chat_id)
+    {:reply, :ok, %{state | activity: activity}}
   end
 
   def handle_call(:get_table, _from, %{table: table} = state) do
     {:reply, table, state}
+  end
+
+  def handle_call(:get_max_history, _from, state) do
+    {:reply, state.max_history, state}
+  end
+
+  def handle_call({:last_active, chat_id}, _from, state) do
+    {:reply, Map.get(state.activity, chat_id), state}
+  end
+
+  def handle_call({:sweep_stale, ttl_ms}, _from, %{table: table, activity: activity} = state) do
+    now = System.system_time(:millisecond)
+    cutoff = now - ttl_ms
+
+    {stale_ids, kept_activity} =
+      Enum.reduce(activity, {[], %{}}, fn {chat_id, last_ts}, {stale, kept} ->
+        if last_ts < cutoff do
+          {[chat_id | stale], kept}
+        else
+          {stale, Map.put(kept, chat_id, last_ts)}
+        end
+      end)
+
+    Enum.each(stale_ids, fn chat_id ->
+      :ets.delete(table, chat_id)
+    end)
+
+    if stale_ids != [] do
+      Logger.info("[Kyber.Session] swept #{length(stale_ids)} stale session(s): #{inspect(stale_ids)}")
+    end
+
+    {:reply, stale_ids, %{state | activity: kept_activity}}
   end
 
   @impl true
