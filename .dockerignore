@@ -1,0 +1,34 @@
+# Build artifacts (rebuilt in container)
+_build/
+deps/
+
+# Version control
+.git/
+.gitignore
+
+# Tests (not needed in prod image)
+test/
+
+# CI/CD
+.github/
+
+# Docs & review files (keep README)
+*.md
+!README.md
+
+# Node / frontend (no assets dir currently, but future-proof)
+node_modules/
+assets/node_modules/
+
+# Environment files (secrets injected at runtime)
+.env*
+
+# Misc
+erl_crash.dump
+*.tar.gz
+.elixir_ls/
+.vscode/
+scripts/
+docs/
+com.liet.kyber-beam.plist
+run.sh
