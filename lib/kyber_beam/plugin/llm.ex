@@ -34,6 +34,10 @@ defmodule Kyber.Plugin.LLM do
   @default_max_tokens 8192
   @auth_profiles_path "~/.openclaw/agents/main/agent/auth-profiles.json"
 
+  defp configured_model do
+    Application.get_env(:kyber_beam, :model, @default_model)
+  end
+
   # ── Plugin behaviour ──────────────────────────────────────────────────────
 
   def name, do: "llm"
@@ -524,10 +528,12 @@ defmodule Kyber.Plugin.LLM do
     tool_defs = Kyber.Tools.definitions()
 
     # Emit llm.call delta before API call
+    model = configured_model()
+
     llm_call_delta =
       Kyber.Delta.new(
         "llm.call",
-        %{"model" => @default_model, "message_count" => length(messages), "tools" => Kyber.Tools.names()},
+        %{"model" => model, "message_count" => length(messages), "tools" => Kyber.Tools.names()},
         origin,
         parent_id
       )
@@ -535,7 +541,7 @@ defmodule Kyber.Plugin.LLM do
     safe_emit(core, llm_call_delta)
 
     params = %{
-      "model" => @default_model,
+      "model" => model,
       "max_tokens" => @default_max_tokens,
       "messages" => messages,
       "system" => system_prompt,

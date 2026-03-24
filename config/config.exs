@@ -4,6 +4,10 @@ import Config
 # Override in config/test.exs or config/runtime.exs.
 config :kyber_beam, :vault_path, Path.expand("~/.kyber/vault")
 
+# LLM model selection. Override in config/runtime.exs or via environment.
+# Example: config :kyber_beam, :model, "claude-opus-4-20250514"
+config :kyber_beam, :model, "claude-sonnet-4-20250514"
+
 # Phoenix Endpoint for LiveView Dashboard (port 4001)
 config :kyber_beam, Kyber.Web.Endpoint,
   adapter: Bandit.PhoenixAdapter,
