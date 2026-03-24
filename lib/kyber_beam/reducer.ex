@@ -24,6 +24,17 @@ defmodule Kyber.Reducer do
   | _(any other)_        | none                       | `[]`                     |
   """
 
+  @typedoc """
+  An effect descriptor — a plain map with at minimum a `:type` key (atom).
+
+  The `Kyber.Effect` struct no longer exists; effects are always plain maps.
+  Handlers are registered by type in `Kyber.Effect.Executor`.
+
+  Example:
+
+      %{type: :llm_call,   delta_id: "...", payload: %{...}, origin: ...}
+      %{type: :send_message, delta_id: "...", payload: %{...}, origin: ...}
+  """
   @type effect :: map()
   @type result :: {Kyber.State.t(), [effect()]}
 

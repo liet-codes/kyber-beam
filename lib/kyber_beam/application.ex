@@ -11,18 +11,26 @@ defmodule KyberBeam.Application do
     vault_path = Application.get_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
     heartbeat_interval = Application.get_env(:kyber_beam, :heartbeat_interval, nil)
 
-    discord_token = Application.get_env(:kyber_beam, :discord_bot_token)
-    discord_connect = Application.get_env(:kyber_beam, :discord_connect, false)
-
     children =
       [
         # PubSub for Phoenix LiveView
         {Phoenix.PubSub, name: Kyber.PubSub},
 
-        # Core OTP components — Core must start before Session so the delta
-        # store is ready before Session can rehydrate from it.
-        {Kyber.Core, name: Kyber.Core},
+        # Core OTP components
         {Kyber.Session, name: Kyber.Session},
+
+        # Kyber.Core starts with initial plugins routed through Plugin.Manager.
+        # This ensures they appear in the plugin list, are hot-reloadable, and
+        # emit "plugin.loaded" deltas — rather than bypassing the manager as
+        # direct Application supervisor children (P2-1 fix).
+        {Kyber.Core,
+         name: Kyber.Core,
+         plugins: [
+           # LLM plugin — reads auth from ~/.openclaw/agents/main/agent/auth-profiles.json
+           {Kyber.Plugin.LLM, [core: Kyber.Core, session: Kyber.Session]},
+           # Discord plugin — reads token from app config / DISCORD_BOT_TOKEN env
+           {Kyber.Plugin.Discord, [core: Kyber.Core]}
+         ]},
 
         # Hot code deployment (Phase 2)
         {Kyber.Deployment, name: Kyber.Deployment},
@@ -39,18 +47,7 @@ defmodule KyberBeam.Application do
         # Memory consolidator — must start after Delta.Store and Knowledge
         {Kyber.Memory.Consolidator,
          name: Kyber.Memory.Consolidator,
-         core: Kyber.Core},
-
-        # LLM plugin (Anthropic API)
-        {Kyber.Plugin.LLM,
-         core: Kyber.Core,
-         session: Kyber.Session},
-
-        # Discord plugin (Stilgar bot)
-        {Kyber.Plugin.Discord,
-         token: discord_token,
-         core: Kyber.Core,
-         connect: discord_connect}
+         core: Kyber.Core}
       ]
       |> then(&(&1 ++ web_children()))
       |> then(&(&1 ++ phoenix_children()))

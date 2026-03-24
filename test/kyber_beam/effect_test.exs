@@ -1,7 +1,7 @@
 defmodule Kyber.EffectTest do
   use ExUnit.Case, async: true
 
-  alias Kyber.Effect
+  # Kyber.Effect struct was removed (P2-2). Effects are plain maps with :type.
   alias Kyber.Effect.Executor
 
   setup do
@@ -20,19 +20,6 @@ defmodule Kyber.EffectTest do
       end
     end)
     {:ok, executor: pid, task_sup: task_sup}
-  end
-
-  describe "Kyber.Effect" do
-    test "new/2 creates an effect struct" do
-      e = Effect.new(:llm_call, %{delta_id: "abc"})
-      assert e.type == :llm_call
-      assert e.data == %{delta_id: "abc"}
-    end
-
-    test "new/1 defaults data to empty map" do
-      e = Effect.new(:llm_call)
-      assert e.data == %{}
-    end
   end
 
   describe "Kyber.Effect.Executor — register" do
@@ -108,13 +95,14 @@ defmodule Kyber.EffectTest do
       assert result == {:error, :no_handler}
     end
 
-    test "executes Kyber.Effect struct", %{executor: pid} do
+    test "executes plain map effect (struct removed, P2-2)", %{executor: pid} do
       test_pid = self()
       Executor.register(pid, :effect_struct_test, fn _ ->
         send(test_pid, :ran)
       end)
 
-      effect = Effect.new(:effect_struct_test, %{})
+      # Effects are plain maps with :type — no struct needed
+      effect = %{type: :effect_struct_test}
       {:ok, _ref} = Executor.execute(pid, effect)
       assert_receive :ran, 500
     end

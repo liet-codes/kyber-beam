@@ -166,7 +166,8 @@ defmodule Kyber.CronTest do
       {:ok, pid} = Cron.start_link(
         name: nil,
         core: nil,
-        check_interval: 50  # check every 50ms
+        check_interval: 50,  # check every 50ms
+        min_interval_ms: 0   # disable minimum interval guard for tests
       )
 
       callback = fn _job -> send(test_pid, :job_fired) end
@@ -216,7 +217,8 @@ defmodule Kyber.CronTest do
         name: nil,
         core: core,
         check_interval: 50,
-        persist_path: nil
+        persist_path: nil,
+        min_interval_ms: 0   # disable minimum interval guard for tests
       )
 
       # Add a fast job
@@ -294,7 +296,8 @@ defmodule Kyber.CronTest do
         name: nil,
         core: core,
         check_interval: 50,
-        persist_path: nil
+        persist_path: nil,
+        min_interval_ms: 0   # disable minimum interval guard for tests
       )
 
       # Schedule an interval job that fires immediately (1ms)

@@ -122,6 +122,7 @@ defmodule Kyber.Cron do
   def init(opts) do
     core = Keyword.get(opts, :core, nil)
     check_interval = Keyword.get(opts, :check_interval, @check_interval_ms)
+    min_interval_ms = Keyword.get(opts, :min_interval_ms, @min_interval_ms)
 
     default_persist = Path.expand("~/.kyber/cron_jobs.jsonl")
     persist = Keyword.get(opts, :persist_path, default_persist)
@@ -134,6 +135,7 @@ defmodule Kyber.Cron do
       core: core,
       jobs: %{},
       check_interval: check_interval,
+      min_interval_ms: min_interval_ms,
       persist_path: persist
     }
 
@@ -156,7 +158,7 @@ defmodule Kyber.Cron do
 
   @impl true
   def handle_call({:add_job, name, schedule, callback}, _from, state) do
-    case enforce_min_interval(schedule) do
+    case enforce_min_interval(schedule, state.min_interval_ms) do
       {:error, _} = err -> {:reply, err, state}
       schedule ->
         new_state = add_job_to_state(state, name, schedule, callback, %{})
@@ -166,7 +168,7 @@ defmodule Kyber.Cron do
   end
 
   def handle_call({:add_job, name, schedule, callback, metadata}, _from, state) do
-    case enforce_min_interval(schedule) do
+    case enforce_min_interval(schedule, state.min_interval_ms) do
       {:error, _} = err -> {:reply, err, state}
       schedule ->
         new_state = add_job_to_state(state, name, schedule, callback, metadata)
@@ -295,12 +297,12 @@ defmodule Kyber.Cron do
 
   # Enforce minimum interval on {:every, ms} schedules.
   # Returns the schedule (possibly clamped) or {:error, reason}.
-  defp enforce_min_interval({:every, ms}) when ms < @min_interval_ms do
-    Logger.warning("[Kyber.Cron] interval #{ms}ms below minimum #{@min_interval_ms}ms — clamping")
-    {:every, @min_interval_ms}
+  defp enforce_min_interval({:every, ms}, min) when min > 0 and ms < min do
+    Logger.warning("[Kyber.Cron] interval #{ms}ms below minimum #{min}ms — clamping")
+    {:every, min}
   end
 
-  defp enforce_min_interval(schedule), do: schedule
+  defp enforce_min_interval(schedule, _min), do: schedule
 
   defp schedule_check(interval) do
     Process.send_after(self(), :check_jobs, interval)

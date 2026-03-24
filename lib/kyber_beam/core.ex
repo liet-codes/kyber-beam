@@ -129,13 +129,20 @@ defmodule Kyber.Core do
     plugin_mgr = plugin_manager_name(core_name)
     task_sup = task_supervisor_name(core_name)
 
+    # Plugins to start through Plugin.Manager at init — passed from Application.
+    # Each entry is {module, opts} or just module (opts defaults to []).
+    initial_plugins = Keyword.get(opts, :plugins, [])
+
     children = [
       # Task.Supervisor must be first — Delta.Store and Executor depend on it.
       {Task.Supervisor, name: task_sup},
       {Kyber.Delta.Store, [name: store, path: store_path, task_supervisor: task_sup]},
       {Kyber.State, [name: state]},
       {Kyber.Effect.Executor, [name: executor, task_supervisor: task_sup]},
-      {Kyber.Plugin.Manager, [name: plugin_mgr]},
+      # Plugin.Manager starts after Executor so plugins can register effect
+      # handlers immediately. Pass initial_plugins so they start via Manager
+      # rather than being direct Application supervisor children.
+      {Kyber.Plugin.Manager, [name: plugin_mgr, plugins: initial_plugins, core: core_name]},
       # PipelineWirer MUST be last: all prior siblings are guaranteed started
       # when its init/1 runs, so the subscribe call succeeds without any sleep.
       {Kyber.Core.PipelineWirer,

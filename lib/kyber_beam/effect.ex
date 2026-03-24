@@ -1,27 +1,3 @@
-defmodule Kyber.Effect do
-  @moduledoc """
-  Effect struct and type definitions for the Kyber effect system.
-
-  Effects are plain data — descriptors of work to be done asynchronously.
-  They are produced by `Kyber.Reducer.reduce/2` and consumed by
-  `Kyber.Effect.Executor`.
-  """
-
-  @typedoc "An effect descriptor"
-  @type t :: %__MODULE__{
-          type: atom(),
-          data: map()
-        }
-
-  defstruct type: nil, data: %{}
-
-  @doc "Build an effect struct."
-  @spec new(atom(), map()) :: t()
-  def new(type, data \\ %{}) when is_atom(type) do
-    %__MODULE__{type: type, data: data}
-  end
-end
-
 defmodule Kyber.Effect.Executor do
   @moduledoc """
   GenServer that dispatches effects to registered handler functions.
@@ -39,7 +15,7 @@ defmodule Kyber.Effect.Executor do
         {:ok, %{result: "..."}}
       end)
 
-      {:ok, task_ref} = Kyber.Effect.Executor.execute(pid, %{type: :llm_call, ...})
+      {:ok, task_ref} = Kyber.Effect.Executor.execute(pid, %{type: :llm_call, payload: %{...}})
   """
 
   use GenServer
@@ -63,14 +39,16 @@ defmodule Kyber.Effect.Executor do
   end
 
   @doc """
-  Execute an effect map (or `%Kyber.Effect{}`) asynchronously.
+  Execute an effect map asynchronously.
+
+  Effects are plain maps with at minimum a `:type` key (atom). See
+  `Kyber.Reducer` for the canonical effect format.
 
   Dispatches to the registered handler (if any) via a supervised Task.
   Returns `{:ok, task_ref}` immediately — does not wait for the handler.
   Returns `{:error, :no_handler}` if no handler is registered for the type.
   """
-  @spec execute(GenServer.server(), map() | Kyber.Effect.t()) ::
-          {:ok, reference()} | {:error, atom()}
+  @spec execute(GenServer.server(), map()) :: {:ok, reference()} | {:error, atom()}
   def execute(pid, effect) do
     GenServer.call(pid, {:execute, effect})
   end
@@ -141,7 +119,6 @@ defmodule Kyber.Effect.Executor do
 
   # ── Private ───────────────────────────────────────────────────────────────
 
-  defp get_type(%Kyber.Effect{type: t}), do: t
   defp get_type(%{type: t}) when is_atom(t), do: t
 
   # String.to_existing_atom/1 would crash with ArgumentError for unknown atoms,

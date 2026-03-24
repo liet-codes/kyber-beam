@@ -23,11 +23,58 @@ defmodule Kyber.Plugin.Manager do
 
   # ── Public API ─────────────────────────────────────────────────────────────
 
-  @doc "Start the Plugin.Manager DynamicSupervisor."
+  @doc """
+  Start the Plugin.Manager DynamicSupervisor.
+
+  ## Options
+
+    * `:name` — registered name (default: `#{__MODULE__}`)
+    * `:plugins` — list of `{module, opts}` tuples to register at startup
+    * `:core` — `Kyber.Core` name/pid; when present, a `"plugin.loaded"` delta
+      is emitted into Core for each plugin started at init
+
+  Any `{module, opts}` plugins are registered synchronously before
+  `start_link/1` returns, so callers can rely on them being up immediately.
+  """
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts \\ []) do
-    name = Keyword.get(opts, :name, __MODULE__)
-    DynamicSupervisor.start_link(__MODULE__, opts, name: name)
+    plugins = Keyword.get(opts, :plugins, [])
+    core    = Keyword.get(opts, :core)
+    name    = Keyword.get(opts, :name, __MODULE__)
+
+    case DynamicSupervisor.start_link(__MODULE__, opts, name: name) do
+      {:ok, pid} = result ->
+        Enum.each(plugins, fn
+          {module, plugin_opts} ->
+            case register(pid, module, plugin_opts) do
+              {:ok, _} ->
+                if core, do: emit_plugin_loaded(core, module)
+
+              {:error, reason} ->
+                Logger.warning(
+                  "[Kyber.Plugin.Manager] failed to start initial plugin " <>
+                    "#{inspect(module)}: #{inspect(reason)}"
+                )
+            end
+
+          module when is_atom(module) ->
+            case register(pid, module) do
+              {:ok, _} ->
+                if core, do: emit_plugin_loaded(core, module)
+
+              {:error, reason} ->
+                Logger.warning(
+                  "[Kyber.Plugin.Manager] failed to start initial plugin " <>
+                    "#{inspect(module)}: #{inspect(reason)}"
+                )
+            end
+        end)
+
+        result
+
+      other ->
+        other
+    end
   end
 
   @doc """
@@ -36,11 +83,14 @@ defmodule Kyber.Plugin.Manager do
   The plugin module must export `start_link/1`. We derive a name via
   `plugin_module.name/0` if available, otherwise the module name string.
 
+  `opts` are passed as the argument to `plugin_module.start_link/1` (or
+  forwarded to `child_spec/1`). Defaults to `[]` for backward compatibility.
+
   Returns `{:ok, pid}` or `{:error, reason}`.
   """
-  @spec register(Supervisor.supervisor(), module()) :: {:ok, pid()} | {:error, any()}
-  def register(supervisor_pid, plugin_module) do
-    child_spec = plugin_child_spec(plugin_module)
+  @spec register(Supervisor.supervisor(), module(), keyword()) :: {:ok, pid()} | {:error, any()}
+  def register(supervisor_pid, plugin_module, opts \\ []) do
+    child_spec = plugin_child_spec(plugin_module, opts)
 
     case DynamicSupervisor.start_child(supervisor_pid, child_spec) do
       {:ok, pid} ->
@@ -117,6 +167,7 @@ defmodule Kyber.Plugin.Manager do
 
   @impl true
   def init(_opts) do
+    # Strip Manager-specific keys — DynamicSupervisor only needs strategy flags.
     DynamicSupervisor.init(strategy: :one_for_one)
   end
 
@@ -130,15 +181,35 @@ defmodule Kyber.Plugin.Manager do
     end
   end
 
-  defp plugin_child_spec(module) do
+  defp plugin_child_spec(module, opts \\ []) do
     if function_exported?(module, :child_spec, 1) do
-      module.child_spec([])
+      module.child_spec(opts)
     else
       %{
         id: module,
-        start: {module, :start_link, [[]]},
+        start: {module, :start_link, [opts]},
         restart: :transient
       }
+    end
+  end
+
+  # Emit a "plugin.loaded" delta into Core so the reducer updates state.plugins
+  # and any subscribers (e.g. Distribution) learn about the new plugin.
+  defp emit_plugin_loaded(core, module) do
+    delta =
+      Kyber.Delta.new(
+        "plugin.loaded",
+        %{"name" => plugin_name(module)},
+        {:system, "plugin.manager"}
+      )
+
+    try do
+      Kyber.Core.emit(core, delta)
+    rescue
+      e ->
+        Logger.warning(
+          "[Kyber.Plugin.Manager] could not emit plugin.loaded for #{inspect(module)}: #{inspect(e)}"
+        )
     end
   end
 

@@ -23,7 +23,7 @@ defmodule Kyber.ToolExecutor do
   # Strict allowlist for the exec tool.
   # Only these command stems are permitted — anything else is rejected.
   # This prevents LLM prompt injection from running arbitrary shell commands.
-  @allowed_exec_commands ~w(ls cat grep mix git python3 python node elixir erl head tail wc sort uniq find file du df echo date cd mkdir touch cp mv rm chmod)
+  @allowed_exec_commands ~w(ls cat grep mix git node elixir erl head tail wc sort uniq find file du df date cd mkdir touch cp mv chmod)
 
   # NOTE: @allowed_write_roots, @allowed_read_roots, and @vault_path are
   # intentionally defined as private functions below (not module attributes)
@@ -546,15 +546,18 @@ defmodule Kyber.ToolExecutor do
     raw_path = Map.get(input, "output_path", "/tmp/stilgar_snap_#{timestamp}.jpg")
     output_path = Path.expand(raw_path)
 
+    req_path = Application.get_env(:kyber_beam, :snap_request_path, "/tmp/snap_request")
+    res_path = Application.get_env(:kyber_beam, :snap_result_path, "/tmp/snap_result")
+
     Logger.info("[Kyber.ToolExecutor] camera_snap: #{output_path}")
 
     # Remove any stale result file from a previous (possibly failed) snap
-    File.rm("/tmp/snap_result")
+    File.rm(res_path)
 
-    case File.write("/tmp/snap_request", output_path) do
+    case File.write(req_path, output_path) do
       :ok ->
         # Poll for up to 5 seconds (10 attempts × 500ms)
-        poll_snap_result(0, 10)
+        poll_snap_result(0, 10, req_path, res_path)
 
       {:error, reason} ->
         {:error, "Failed to write snap request: #{inspect(reason)}"}
