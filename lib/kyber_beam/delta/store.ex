@@ -107,7 +107,9 @@ defmodule Kyber.Delta.Store do
           name: name,
           subs: %{},
           task_sup: task_sup,
-          max_memory_deltas: max_memory_deltas
+          max_memory_deltas: max_memory_deltas,
+          # query_ref => {from, filters, mon_ref} for in-flight disk queries
+          pending_queries: %{}
         }
 
         # Defer disk load to handle_continue so init/1 returns quickly and
@@ -151,36 +153,35 @@ defmodule Kyber.Delta.Store do
   end
 
   @impl true
-  def handle_call({:query, filters}, _from, state) do
+  def handle_call({:query, filters}, from, state) do
     since = Keyword.get(filters, :since)
 
-    # If the requested window predates our in-memory data we need to read from
-    # disk. To avoid blocking the GenServer (and starving all other callers),
-    # we do the read in a spawned Task and await the result, releasing the
-    # GenServer's mailbox for other messages while waiting.
-    deltas =
-      if needs_disk_fallback?(state.deltas, since) do
-        path = state.path
+    if needs_disk_fallback?(state.deltas, since) do
+      # The requested window predates our in-memory data — we must read from
+      # disk. Rather than blocking the GenServer with Task.yield/2, we spawn
+      # an unlinked process (spawn_monitor), defer the reply, and continue
+      # serving other calls (appends, subscribes, etc.) while the I/O runs.
+      # GenServer.reply/2 is called from handle_info when the task finishes.
+      parent = self()
+      query_ref = make_ref()
+      path = state.path
 
-        task = Task.async(fn -> load_from_disk(path) end)
+      {_pid, mon_ref} = spawn_monitor(fn ->
+        loaded = load_from_disk(path)
+        send(parent, {:disk_query_done, query_ref, loaded})
+      end)
 
-        case Task.yield(task, 5_000) || Task.shutdown(task) do
-          {:ok, loaded} -> loaded
-          nil ->
-            Logger.warning("[Kyber.Delta.Store] disk fallback timed out — returning in-memory only")
-            state.deltas
-        end
-      else
+      pending = Map.put(state.pending_queries, query_ref, {from, filters, mon_ref})
+      {:noreply, %{state | pending_queries: pending}}
+    else
+      results =
         state.deltas
-      end
+        |> apply_since(since)
+        |> apply_kind(Keyword.get(filters, :kind))
+        |> apply_limit(Keyword.get(filters, :limit))
 
-    results =
-      deltas
-      |> apply_since(since)
-      |> apply_kind(Keyword.get(filters, :kind))
-      |> apply_limit(Keyword.get(filters, :limit))
-
-    {:reply, results, state}
+      {:reply, results, state}
+    end
   end
 
   @impl true
@@ -203,6 +204,54 @@ defmodule Kyber.Delta.Store do
   end
 
   @impl true
+  def handle_info({:disk_query_done, query_ref, loaded_deltas}, state) do
+    case Map.pop(state.pending_queries, query_ref) do
+      {nil, _} ->
+        # Stale result (shouldn't happen, but be defensive)
+        {:noreply, state}
+
+      {{from, filters, mon_ref}, pending} ->
+        # Demonitor and flush the pending :DOWN so it doesn't hit the catch-all
+        Process.demonitor(mon_ref, [:flush])
+
+        results =
+          loaded_deltas
+          |> apply_since(Keyword.get(filters, :since))
+          |> apply_kind(Keyword.get(filters, :kind))
+          |> apply_limit(Keyword.get(filters, :limit))
+
+        GenServer.reply(from, results)
+        {:noreply, %{state | pending_queries: pending}}
+    end
+  end
+
+  def handle_info({:DOWN, mon_ref, :process, _pid, reason}, state) do
+    # Check if this DOWN is for one of our in-flight disk queries
+    case Enum.find(state.pending_queries, fn {_qref, {_from, _filters, mref}} ->
+           mref == mon_ref
+         end) do
+      nil ->
+        Logger.warning("[Kyber.Delta.Store] unexpected message: {:DOWN, #{inspect(mon_ref)}, ...}")
+        {:noreply, state}
+
+      {query_ref, {from, filters, _mon_ref}} ->
+        Logger.warning(
+          "[Kyber.Delta.Store] disk fallback task crashed (#{inspect(reason)}) — returning in-memory only"
+        )
+
+        pending = Map.delete(state.pending_queries, query_ref)
+
+        results =
+          state.deltas
+          |> apply_since(Keyword.get(filters, :since))
+          |> apply_kind(Keyword.get(filters, :kind))
+          |> apply_limit(Keyword.get(filters, :limit))
+
+        GenServer.reply(from, results)
+        {:noreply, %{state | pending_queries: pending}}
+    end
+  end
+
   def handle_info(msg, state) do
     Logger.warning("[Kyber.Delta.Store] unexpected message: #{inspect(msg)}")
     {:noreply, state}

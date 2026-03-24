@@ -152,11 +152,11 @@ defmodule Kyber.Knowledge do
     state = %{
       vault_path: vault_dir,
       poll_interval: poll_interval,
-      notes: %{},        # path → note map
-      link_graph: %{},   # path → [linked paths]
-      file_mtimes: %{},  # rel_path → mtime (for incremental reloads)
-      reload_task: nil,  # Task ref of in-progress async reload
-      subscribers: []    # PIDs to notify on vault changes
+      notes: %{},          # path → note map
+      link_graph: %{},     # path → [linked paths]
+      file_mtimes: %{},    # rel_path → mtime (for incremental reloads)
+      reload_task_ref: nil, # monitor ref of in-progress async reload (nil = idle)
+      subscribers: []      # PIDs to notify on vault changes
     }
 
     # Defer vault load to handle_continue so init/1 returns immediately and
@@ -303,14 +303,25 @@ defmodule Kyber.Knowledge do
   # ── handle_info ─────────────────────────────────────────────────────────────
 
   @impl true
+  def handle_info(:poll_vault, %{reload_task_ref: ref} = state) when not is_nil(ref) do
+    # A reload is already in progress — skip this poll to avoid a race where
+    # two Tasks read/write vault state concurrently. The next scheduled poll
+    # will retry once the current task has finished and cleared the ref.
+    Logger.debug("[Kyber.Knowledge] reload already in progress — skipping poll")
+    schedule_poll(state.poll_interval)
+    {:noreply, state}
+  end
+
   def handle_info(:poll_vault, state) do
     # Kick off an async vault reload — do NOT block the GenServer on file I/O.
     # Stale data continues to be served from state while the task runs.
+    # Use spawn_monitor (no link) so a crash clears reload_task_ref without
+    # propagating to the GenServer.
     server = self()
     vault_dir = state.vault_path
     old_mtimes = state.file_mtimes
 
-    Task.start(fn ->
+    {_pid, ref} = spawn_monitor(fn ->
       if File.dir?(vault_dir) do
         result = read_changed_notes(vault_dir, old_mtimes)
         send(server, {:reload_complete, result})
@@ -318,7 +329,7 @@ defmodule Kyber.Knowledge do
     end)
 
     schedule_poll(state.poll_interval)
-    {:noreply, state}
+    {:noreply, %{state | reload_task_ref: ref}}
   end
 
   def handle_info({:reload_complete, {changed_notes, changed_graph, new_mtimes, deleted_paths}}, state) do
@@ -354,7 +365,15 @@ defmodule Kyber.Knowledge do
         state.subscribers
       end
 
-    {:noreply, %{state | notes: new_notes, link_graph: new_graph, file_mtimes: new_mtimes, subscribers: live_subscribers}}
+    {:noreply, %{state | notes: new_notes, link_graph: new_graph, file_mtimes: new_mtimes, subscribers: live_subscribers, reload_task_ref: nil}}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{reload_task_ref: ref} = state)
+      when not is_nil(ref) do
+    # Reload task crashed before sending {:reload_complete, ...}. Clear the
+    # ref so the next poll can start a fresh reload.
+    Logger.error("[Kyber.Knowledge] reload task crashed: #{inspect(reason)}")
+    {:noreply, %{state | reload_task_ref: nil}}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
