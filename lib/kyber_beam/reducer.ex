@@ -140,6 +140,9 @@ defmodule Kyber.Reducer do
   end
 
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "plugin.loaded"} = delta) do
+    # Support both string and atom keys — plugin.loaded deltas may originate
+    # from internal code (atom keys) or external API (string keys).
+    # See docs/CONVENTIONS.md for key conventions.
     plugin_name = Map.get(delta.payload, "name") || Map.get(delta.payload, :name, "unknown")
     new_state = Kyber.State.add_plugin(state, plugin_name)
     {new_state, []}
