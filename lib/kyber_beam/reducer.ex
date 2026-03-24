@@ -196,6 +196,17 @@ defmodule Kyber.Reducer do
     {state, effects}
   end
 
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "task.result"}) do
+    # Task results are informational — visible to LLM in subsequent turns
+    # via the delta stream. No state change or effects needed.
+    {state, []}
+  end
+
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "task.error"}) do
+    # Task errors are informational — visible to LLM in subsequent turns.
+    {state, []}
+  end
+
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "voice.audio"}) do
     # Audio data is passed through; no state change.
     # Downstream effect handlers (e.g. :send_audio) are not emitted here —

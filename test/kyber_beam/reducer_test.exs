@@ -188,6 +188,32 @@ defmodule Kyber.ReducerTest do
     assert effects == []
   end
 
+  test "task.result emits no effects and does not change state" do
+    state = empty_state()
+    delta = Delta.new("task.result", %{
+      "task_id" => "abc123",
+      "task_name" => "echo",
+      "result" => %{"hello" => "world"}
+    })
+    {new_state, effects} = Reducer.reduce(state, delta)
+
+    assert new_state == state
+    assert effects == []
+  end
+
+  test "task.error emits no effects and does not change state" do
+    state = empty_state()
+    delta = Delta.new("task.error", %{
+      "task_id" => "abc123",
+      "task_name" => "fail",
+      "reason" => "intentional failure"
+    })
+    {new_state, effects} = Reducer.reduce(state, delta)
+
+    assert new_state == state
+    assert effects == []
+  end
+
   test "voice.audio emits no effects and does not change state" do
     state = empty_state()
     delta = Delta.new("voice.audio", %{"audio" => "base64data", "encoding" => "mp3"})

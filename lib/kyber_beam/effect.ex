@@ -133,6 +133,7 @@ defmodule Kyber.Effect.Executor do
     error_route
     plugin_loaded
     message_received
+    spawn_task
   )a
 
   defp safe_to_atom(t) when t in @known_effect_types, do: String.to_existing_atom(t)
