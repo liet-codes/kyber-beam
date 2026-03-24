@@ -495,7 +495,8 @@ defmodule Kyber.Plugin.Discord do
       sequence: nil,
       session_id: nil,
       connected: false,
-      application_id: nil
+      application_id: nil,
+      bot_user_id: nil
     }
 
     if token do
@@ -714,7 +715,8 @@ defmodule Kyber.Plugin.Discord do
   defp handle_gateway_message(%{"op" => @op_dispatch, "t" => "READY", "d" => data, "s" => seq}, state) do
     session_id = data["session_id"]
     application_id = get_in(data, ["application", "id"])
-    Logger.info("[Kyber.Plugin.Discord] READY — session_id: #{session_id}, app_id: #{application_id}")
+    bot_user_id = get_in(data, ["user", "id"])
+    Logger.info("[Kyber.Plugin.Discord] READY — session_id: #{session_id}, app_id: #{application_id}, bot_user_id: #{bot_user_id}")
 
     # Register slash commands in the background (non-blocking)
     if application_id && state.token do
@@ -722,11 +724,9 @@ defmodule Kyber.Plugin.Discord do
       Task.start(fn -> register_slash_commands(token, application_id) end)
     end
 
-    %{state | session_id: session_id, sequence: seq, application_id: application_id}
+    %{state | session_id: session_id, sequence: seq, application_id: application_id, bot_user_id: bot_user_id}
   end
 
-  # Bot user ID for mention detection / self-ignore
-  @bot_user_id "1483371308606816316"
   # Liet's bot ID — treat as a peer, not a bot to ignore
   @liet_user_id "1466660860582821995"
 
@@ -737,7 +737,8 @@ defmodule Kyber.Plugin.Discord do
     guild_id = data["guild_id"]
 
     # Ignore our own messages. Allow Liet (sibling bot). Ignore other bots.
-    is_self = author_id == @bot_user_id
+    bot_user_id = state.bot_user_id
+    is_self = bot_user_id != nil && author_id == bot_user_id
     is_liet = author_id == @liet_user_id
     skip = is_self || (is_bot && !is_liet)
 
@@ -746,13 +747,13 @@ defmodule Kyber.Plugin.Discord do
     else
       # Respond to @mentions (user or role), DMs, or replies to our messages
       is_dm = is_nil(guild_id)
-      is_mentioned = String.contains?(content, "<@#{@bot_user_id}>") or String.contains?(content, "<@!#{@bot_user_id}>")
+      is_mentioned = bot_user_id != nil && (String.contains?(content, "<@#{bot_user_id}>") or String.contains?(content, "<@!#{bot_user_id}>"))
       mention_roles = data["mention_roles"] || []
       is_role_mentioned = Enum.any?(mention_roles, fn role_id ->
         # Check if any of our roles were mentioned (role mentions use <@&ROLE_ID>)
         String.contains?(content, "<@&#{role_id}>")
       end)
-      is_reply_to_us = get_in(data, ["referenced_message", "author", "id"]) == @bot_user_id
+      is_reply_to_us = bot_user_id != nil && get_in(data, ["referenced_message", "author", "id"]) == bot_user_id
 
       if is_dm or is_mentioned or is_role_mentioned or is_reply_to_us do
         delta = build_message_delta(data)
