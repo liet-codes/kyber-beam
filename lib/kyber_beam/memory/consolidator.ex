@@ -506,7 +506,8 @@ defmodule Kyber.Memory.Consolidator do
 
       case score_path_to_result(path, auth, knowledge, model) do
         {:ok, vault_ref, salience, tags} ->
-          Logger.info("[Kyber.Memory.Consolidator] scored #{vault_ref}: salience=#{salience}, tags=#{inspect(tags)}")
+          tags_summary = tag_summary(tags)
+          Logger.info("[Kyber.Memory.Consolidator] scored #{vault_ref}: salience=#{salience}, tags=#{tags_summary}")
           [{vault_ref, salience, tags}]
 
         :error ->
@@ -974,4 +975,20 @@ defmodule Kyber.Memory.Consolidator do
   end
 
   defp extract_response_text(_), do: ""
+
+  defp tag_summary(tags) when is_list(tags) do
+    case length(tags) do
+      0 ->
+        "[]"
+
+      count when count <= 5 ->
+        inspect(tags)
+
+      count ->
+        first_5 = Enum.take(tags, 5)
+        "#{inspect(first_5)} (+#{count - 5} more, #{count} total)"
+    end
+  end
+
+  defp tag_summary(tags), do: inspect(tags)
 end
