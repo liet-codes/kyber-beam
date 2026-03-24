@@ -108,7 +108,7 @@ defmodule Kyber.Deployment do
   @impl true
   def init(opts) do
     project_dir = Keyword.get(opts, :project_dir, File.cwd!())
-    {:ok, task_sup} = Task.Supervisor.start_link()
+    task_sup = Keyword.get(opts, :task_supervisor, Kyber.Deployment.TaskSupervisor)
 
     {:ok,
      %{

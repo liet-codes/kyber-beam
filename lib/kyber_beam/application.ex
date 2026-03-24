@@ -11,6 +11,22 @@ defmodule KyberBeam.Application do
     vault_path = Application.get_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
     heartbeat_interval = Application.get_env(:kyber_beam, :heartbeat_interval, nil)
 
+    # Supervision strategy: :one_for_one
+    #
+    # Children have startup ordering dependencies (Session before Core,
+    # Knowledge before LLM plugin, etc.), but :one_for_one is acceptable
+    # because:
+    #   1. All children register under well-known names (atoms). When a
+    #      child restarts, it re-registers the same name, so siblings that
+    #      reference it by name automatically resolve to the new PID.
+    #   2. Core and its plugins are self-contained supervisors — a plugin
+    #      crash restarts within Core's subtree, not the whole app.
+    #   3. The ordering dependency is only at initial boot (handled by list
+    #      order). After boot, each child can restart independently.
+    #
+    # If we later add children whose crashes invalidate sibling state
+    # (e.g., shared ETS tables), switch to :rest_for_one.
+
     children =
       [
         # PubSub for Phoenix LiveView
@@ -31,6 +47,9 @@ defmodule KyberBeam.Application do
            # Discord plugin — reads token from app config / DISCORD_BOT_TOKEN env
            {Kyber.Plugin.Discord, [core: Kyber.Core]}
          ]},
+
+        # Task.Supervisor for Deployment async tasks (supervised, not ad-hoc)
+        {Task.Supervisor, name: Kyber.Deployment.TaskSupervisor},
 
         # Hot code deployment (Phase 2)
         {Kyber.Deployment, name: Kyber.Deployment},
