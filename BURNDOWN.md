@@ -19,29 +19,23 @@
 
 ## P1 — Performance & Reliability (fix before sustained use)
 
-- [ ] **O(n) session history append** — `history ++ [delta]` copies full list every message. Degrades at ~200+ messages/session.
-  - File: `lib/kyber_beam/session.ex` ~line 110
-  - Fix: Prepend (`[delta | history]`), reverse on read
+- [x] **O(n) session history append** — Prepend O(1) + reverse on read. *(Fixed 2026-03-23)*
+  - File: `lib/kyber_beam/session.ex`
 
-- [ ] **O(n) `trim_memory` on every delta append** — `length(deltas)` is O(n), runs every append.
-  - File: `lib/kyber_beam/delta/store.ex` ~line 165
-  - Fix: Track `delta_count` in state
+- [x] **O(n) `trim_memory` on every delta append** — Track `delta_count` in state, O(1) check. *(Fixed 2026-03-23)*
+  - File: `lib/kyber_beam/delta/store.ex`
 
-- [ ] **LLM re-registration race** — after Core restart, `llm_call` effects silently dropped during 500ms polling loop before re-registration completes.
-  - File: `lib/kyber_beam/plugin/llm.ex` ~line 170
-  - Fix: Use `Process.monitor/1` on new Executor PID, re-register in `:DOWN` handler
+- [x] **LLM re-registration race** — Monitor Executor PID, re-register on `:DOWN`. *(Fixed 2026-03-23)*
+  - File: `lib/kyber_beam/plugin/llm.ex`
 
-- [ ] **No API retry/backoff** — transient 5xx/429 from Anthropic silently kills turns.
-  - File: `lib/kyber_beam/plugin/llm.ex`, `call_api/2`
-  - Fix: Exponential backoff (1s, 2s, 4s), 3 retries on 5xx
+- [x] **No API retry/backoff** — Exponential backoff (1s/2s/4s), 3 retries on 5xx, 429 Retry-After. *(Fixed 2026-03-23)*
+  - File: `lib/kyber_beam/plugin/llm.ex`
 
-- [ ] **Knowledge reload race** — no guard against concurrent reload tasks during polling.
-  - File: `lib/kyber_beam/knowledge.ex` ~line 255
-  - Fix: Track `reload_task_ref` in state, skip poll when reload in progress
+- [x] **Knowledge reload race** — Track `reload_task_ref`, skip poll when reload in progress. *(Fixed 2026-03-23)*
+  - File: `lib/kyber_beam/knowledge.ex`
 
-- [ ] **Delta.Store disk query blocks GenServer** — `Task.yield/2` inside `handle_call` blocks for up to 5s.
-  - File: `lib/kyber_beam/delta/store.ex` ~line 130
-  - Fix: Deferred reply via `GenServer.reply/2`
+- [x] **Delta.Store disk query blocks GenServer** — Deferred reply via `spawn_monitor` + `GenServer.reply/2`. *(Fixed 2026-03-23)*
+  - File: `lib/kyber_beam/delta/store.ex`
 
 ---
 
@@ -104,4 +98,4 @@
 
 ---
 
-*Total: ~~3~~ 0 P0 (all fixed!) + 6 P1 (perf/reliability) + 4 P2 (architecture) + 10 P3 (features) + 6 P4 (doc gaps) + 8 nits = 34 remaining items*
+*Total: 0 P0 + 0 P1 (all fixed!) + 4 P2 (architecture) + 10 P3 (features) + 6 P4 (doc gaps) + 8 nits = 28 remaining items*
