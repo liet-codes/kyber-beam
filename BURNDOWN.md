@@ -85,9 +85,9 @@
 - [ ] `Kyber.Knowledge.frontmatter_to_yaml` — naive serializer, breaks on nested maps
 - [ ] `Consolidator` logs `inspect/1` on large lists — truncate or log count only
 - [ ] `Process.sleep` in integration tests — use `assert_receive` with timeout
-- [ ] Discord gateway URL fetched but discarded — use it for proper sharding
-- [ ] `find_match` in `cron.ex` can recurse 525K times — run in Task for rare expressions
+- [x] Discord gateway URL fetched but discarded — use it for proper sharding *(Fixed 2026-03-23)*
+- [x] `find_match` in `cron.ex` can recurse 525K times — add max iteration guard *(Fixed 2026-03-23)*
 
 ---
 
-*Total: 0 P0 + 0 P1 + 0 P2 (all fixed!) + 10 P3 (features) + 6 P4 (doc gaps) + 5 nits = 21 remaining items*
+*Total: 0 P0 + 0 P1 + 0 P2 (all fixed!) + 10 P3 (features) + 6 P4 (doc gaps) + 3 nits = 19 remaining items*

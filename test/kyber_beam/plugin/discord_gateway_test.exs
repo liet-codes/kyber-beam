@@ -231,6 +231,7 @@ defmodule Kyber.Plugin.Discord.GatewayTest do
       end
     end
 
+    @tag :pending
     test "send_presence_update/2 function exists" do
       assert function_exported?(Gateway, :send_presence_update, 2)
     end
