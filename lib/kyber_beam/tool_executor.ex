@@ -30,11 +30,9 @@ defmodule Kyber.ToolExecutor do
   # so that Path.expand and System.tmp_dir! are evaluated at runtime against
   # the actual $HOME, not the $HOME of the build environment.
   # See: Architecture Audit M3.
-  @web_fetch_max_bytes 50_000
+  # NOTE: web_fetch truncation now handled by Kyber.Tools.WebFetch (max_chars option).
 
-  # SSRF: blocked host literals (IPv6 loopback stored without brackets)
-  @blocked_hosts ["localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254",
-                  "metadata.google.internal", "::1"]
+  # NOTE: SSRF blocked hosts moved to Kyber.Tools.WebFetch module.
 
   @doc """
   Execute a tool by name with its input map.
@@ -332,44 +330,18 @@ defmodule Kyber.ToolExecutor do
 
   # ── web_fetch ─────────────────────────────────────────────────────────────
 
-  def execute("web_fetch", %{"url" => url}) do
-    cond do
-      not String.starts_with?(url, ["http://", "https://"]) ->
-        {:error, "URL must start with http:// or https://"}
+  def execute("web_fetch", %{"url" => url} = input) do
+    max_chars = Map.get(input, "max_chars")
+    opts = if max_chars, do: [max_chars: max_chars], else: []
 
-      not ssrf_safe?(url) ->
-        {:error, "blocked: private/internal address"}
+    case Kyber.Tools.WebFetch.fetch(url, opts) do
+      {:ok, %{title: title, content: content, url: fetched_url, word_count: word_count}} ->
+        title_line = if title, do: "Title: #{title}\n", else: ""
+        {:ok, "#{title_line}URL: #{fetched_url}\nWords: #{word_count}\n\n#{content}"}
 
-      true ->
-        Logger.info("[Kyber.ToolExecutor] web_fetch: #{url}")
-
-        case Req.get(url,
-               connect_options: [timeout: 5_000],
-               receive_timeout: 10_000,
-               decode_body: false
-             ) do
-          {:ok, %{status: status, body: body}} when status in 200..299 ->
-            text = extract_text(body)
-
-            truncated =
-              if byte_size(text) > @web_fetch_max_bytes do
-                String.slice(text, 0, @web_fetch_max_bytes) <>
-                  "\n[response truncated to 50KB]"
-              else
-                text
-              end
-
-            {:ok, "(HTTP #{status}) #{truncated}"}
-
-          {:ok, %{status: status}} ->
-            {:error, "HTTP #{status} fetching #{url}"}
-
-          {:error, reason} ->
-            {:error, "web_fetch failed: #{inspect(reason)}"}
-        end
+      {:error, reason} ->
+        {:error, reason}
     end
-  rescue
-    e -> {:error, "web_fetch error: #{inspect(e)}"}
   end
 
   # ── Phase 6: BEAM Introspection ───────────────────────────────────────────
@@ -749,27 +721,7 @@ defmodule Kyber.ToolExecutor do
     Enum.any?(allowed_read_roots(), &String.starts_with?(expanded, &1))
   end
 
-  # Returns true if the URL host is not a private/internal address (SSRF guard).
-  defp ssrf_safe?(url) do
-    case URI.parse(url) do
-      %URI{host: nil} ->
-        false
-
-      %URI{host: host} ->
-        # Strip IPv6 brackets if present (e.g. "[::1]" -> "::1")
-        host =
-          host
-          |> String.downcase()
-          |> String.trim_leading("[")
-          |> String.trim_trailing("]")
-
-        not (host in @blocked_hosts or
-               String.starts_with?(host, "10.") or
-               String.starts_with?(host, "192.168.") or
-               String.ends_with?(host, ".internal") or
-               Regex.match?(~r/^172\.(1[6-9]|2[0-9]|3[01])\./, host))
-    end
-  end
+  # NOTE: SSRF protection for web_fetch moved to Kyber.Tools.WebFetch module.
 
   # Truncate command output to 100KB to prevent OOM and API rejections.
   @max_output_bytes 100_000
@@ -837,22 +789,7 @@ defmodule Kyber.ToolExecutor do
 
   defp format_list(other), do: inspect(other)
 
-  # Best-effort text extraction from an HTTP response body.
-  # Strips HTML tags if content looks like HTML; otherwise returns as-is.
-  defp extract_text(body) when is_binary(body) do
-    if String.contains?(body, "<html") or String.contains?(body, "<HTML") do
-      body
-      |> String.replace(~r/<script[^>]*>.*?<\/script>/si, " ")
-      |> String.replace(~r/<style[^>]*>.*?<\/style>/si, " ")
-      |> String.replace(~r/<[^>]+>/, " ")
-      |> String.replace(~r/\s{2,}/, " ")
-      |> String.trim()
-    else
-      body
-    end
-  end
-
-  defp extract_text(body), do: inspect(body)
+  # NOTE: HTML text extraction moved to Kyber.Tools.WebFetch.extract_readable_text/1.
 
   # ── Search result formatting ───────────────────────────────────────────────
 

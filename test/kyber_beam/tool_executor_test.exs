@@ -322,7 +322,8 @@ defmodule Kyber.ToolExecutorTest do
     @tag :network
     test "fetches a real URL" do
       assert {:ok, output} = ToolExecutor.execute("web_fetch", %{"url" => "https://httpbin.org/get"})
-      assert String.contains?(output, "HTTP 200")
+      assert String.contains?(output, "URL: https://httpbin.org/get")
+      assert String.contains?(output, "Words:")
     end
   end
 

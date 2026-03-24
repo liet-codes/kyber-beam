@@ -178,13 +178,20 @@ defmodule Kyber.Tools do
     %{
       "name" => "web_fetch",
       "description" =>
-        "Fetch a URL and return its text content. Useful for reading documentation, articles, or any web resource. Response is truncated to 50KB.",
+        "Fetch a URL and return clean, readable text content (like Reader View). " <>
+        "Strips scripts, styles, navigation, and other non-content elements. " <>
+        "Useful for reading articles, documentation, or any web page. " <>
+        "Returns title, content, URL, and word count.",
       "input_schema" => %{
         "type" => "object",
         "properties" => %{
           "url" => %{
             "type" => "string",
             "description" => "Full URL to fetch (must start with http:// or https://)"
+          },
+          "max_chars" => %{
+            "type" => "integer",
+            "description" => "Maximum characters of content to return (default: 10000)"
           }
         },
         "required" => ["url"]
