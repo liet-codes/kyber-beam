@@ -83,11 +83,11 @@
 - [x] `toggle_job/2` dead code in `cron.ex` — unreachable fallback clause *(Fixed 2026-03-23)*
 - [x] Delta IDs are 32-char hex, not UUID — document or switch *(Fixed 2026-03-23)*
 - [x] `Kyber.Knowledge.frontmatter_to_yaml` — naive serializer, breaks on nested maps *(Fixed 2026-03-24)*
-- [x] `Consolidator` logs `inspect/1` on large lists — truncate or log count only *(Fixed 2026-03-24)*
-- [x] `Process.sleep` in integration tests — use `assert_receive` with timeout *(Fixed 2026-03-24)*
+- [x] `Consolidator` logs `inspect/1` on large lists — already uses count-based logging and tag_summary truncation *(Verified 2026-03-24)*
+- [ ] `Process.sleep` in integration tests — use `assert_receive` with timeout *(deferred — low risk, high effort)*
 - [x] Discord gateway URL fetched but discarded — use it for proper sharding *(Fixed 2026-03-23)*
 - [x] `find_match` in `cron.ex` can recurse 525K times — add max iteration guard *(Fixed 2026-03-23)*
 
 ---
 
-*Total: 0 P0 + 0 P1 + 0 P2 (all fixed!) + 9 P3 (features) + 6 P4 (doc gaps) + 0 nits = 15 remaining items*
+*Total: 0 P0 + 0 P1 + 0 P2 + 10 P3 (features) + 6 P4 (doc gaps) + 1 nit = 17 remaining items*
