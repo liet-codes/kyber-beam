@@ -517,8 +517,18 @@ defmodule Kyber.Cron do
   @doc false
   def compute_next_cron(expr, from) do
     case parse_cron(expr) do
-      {:ok, fields} -> next_cron_time(fields, from)
-      {:error, _} -> DateTime.add(from, 60, :second)
+      {:ok, fields} ->
+        case next_cron_time(fields, from) do
+          {:ok, dt} ->
+            dt
+
+          {:error, :no_match_within_year} ->
+            Logger.warning("[Kyber.Cron] cron expression #{inspect(expr)} has no match within a year — scheduling 1 year out")
+            DateTime.add(from, 366 * 24 * 3600, :second)
+        end
+
+      {:error, _} ->
+        DateTime.add(from, 60, :second)
     end
   end
 
@@ -610,9 +620,9 @@ defmodule Kyber.Cron do
     find_match(fields, start, 0)
   end
 
-  defp find_match(_fields, dt, limit) when limit > 525_601 do
-    # More than a year of minutes — give up
-    DateTime.add(dt, 60, :second)
+  defp find_match(_fields, _dt, limit) when limit > 525_600 do
+    # More than a year of minutes searched — give up (e.g. "Feb 29" in a non-leap year)
+    {:error, :no_match_within_year}
   end
 
   defp find_match(fields, dt, limit) do
@@ -623,7 +633,7 @@ defmodule Kyber.Cron do
        dt.day in fields.doms and
        dt.month in fields.months and
        dow in fields.dows do
-      dt
+      {:ok, dt}
     else
       find_match(fields, DateTime.add(dt, 60, :second), limit + 1)
     end

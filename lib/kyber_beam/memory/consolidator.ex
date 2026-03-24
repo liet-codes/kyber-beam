@@ -497,7 +497,7 @@ defmodule Kyber.Memory.Consolidator do
   # Called from a background Task — scores all paths and returns a list of
   # {vault_ref, salience, tags} tuples. No ETS writes happen here.
   defp score_paths_for_task(paths, auth, knowledge, model) do
-    Logger.info("[Kyber.Memory.Consolidator] scoring #{length(Enum.uniq(paths))} paths: #{inspect(Enum.uniq(paths))}")
+    Logger.info("[Kyber.Memory.Consolidator] scoring #{length(Enum.uniq(paths))} paths")
 
     paths
     |> Enum.uniq()

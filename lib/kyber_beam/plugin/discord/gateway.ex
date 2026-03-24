@@ -229,9 +229,21 @@ defmodule Kyber.Plugin.Discord.Gateway do
   # ── Private: Connection setup ─────────────────────────────────────────────
 
   defp start_connection(token) do
-    _ = fetch_gateway_url(token)
+    gateway_host =
+      case fetch_gateway_url(token) do
+        {:ok, url} ->
+          case URI.parse(url) do
+            %URI{host: host} when is_binary(host) and host != "" -> host
+            _ -> @gateway_host
+          end
 
-    case Mint.HTTP.connect(:https, @gateway_host, @gateway_port, protocols: [:http1]) do
+        _ ->
+          @gateway_host
+      end
+
+    Logger.info("[Discord.Gateway] using gateway host: #{gateway_host}")
+
+    case Mint.HTTP.connect(:https, gateway_host, @gateway_port, protocols: [:http1]) do
       {:ok, conn} ->
         case Mint.WebSocket.upgrade(:wss, conn, @gateway_path, []) do
           {:ok, conn, ref} -> {:ok, conn, ref}

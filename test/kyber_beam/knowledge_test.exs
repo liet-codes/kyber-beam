@@ -306,6 +306,8 @@ defmodule Kyber.KnowledgeTest do
     end
 
     test "external file changes are picked up after async reload", %{pid: pid, vault_dir: vault_dir} do
+      :ok = Knowledge.subscribe(pid)
+
       # Write a file directly to disk (bypassing GenServer)
       external_path = Path.join(vault_dir, "external.md")
       File.write!(external_path, "---\ntitle: External\n---\n\nExternal content.")
@@ -313,8 +315,8 @@ defmodule Kyber.KnowledgeTest do
       # Trigger a poll to pick up the change
       send(pid, :poll_vault)
 
-      # Wait for the reload task to complete and message to be processed
-      Process.sleep(200)
+      # Wait for the reload task to notify subscribers (replaces Process.sleep)
+      assert_receive {:vault_changed, _}, 500
 
       # Note should now be in state
       assert {:ok, note} = Knowledge.get_note(pid, "external.md")
@@ -333,8 +335,8 @@ defmodule Kyber.KnowledgeTest do
       }
       send(pid, {:reload_complete, {%{"atom-test.md" => new_note}, %{}, %{}, []}})
 
-      # Allow message to be processed
-      Process.sleep(50)
+      # Issue a sync call to ensure the GenServer has processed the message above
+      Knowledge.note_count(pid)
 
       assert {:ok, note} = Knowledge.get_note(pid, "atom-test.md")
       assert note.body == "Updated by reload"
@@ -345,12 +347,14 @@ defmodule Kyber.KnowledgeTest do
       :ok = Knowledge.put_note(pid, "doomed.md", %{}, "Soon gone")
       assert {:ok, _} = Knowledge.get_note(pid, "doomed.md")
 
+      :ok = Knowledge.subscribe(pid)
+
       # Delete from disk directly
       File.rm!(Path.join(vault_dir, "doomed.md"))
 
-      # Trigger async reload
+      # Trigger async reload and wait for notification (replaces Process.sleep)
       send(pid, :poll_vault)
-      Process.sleep(200)
+      assert_receive {:vault_changed, _}, 500
 
       assert {:error, :not_found} = Knowledge.get_note(pid, "doomed.md")
     end
@@ -383,9 +387,9 @@ defmodule Kyber.KnowledgeTest do
       File.write!(ext_path, "content.")
 
       send(pid, :poll_vault)
-      Process.sleep(300)
 
-      refute_receive {:vault_changed, _}, 100
+      # Extend the refute window to cover full async reload; no sleep needed
+      refute_receive {:vault_changed, _}, 500
     end
 
     test "deleted paths are included in vault_changed", %{pid: pid, vault_dir: vault_dir} do
