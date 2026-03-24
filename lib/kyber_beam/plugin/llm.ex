@@ -1,211 +1,47 @@
 defmodule Kyber.Plugin.LLM do
   @moduledoc """
-  Anthropic API integration as a Kyber plugin.
+  Anthropic API integration — GenServer lifecycle and effect handler registration.
 
-  Runs as a GenServer under `Kyber.Plugin.Manager`. On startup it:
-  1. Loads auth config from `~/.openclaw/agents/main/agent/auth-profiles.json`
-  2. Detects OAuth vs API key by token prefix
-  3. Registers an `:llm_call` effect handler with the Core executor
-
-  ## Token prefix detection
-  - `"sk-ant-oat"` prefix → OAuth token (Bearer auth + special headers)
-  - `"sk-ant-api"` prefix → API key (`x-api-key` header)
-
-  ## Effect handler
-  When a `:llm_call` effect fires, the handler:
-  1. Stores the user message in `Kyber.Session` before the API call
-  2. Retrieves conversation history from `Kyber.Session`
-  3. Runs a multi-turn tool loop (up to 10 iterations)
-  4. Stores the assistant response in `Kyber.Session` after completion
-  5. Emits `"llm.response"` or `"llm.error"` delta back into Core
-
-  ## Tool loop
-  The tool loop calls the API with tool definitions. If the model responds
-  with `stop_reason == "tool_use"`, each tool call is executed via
-  `Kyber.ToolExecutor` and results are fed back as `tool_result` blocks.
-  Repeats until `stop_reason == "end_turn"` or max iterations (10).
+  Delegates actual work to focused modules:
+  - `ApiClient` — HTTP calls, auth, retry/backoff
+  - `PromptBuilder` — System prompt, messages, memory
+  - `ToolLoop` — Multi-turn tool execution
+  - `Streamer` — SSE streaming
   """
 
   use GenServer
   require Logger
 
-  @anthropic_url "https://api.anthropic.com/v1/messages"
-  @default_model "claude-sonnet-4-20250514"
-  @default_max_tokens 16_384
-  @auth_profiles_path "~/.openclaw/agents/main/agent/auth-profiles.json"
+  alias Kyber.Plugin.LLM.{ApiClient, PromptBuilder, ToolLoop}
 
-  defp configured_model do
-    Application.get_env(:kyber_beam, :model, @default_model)
-  end
+  @auth_profiles_path "~/.openclaw/agents/main/agent/auth-profiles.json"
 
   # ── Plugin behaviour ──────────────────────────────────────────────────────
 
   def name, do: "llm"
 
-  # ── Public API ────────────────────────────────────────────────────────────
+  # ── Public API (delegates) ────────────────────────────────────────────────
+
+  defdelegate detect_auth_type(token), to: ApiClient
+  defdelegate build_headers(auth_config), to: ApiClient
+  defdelegate build_messages(payload), to: PromptBuilder
+  defdelegate call_api(auth_config, params), to: ApiClient
+  defdelegate format_with_reasoning(text, thinking), to: ApiClient
 
   @doc "Start the LLM plugin."
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    # Accept an explicit :name so Plugin.Manager (and tests) can override it.
-    # Defaults to __MODULE__ to preserve backwards compatibility.
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @doc """
-  Load auth configuration from auth-profiles.json.
-
-  Returns `{:ok, %{token: token, type: :oauth | :api_key}}` or `{:error, reason}`.
-  """
+  @doc "Load auth configuration from auth-profiles.json (default path)."
   @spec load_auth_config() :: {:ok, map()} | {:error, term()}
-  def load_auth_config do
-    load_auth_config(@auth_profiles_path)
-  end
+  def load_auth_config, do: ApiClient.load_auth_config(@auth_profiles_path)
 
+  @doc "Load auth configuration from a specific path."
   @spec load_auth_config(String.t()) :: {:ok, map()} | {:error, term()}
-  def load_auth_config(path) do
-    expanded = Path.expand(path)
-
-    with {:ok, raw} <- File.read(expanded),
-         {:ok, data} <- Jason.decode(raw) do
-      token = extract_token(data)
-      if token do
-        auth_type = detect_auth_type(token)
-        {:ok, %{token: token, type: auth_type}}
-      else
-        {:error, :no_token_found}
-      end
-    else
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @doc "Detect whether a token is OAuth or API key based on prefix."
-  @spec detect_auth_type(String.t()) :: :oauth | :api_key
-  def detect_auth_type("sk-ant-oat" <> _), do: :oauth
-  def detect_auth_type("sk-ant-api" <> _), do: :api_key
-  def detect_auth_type(_), do: :api_key
-
-  @doc """
-  Build the HTTP request headers for a given auth config.
-  """
-  @spec build_headers(map()) :: [{String.t(), String.t()}]
-  def build_headers(%{type: :oauth, token: token}) do
-    [
-      {"Authorization", "Bearer #{token}"},
-      {"anthropic-version", "2023-06-01"},
-      {"anthropic-beta",
-       "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"},
-      {"user-agent", "claude-cli/2.1.62"},
-      {"x-app", "cli"},
-      {"content-type", "application/json"}
-    ]
-  end
-
-  def build_headers(%{type: :api_key, token: token}) do
-    [
-      {"x-api-key", token},
-      {"anthropic-version", "2023-06-01"},
-      {"content-type", "application/json"}
-    ]
-  end
-
-  @doc """
-  Build the messages list for an Anthropic API call from effect data.
-
-  Effect data may include:
-  - `"history"` — list of prior message maps `%{role, content}`
-  - `"text"` — current user message
-  - `"attachments"` — list of attachment maps with `"url"` and `"content_type"`
-  - `"messages"` — explicit messages list (overrides history+text)
-
-  When `"attachments"` contains image entries (content_type starting with `"image/"`),
-  the user message content is built as a list of Anthropic content blocks (image + text).
-  Otherwise content is a plain string.
-  """
-  @spec build_messages(map()) :: [map()]
-  def build_messages(payload) do
-    cond do
-      is_list(payload["messages"]) ->
-        payload["messages"]
-
-      is_binary(payload["text"]) ->
-        history = build_history_messages(payload["history"] || [])
-        content = build_user_content(payload["text"], payload["attachments"] || [])
-        history ++ [%{"role" => "user", "content" => content}]
-
-      true ->
-        []
-    end
-  end
-
-  @doc """
-  Call the Anthropic Messages API with the given parameters.
-
-  Returns `{:ok, response_body}` or `{:error, %{error: msg, status: code}}`.
-  """
-  @spec call_api(map(), map()) :: {:ok, map()} | {:error, map()}
-  def call_api(auth_config, params) do
-    headers = build_headers(auth_config)
-
-    body = %{
-      "model" => params["model"] || @default_model,
-      "max_tokens" => params["max_tokens"] || @default_max_tokens,
-      "messages" => params["messages"] || []
-    }
-
-    # Include tools if provided
-    body =
-      case params["tools"] do
-        [_ | _] = tools ->
-          Map.put(body, "tools", tools)
-
-        _ ->
-          body
-      end
-
-    body =
-      case {auth_config.type, params["system"]} do
-        {:oauth, system} when is_binary(system) ->
-          # OAuth tokens require Claude Code identity prefix and system as array
-          Map.put(body, "system", [
-            %{"type" => "text", "text" => "You are Claude Code, Anthropic's official CLI for Claude."},
-            %{"type" => "text", "text" => system}
-          ])
-
-        {:oauth, nil} ->
-          Map.put(body, "system", [
-            %{"type" => "text", "text" => "You are Claude Code, Anthropic's official CLI for Claude."}
-          ])
-
-        {_, system} when is_binary(system) ->
-          Map.put(body, "system", system)
-
-        _ ->
-          body
-      end
-
-    system_info =
-      case body["system"] do
-        list when is_list(list) -> "yes (#{length(list)} blocks)"
-        str when is_binary(str) -> "yes (#{String.length(str)} chars)"
-        _ -> "no"
-      end
-
-    tools_info =
-      case body["tools"] do
-        tools when is_list(tools) -> "#{length(tools)} tools"
-        _ -> "none"
-      end
-
-    Logger.info(
-      "[Kyber.Plugin.LLM] calling API: model=#{body["model"]}, " <>
-        "messages=#{length(body["messages"] || [])}, system=#{system_info}, tools=#{tools_info}"
-    )
-
-    call_api_with_retry(@anthropic_url, headers, body)
-  end
+  def load_auth_config(path), do: ApiClient.load_auth_config(path)
 
   # ── GenServer callbacks ───────────────────────────────────────────────────
 
@@ -226,8 +62,7 @@ defmodule Kyber.Plugin.LLM do
       api_calls: []
     }
 
-    # Load auth config asynchronously so init doesn't block if file is missing
-    case load_auth_config(auth_path) do
+    case ApiClient.load_auth_config(auth_path) do
       {:ok, auth_config} ->
         Logger.info("[Kyber.Plugin.LLM] auth loaded (type: #{auth_config.type})")
         state = %{state | auth_config: auth_config}
@@ -251,8 +86,6 @@ defmodule Kyber.Plugin.LLM do
     {:noreply, state}
   end
 
-  # When the Core's Effect.Executor crashes and restarts, its handler registry
-  # is wiped. We get a :DOWN from our monitor and re-register once it's back.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{executor_monitor: ref} = state) do
     Logger.warning(
       "[Kyber.Plugin.LLM] Effect.Executor went down (#{inspect(reason)}) — " <>
@@ -260,10 +93,6 @@ defmodule Kyber.Plugin.LLM do
     )
 
     state = %{state | executor_monitor: nil}
-
-    # Due to :rest_for_one restart order, the new Executor may already be up.
-    # Try to re-register immediately to minimize the window where llm_call
-    # effects would be silently dropped. Fall back to polling if not ready yet.
     executor = find_executor(state.core)
 
     if executor && Process.alive?(executor) do
@@ -271,14 +100,12 @@ defmodule Kyber.Plugin.LLM do
       Logger.info("[Kyber.Plugin.LLM] effect handler re-registered immediately after :DOWN")
       {:noreply, state}
     else
-      # Not ready yet — fall back to polling loop
       Process.send_after(self(), :reregister_after_core_restart, 500)
       {:noreply, state}
     end
   end
 
   def handle_info(:reregister_after_core_restart, state) do
-    # Find the executor — it may be registered under the Core's child name
     executor = find_executor(state.core)
 
     if executor && Process.alive?(executor) do
@@ -286,7 +113,6 @@ defmodule Kyber.Plugin.LLM do
       Logger.info("[Kyber.Plugin.LLM] effect handler re-registered after Core restart")
       {:noreply, state}
     else
-      # Not ready yet — retry in 500ms
       Process.send_after(self(), :reregister_after_core_restart, 500)
       {:noreply, state}
     end
@@ -322,13 +148,10 @@ defmodule Kyber.Plugin.LLM do
   # ── Private ───────────────────────────────────────────────────────────────
 
   defp find_executor(core) do
-    # The executor is a child of Kyber.Core named :"#{core}.Executor" or similar.
-    # Try common registered names.
     executor_name = :"#{core}.Executor"
 
     case Process.whereis(executor_name) do
       nil ->
-        # Fall back: ask the Core supervisor for its children
         try do
           Supervisor.which_children(core)
           |> Enum.find_value(fn
@@ -345,30 +168,37 @@ defmodule Kyber.Plugin.LLM do
   end
 
   defp register_effect_handler(%{core: core, session: session} = state) do
-    # Capture plugin_pid (self()) BEFORE the closure, so the handler always
-    # fetches the current auth config at invocation time rather than using the
-    # stale value that was closed over at registration time. This allows
-    # handle_info({:update_auth, ...}) to propagate token updates correctly.
     plugin_pid = self()
 
     handler = fn effect ->
       case GenServer.call(plugin_pid, :check_rate_limit) do
         :ok ->
           auth_config = GenServer.call(plugin_pid, :get_auth_config)
-          handle_llm_call(effect, core, session, auth_config)
+          ToolLoop.handle_llm_call(effect, core, session, auth_config)
 
         {:error, :rate_limited} ->
           origin = Map.get(effect, :origin)
           parent_id = Map.get(effect, :delta_id)
-          emit_error(core, "rate limited: too many LLM calls, please wait", 429, origin, parent_id)
+
+          delta =
+            Kyber.Delta.new(
+              "llm.error",
+              %{"error" => "rate limited: too many LLM calls, please wait", "status" => 429},
+              origin || {:system, "llm"},
+              parent_id
+            )
+
+          try do
+            Kyber.Core.emit(core, delta)
+          rescue
+            e -> Logger.error("[Kyber.Plugin.LLM] failed to emit rate limit error: #{inspect(e)}")
+          end
       end
     end
 
     try do
       Kyber.Core.register_effect_handler(core, :llm_call, handler)
 
-      # Monitor the Effect.Executor so we know when to re-register.
-      # Clear any previous monitor first.
       if old_ref = state[:executor_monitor], do: Process.demonitor(old_ref, [:flush])
 
       executor_monitor =
@@ -395,752 +225,8 @@ defmodule Kyber.Plugin.LLM do
     end
   end
 
-  defp handle_llm_call(effect, core, session, auth_config) do
-    payload = Map.get(effect, :payload, %{})
-    origin = Map.get(effect, :origin)
-    parent_id = Map.get(effect, :delta_id)
-
-    # Derive chat_id from origin for session keying
-    chat_id = chat_id_from_origin(origin)
-
-    # Get conversation history from session — preserving proper roles.
-    # Apply token-budget trimming: keep as many recent messages as fit in the
-    # configured context window (default 180K tokens) instead of a fixed count.
-    history =
-      if chat_id && process_alive?(session) do
-        raw_history =
-          Kyber.Session.get_history(session, chat_id)
-          |> Enum.map(fn delta ->
-            role = Map.get(delta.payload, "role", "user")
-            content = Map.get(delta.payload, "content", "")
-            %{"role" => role, "content" => content}
-          end)
-
-        budget = Application.get_env(:kyber_beam, :max_context_tokens, 180_000)
-        {trimmed, dropped, est_tokens} = Kyber.TokenCounter.trim_to_budget(raw_history, budget: budget)
-
-        if dropped > 0 do
-          Logger.info(
-            "[LLM] trimmed #{dropped} messages (estimated #{Float.round(est_tokens / 1_000, 1)}k tokens, budget #{Float.round(budget / 1_000, 1)}k)"
-          )
-        end
-
-        trimmed
-      else
-        []
-      end
-
-    # Build current user message — may be a string or a list of content blocks
-    # (image + text blocks) when image attachments are present.
-    text = payload["text"] || ""
-    attachments = payload["attachments"] || []
-    content = build_user_content(text, attachments)
-
-    # Store user message in session BEFORE API call.
-    # We store `content` (not just `text`) so that conversation history
-    # preserves image blocks for future turns.
-    if chat_id && process_alive?(session) do
-      user_delta =
-        Kyber.Delta.new(
-          "session.user",
-          %{"role" => "user", "content" => content},
-          origin
-        )
-
-      Kyber.Session.add_message(session, chat_id, user_delta)
-    end
-
-    # Build messages list for the API call
-    messages =
-      if is_list(payload["messages"]) do
-        payload["messages"]
-      else
-        history ++ [%{"role" => "user", "content" => content}]
-      end
-
-    # Load system prompt: explicit payload > vault knowledge context
-    system_prompt = payload["system"] || build_system_prompt(chat_id)
-
-    # Set channel context for tools that need it (e.g. send_file)
-    case origin do
-      {:channel, "discord", cid, _} ->
-        Kyber.ToolExecutor.set_channel_context(cid)
-      _ -> :ok
-    end
-
-    case auth_config do
-      nil ->
-        emit_error(core, "no auth config", 0, origin, parent_id)
-
-      config ->
-        case run_tool_loop(messages, system_prompt, config, core, origin, parent_id) do
-          {:ok, response} ->
-            content = extract_content(response)
-
-            # Store assistant response in session AFTER successful API call
-            if chat_id && process_alive?(session) do
-              asst_delta =
-                Kyber.Delta.new(
-                  "session.assistant",
-                  %{"role" => "assistant", "content" => content},
-                  origin
-                )
-
-              Kyber.Session.add_message(session, chat_id, asst_delta)
-            end
-
-            # Derive channel from original origin for routing the response back
-            channel_id =
-              case origin do
-                {:channel, "discord", cid, _} -> cid
-                _ -> nil
-              end
-
-            # Extract and log actual token usage from Anthropic response for observability.
-            # This gives real data to calibrate the ~4 chars/token estimator over time.
-            usage = response["usage"]
-
-            if is_map(usage) do
-              input_tokens = Map.get(usage, "input_tokens", 0)
-              output_tokens = Map.get(usage, "output_tokens", 0)
-
-              Logger.debug(
-                "[LLM] usage: input=#{input_tokens} output=#{output_tokens} total=#{input_tokens + output_tokens}"
-              )
-            end
-
-            response_payload =
-              %{
-                "content" => content,
-                "model" => response["model"],
-                "usage" => usage,
-                "stop_reason" => response["stop_reason"]
-              }
-              |> then(fn p ->
-                if channel_id, do: Map.put(p, "channel_id", channel_id), else: p
-              end)
-              |> then(fn p ->
-                # Carry original message_id through for reply threading
-                case payload["message_id"] do
-                  nil -> p
-                  mid -> Map.put(p, "reply_to_message_id", mid)
-                end
-              end)
-
-            # Preserve the original origin so the reducer can route the response
-            delta =
-              Kyber.Delta.new(
-                "llm.response",
-                response_payload,
-                origin || {:system, "llm"},
-                parent_id
-              )
-
-            try do
-              Kyber.Core.emit(core, delta)
-            rescue
-              e ->
-                Logger.error("[Kyber.Plugin.LLM] failed to emit response: #{inspect(e)}")
-            end
-
-            # Reinforce memories whose tags appear in the response.
-            # Lightweight — just tag extraction, no LLM call.
-            reinforce_memories(content)
-
-          {:error, %{error: error_msg, status: status}} ->
-            emit_error(core, error_msg, status, origin, parent_id)
-
-          {:error, reason} when is_binary(reason) ->
-            emit_error(core, reason, 0, origin, parent_id)
-        end
-    end
-  end
-
-  # Multi-turn tool loop. Calls the API, executes any tool_use blocks,
-  # and repeats until stop_reason is end_turn (or max iterations reached).
-  # Emits llm.call, tool.call, and tool.result deltas for observability.
-  defp run_tool_loop(messages, system_prompt, auth_config, core, origin, parent_id, remaining \\ 10)
-
-  defp run_tool_loop(_messages, _system_prompt, _auth_config, _core, _origin, _parent_id, 0) do
-    {:error, "tool loop limit reached (max 10 iterations)"}
-  end
-
-  defp run_tool_loop(messages, system_prompt, auth_config, core, origin, parent_id, remaining) do
-    tool_defs = Kyber.Tools.definitions()
-
-    # Emit llm.call delta before API call
-    model = configured_model()
-
-    llm_call_delta =
-      Kyber.Delta.new(
-        "llm.call",
-        %{"model" => model, "message_count" => length(messages), "tools" => Kyber.Tools.names()},
-        origin,
-        parent_id
-      )
-
-    safe_emit(core, llm_call_delta)
-
-    params = %{
-      "model" => model,
-      "max_tokens" => @default_max_tokens,
-      "messages" => messages,
-      "system" => system_prompt,
-      "tools" => tool_defs
-    }
-
-    case call_api_maybe_stream(auth_config, params, core, origin, parent_id) do
-      {:ok, %{"stop_reason" => "tool_use", "content" => content_blocks} = _response} ->
-        # Extract all tool_use blocks from the response
-        tool_uses = Enum.filter(content_blocks, &(&1["type"] == "tool_use"))
-
-        Logger.info(
-          "[Kyber.Plugin.LLM] tool_use: #{length(tool_uses)} call(s): " <>
-            Enum.map_join(tool_uses, ", ", & &1["name"])
-        )
-
-        # Build assistant turn with all content blocks (preserves tool_use blocks)
-        assistant_msg = %{"role" => "assistant", "content" => content_blocks}
-
-        # Execute each tool and build tool_result blocks
-        tool_results =
-          Enum.map(tool_uses, fn tu ->
-            tool_name = tu["name"]
-            tool_input = tu["input"] || %{}
-
-            Logger.debug("[Kyber.Plugin.LLM] executing tool: #{tool_name} #{inspect(tool_input)}")
-
-            # Emit tool.call delta before execution
-            call_delta =
-              Kyber.Delta.new(
-                "tool.call",
-                %{"name" => tool_name, "input" => tool_input},
-                origin,
-                parent_id
-              )
-
-            safe_emit(core, call_delta)
-
-            case Kyber.ToolExecutor.execute(tool_name, tool_input) do
-              {:ok, output} ->
-                # Emit tool.result delta (parent is the tool.call)
-                result_delta =
-                  Kyber.Delta.new(
-                    "tool.result",
-                    %{"name" => tool_name, "status" => "ok", "output" => truncate_output(output)},
-                    origin,
-                    call_delta.id
-                  )
-
-                safe_emit(core, result_delta)
-
-                %{
-                  "type" => "tool_result",
-                  "tool_use_id" => tu["id"],
-                  "content" => output
-                }
-
-              {:ok_image, %{"media_type" => media_type, "base64" => b64, "path" => path, "size_bytes" => size}} ->
-                Logger.info("[Kyber.Plugin.LLM] view_image: #{path} (#{size} bytes)")
-
-                result_delta =
-                  Kyber.Delta.new(
-                    "tool.result",
-                    %{"name" => tool_name, "status" => "ok", "output" => truncate_output("Image: #{path} (#{size} bytes)")},
-                    origin,
-                    call_delta.id
-                  )
-
-                safe_emit(core, result_delta)
-
-                %{
-                  "type" => "tool_result",
-                  "tool_use_id" => tu["id"],
-                  "content" => [
-                    %{
-                      "type" => "image",
-                      "source" => %{
-                        "type" => "base64",
-                        "media_type" => media_type,
-                        "data" => b64
-                      }
-                    },
-                    %{
-                      "type" => "text",
-                      "text" => "Image loaded: #{path} (#{size} bytes)"
-                    }
-                  ]
-                }
-
-              {:error, err} ->
-                Logger.warning("[Kyber.Plugin.LLM] tool error (#{tool_name}): #{err}")
-
-                result_delta =
-                  Kyber.Delta.new(
-                    "tool.result",
-                    %{"name" => tool_name, "status" => "error", "output" => truncate_output(err)},
-                    origin,
-                    call_delta.id
-                  )
-
-                safe_emit(core, result_delta)
-
-                %{
-                  "type" => "tool_result",
-                  "tool_use_id" => tu["id"],
-                  "content" => "Error: #{err}",
-                  "is_error" => true
-                }
-            end
-          end)
-
-        user_result_msg = %{"role" => "user", "content" => tool_results}
-
-        # Continue loop with updated message history
-        run_tool_loop(
-          messages ++ [assistant_msg, user_result_msg],
-          system_prompt,
-          auth_config,
-          core,
-          origin,
-          parent_id,
-          remaining - 1
-        )
-
-      {:ok, response} ->
-        # end_turn or any other stop_reason — we're done
-        {:ok, response}
-
-      {:error, _} = err ->
-        err
-    end
-  end
-
-  defp safe_emit(core, delta) do
-    try do
-      Kyber.Core.emit(core, delta)
-    rescue
-      e -> Logger.error("[Kyber.Plugin.LLM] failed to emit delta: #{inspect(e)}")
-    end
-  end
-
-  defp truncate_output(output, max \\ 500) do
-    str = if is_binary(output), do: output, else: inspect(output)
-
-    if String.length(str) > max do
-      String.slice(str, 0, max) <> "…"
-    else
-      str
-    end
-  end
-
-  defp emit_error(core, error_msg, status, origin, parent_id) do
-    delta =
-      Kyber.Delta.new(
-        "llm.error",
-        %{"error" => error_msg, "status" => status},
-        origin || {:system, "llm"},
-        parent_id
-      )
-
-    try do
-      Kyber.Core.emit(core, delta)
-    rescue
-      e -> Logger.error("[Kyber.Plugin.LLM] failed to emit error delta: #{inspect(e)}")
-    end
-  end
-
-  # ── Streaming API path ────────────────────────────────────────────────────
-
-  # Calls the API with streaming if enabled, falling back to sync on failure.
-  # Returns same format as `call_api/2`: `{:ok, response}` or `{:error, ...}`.
-  defp call_api_maybe_stream(auth_config, params, core, origin, parent_id) do
-    if Application.get_env(:kyber_beam, :llm_streaming, true) do
-      do_streaming_call(auth_config, params, core, origin, parent_id)
-    else
-      call_api(auth_config, params)
-    end
-  end
-
-  defp do_streaming_call(auth_config, params, core, origin, parent_id) do
-    headers = build_headers(auth_config)
-
-    body = %{
-      "model" => params["model"] || @default_model,
-      "max_tokens" => params["max_tokens"] || @default_max_tokens,
-      "messages" => params["messages"] || []
-    }
-
-    body =
-      case params["tools"] do
-        [_ | _] = tools -> Map.put(body, "tools", tools)
-        _ -> body
-      end
-
-    body =
-      case {auth_config.type, params["system"]} do
-        {:oauth, system} when is_binary(system) ->
-          Map.put(body, "system", [
-            %{"type" => "text", "text" => "You are Claude Code, Anthropic's official CLI for Claude."},
-            %{"type" => "text", "text" => system}
-          ])
-        {:oauth, nil} ->
-          Map.put(body, "system", [
-            %{"type" => "text", "text" => "You are Claude Code, Anthropic's official CLI for Claude."}
-          ])
-        {_, system} when is_binary(system) ->
-          Map.put(body, "system", system)
-        _ ->
-          body
-      end
-
-    # Enable extended thinking if configured
-    body =
-      case Application.get_env(:kyber_beam, :llm_thinking, true) do
-        true ->
-          budget = Application.get_env(:kyber_beam, :thinking_budget_tokens, 10_000)
-          # Anthropic requires max_tokens >= thinking budget; ensure it's large enough
-          current_max = body["max_tokens"]
-          new_max = max(current_max, budget + @default_max_tokens)
-          body
-          |> Map.put("thinking", %{"type" => "enabled", "budget_tokens" => budget})
-          |> Map.put("max_tokens", new_max)
-          # temperature must not be set when thinking is enabled
-          |> Map.delete("temperature")
-        _ ->
-          body
-      end
-
-    # Accumulate text for stream_chunk emissions
-    chunk_acc_ref = make_ref()
-    Process.put(chunk_acc_ref, "")
-
-    # Accumulate thinking text for reasoning trace
-    thinking_acc_ref = make_ref()
-    Process.put(thinking_acc_ref, "")
-
-    chat_id =
-      case origin do
-        {:channel, _ch, cid, _sender} -> cid
-        {:human, user_id} -> user_id
-        _ -> nil
-      end
-
-    callback = fn
-      {:text_chunk, text} ->
-        new_text = Process.get(chunk_acc_ref, "") <> text
-        Process.put(chunk_acc_ref, new_text)
-
-        # Emit every ~100 chars of accumulated text
-        if rem(String.length(new_text), 100) < String.length(text) do
-          stream_delta =
-            Kyber.Delta.new(
-              "llm.stream_chunk",
-              %{"text" => new_text, "chat_id" => chat_id},
-              origin,
-              parent_id
-            )
-
-          safe_emit(core, stream_delta)
-        end
-
-      {:thinking_chunk, text} ->
-        new_thinking = Process.get(thinking_acc_ref, "") <> text
-        Process.put(thinking_acc_ref, new_thinking)
-
-      {:done, _stop_reason} ->
-        :ok
-
-      _ ->
-        :ok
-    end
-
-    case Kyber.Plugin.LLM.Streamer.stream_request(@anthropic_url, body, headers, callback) do
-      {:ok, response} ->
-        thinking = Kyber.Plugin.LLM.Streamer.extract_thinking(response)
-        Logger.info("[LLM] streaming complete, stop_reason=#{response["stop_reason"]}")
-
-        # If thinking was present, wrap the response content with reasoning trace
-        if thinking do
-          text_content = extract_content(response)
-          formatted = format_with_reasoning(text_content, thinking)
-          new_content = [%{"type" => "text", "text" => formatted}]
-          {:ok, Map.put(response, "content", new_content)}
-        else
-          {:ok, response}
-        end
-
-      {:error, reason} ->
-        Logger.warning("[LLM] streaming failed: #{inspect(reason)}, falling back to sync")
-        call_api(auth_config, params)
-    end
-  end
-
-  # ── Reasoning trace formatting ────────────────────────────────────────────
-
-  @doc "Format response text with a collapsible thinking/reasoning spoiler block."
-  def format_with_reasoning(text, nil), do: text
-  def format_with_reasoning(text, ""), do: text
-
-  def format_with_reasoning(text, thinking) do
-    thinking_block =
-      thinking
-      |> String.split("\n")
-      |> Enum.map(&("> " <> &1))
-      |> Enum.join("\n")
-
-    "||🧠 **Reasoning**\n#{thinking_block}||\n\n#{text}"
-  end
-
-  # ── Content extraction ────────────────────────────────────────────────────
-
-  defp extract_content(%{"content" => [%{"text" => text} | _]}), do: text
-
-  defp extract_content(%{"content" => content}) when is_list(content) do
-    content
-    |> Enum.filter(&is_map/1)
-    |> Enum.map_join("\n", &Map.get(&1, "text", ""))
-  end
-
-  defp extract_content(_), do: ""
-
-  # Build the system prompt by combining SOUL.md with vault context.
-  # Loads:
-  #   1. SOUL.md identity (from vault or file fallback)
-  #   2. Long-term memory (MEMORY.md, auto-curated by Memory.Consolidator)
-  #   3. Today's memory note (if present in vault)
-  #
-  # Falls back gracefully if Kyber.Knowledge is not running.
-  defp build_system_prompt(_chat_id) do
-    # Step 1: Load SOUL.md — prefer vault, fall back to file
-    soul_content =
-      case safe_knowledge_call({:get_tiered, "identity/SOUL.md", :l2}) do
-        {:ok, %{body: body}} when is_binary(body) and body != "" -> body
-        _ -> load_soul_from_file()
-      end
-
-    # Step 2: Long-term memory (MEMORY.md, regenerated by Memory.Consolidator)
-    long_term_memory =
-      case safe_knowledge_call({:get_tiered, "identity/MEMORY.md", :l2}) do
-        {:ok, %{body: body}} when is_binary(body) and body != "" ->
-          "\n\n## Long-Term Memory (auto-curated)\n#{body}"
-
-        _ ->
-          # Fall back to reading directly from file
-          path = Path.expand("~/.kyber/vault/identity/MEMORY.md")
-          case File.read(path) do
-            {:ok, content} when content != "" ->
-              "\n\n## Long-Term Memory (auto-curated)\n#{content}"
-            _ ->
-              ""
-          end
-      end
-
-    # Step 3: Today's memory note
-    today = Date.to_string(Date.utc_today())
-
-    memory_context =
-      case safe_knowledge_call({:get_tiered, "memory/#{today}.md", :l2}) do
-        {:ok, %{body: body}} when is_binary(body) and body != "" ->
-          "\n\n## Today's Notes\n#{body}"
-
-        _ ->
-          ""
-      end
-
-    capabilities_note = """
-
-## Your Capabilities
-
-You are a Claude model with vision — you CAN see and analyze images.
-
-**Image workflow:**
-- When someone attaches an image to a Discord message, you see it automatically.
-- To take a photo: `camera_snap` → `view_image` (to see it) → `send_file` (to post it).
-- To look at any image file: `view_image` with the file path.
-- IMPORTANT: `camera_snap` only returns a file path. You MUST call `view_image` on that path
-  to actually see the photo before describing it. Never describe a photo you haven't viewed.
-"""
-
-    vault_instruction = """
-
-## MANDATORY: Check Your Vault First
-
-Before answering ANY question about concepts, ideas, the Groovy Commutator, Wet Math, D₂, \
-or shared work: you MUST call `memory_read` on relevant files in `concepts/` BEFORE responding. \
-Also call `memory_list` if you're unsure what's there. Your vault is ground truth. \
-Do NOT answer from general knowledge or vibes — if it's not in your vault, say so honestly. \
-Confabulating a plausible-sounding answer when you have files you didn't check is a failure mode.
-"""
-
-    (soul_content || "") <> long_term_memory <> memory_context <> capabilities_note <> vault_instruction
-  end
-
-  # Call Kyber.Knowledge safely — returns nil if not running.
-  defp safe_knowledge_call(request) do
-    if Process.whereis(Kyber.Knowledge) do
-      try do
-        GenServer.call(Kyber.Knowledge, request, 2_000)
-      catch
-        :exit, _ -> nil
-      end
-    else
-      nil
-    end
-  end
-
-  defp load_soul_from_file do
-    # Try vault path first, then fallback to priv/vault
-    paths = [
-      Path.expand("~/.kyber/vault/identity/SOUL.md"),
-      Path.join(:code.priv_dir(:kyber_beam), "vault/identity/SOUL.md")
-    ]
-
-    Enum.find_value(paths, fn path ->
-      case File.read(path) do
-        {:ok, content} -> content
-        _ -> nil
-      end
-    end)
-  end
-
-  # Extract tags from LLM response text and reinforce matching memories.
-  # Only matches words that are at least 5 chars and not in the stopword list.
-  # Intentionally lightweight: no LLM call, just simple word extraction.
-
-  @tag_stopwords ~w(
-    about after again also another archive around based batch because before being
-    below build called change changes check class clause common complete config contains
-    context create current cycle datum debug defined delta depends depth detail
-    direct doing elixir error event example false found function given group guard handle
-    handler have here include index inject input inside issue items just keep kind later
-    layer level limit local logic match maybe means memory message might model module
-    needs never might often only other output parse pattern place point process query
-    quite reason reply reset response result return rules serve should since skill some
-    stack state still store string struct system table target test their these thing
-    this three through times token total toward under until update using value where while
-    which within without would write
-  )
-
-  defp reinforce_memories(content) when is_binary(content) and content != "" do
-    # Get existing memory tags via the Consolidator public API so we only match
-    # real memory tags. Using get_pool/0 avoids hard-coding the ETS table name.
-    existing_tags =
-      if Process.whereis(Kyber.Memory.Consolidator) do
-        Kyber.Memory.Consolidator.get_pool()
-        |> Enum.flat_map(fn mem -> mem.tags || [] end)
-        |> MapSet.new()
-      else
-        MapSet.new()
-      end
-
-    words =
-      content
-      |> String.downcase()
-      |> String.split(~r/[\s,.\-:;!?()\"'\[\]{}|<>\/\\]+/)
-      |> Enum.filter(fn word ->
-        len = String.length(word)
-        # Minimum 5 chars, not a stopword
-        len >= 5 and word not in @tag_stopwords
-      end)
-      |> Enum.uniq()
-
-    # Prefer words that match actual memory tags; fall back to any qualifying word
-    matched =
-      if MapSet.size(existing_tags) > 0 do
-        Enum.filter(words, &MapSet.member?(existing_tags, &1))
-      else
-        words
-      end
-
-    tags = Enum.take(matched, 20)
-
-    if tags != [] do
-      Kyber.Memory.Consolidator.reinforce(tags)
-    end
-  end
-
-  defp reinforce_memories(_), do: :ok
-
-  defp chat_id_from_origin({:channel, _ch, chat_id, _sender}), do: chat_id
-  defp chat_id_from_origin({:human, user_id}), do: user_id
-  defp chat_id_from_origin(_), do: nil
-
-  # Safe process existence check — works with both atoms and pids
-  defp process_alive?(name) when is_atom(name), do: Process.whereis(name) != nil
-  defp process_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
-  defp process_alive?(_), do: false
-
-  # Build the Anthropic-compatible messages list from session history.
-  # Content may be a plain string OR a list of content blocks (e.g. image + text).
-  # Both forms are passed through as-is — the Anthropic API accepts either.
-  defp build_history_messages(history) when is_list(history) do
-    Enum.map(history, fn
-      %{"role" => role, "content" => content} -> %{"role" => role, "content" => content}
-      %{role: role, content: content} -> %{"role" => to_string(role), "content" => content}
-      _ -> nil
-    end)
-    |> Enum.reject(&is_nil/1)
-  end
-
-  defp build_history_messages(_), do: []
-
-  # Build user-message content for the Anthropic API.
-  # If the payload has image attachments, returns a list of content blocks:
-  #   [image_block, ..., %{"type" => "text", "text" => text}]
-  # Otherwise returns the plain text string (more efficient for text-only turns).
-  defp build_user_content(text, attachments) when is_list(attachments) do
-    image_blocks =
-      attachments
-      |> Enum.filter(fn att ->
-        content_type = Map.get(att, "content_type", "")
-        String.starts_with?(content_type, "image/")
-      end)
-      |> Enum.map(fn att ->
-        %{"type" => "image", "source" => %{"type" => "url", "url" => att["url"]}}
-      end)
-
-    case {image_blocks, text} do
-      {[], _} -> text
-      {imgs, t} when t == "" or is_nil(t) -> imgs
-      {imgs, t} -> imgs ++ [%{"type" => "text", "text" => t}]
-    end
-  end
-
-  defp build_user_content(text, _), do: text
-
-  defp extract_token(%{"claudeAiOauth" => %{"accessToken" => token}}) when is_binary(token),
-    do: token
-
-  defp extract_token(%{"oauthToken" => token}) when is_binary(token), do: token
-  defp extract_token(%{"apiKey" => token}) when is_binary(token), do: token
-  defp extract_token(%{"token" => token}) when is_binary(token), do: token
-
-  defp extract_token(data) when is_map(data) do
-    # Search recursively for any key that looks like a token
-    Enum.find_value(data, fn {_k, v} ->
-      case v do
-        %{} ->
-          extract_token(v)
-
-        str when is_binary(str) and byte_size(str) > 20 ->
-          if String.starts_with?(str, "sk-ant-"), do: str, else: nil
-
-        _ ->
-          nil
-      end
-    end)
-  end
-
-  defp extract_token(_), do: nil
-
-  # ── Rate limiting (P3-6) ─────────────────────────────────────────────────
-
-  # Check whether the current API call exceeds the configured rate limit.
-  # Tracks call timestamps in state.api_calls (monotonic ms).
-  # Returns {:ok, updated_state} if under the limit, {:error, :rate_limited} if not.
   defp check_rate_limit(state) do
-    window = 60_000  # 1 minute in milliseconds
+    window = 60_000
     max_calls = Application.get_env(:kyber_beam, :max_llm_calls_per_minute, 30)
     now = System.monotonic_time(:millisecond)
     recent = Enum.filter(state.api_calls, &(&1 > now - window))
@@ -1149,102 +235,10 @@ Confabulating a plausible-sounding answer when you have files you didn't check i
       Logger.warning(
         "[Kyber.Plugin.LLM] rate limit reached (#{length(recent)}/#{max_calls} calls in last 60s)"
       )
+
       {:error, :rate_limited}
     else
       {:ok, %{state | api_calls: [now | recent]}}
     end
-  end
-
-  # ── HTTP retry helpers (P1-4) ─────────────────────────────────────────────
-
-  # Wraps Req.post with exponential backoff retry for transient failures.
-  # Retries on:
-  #   - 5xx server errors  (backoff 1s / 2s / 4s)
-  #   - 429 rate-limited   (respects Retry-After header, default 5s)
-  #   - network errors     (same backoff as 5xx)
-  # Halts immediately on 2xx / 4xx (except 429).
-  @max_retries 3
-
-  defp call_api_with_retry(url, headers, body, retries_left \\ @max_retries) do
-    case Req.post(url, headers: headers, json: body, receive_timeout: 60_000) do
-      {:ok, %{status: 200, body: response}} ->
-        {:ok, response}
-
-      {:ok, %{status: 429, headers: resp_headers}} when retries_left > 0 ->
-        delay = parse_retry_after(resp_headers, 5_000)
-        Logger.warning("[Kyber.Plugin.LLM] rate limited (429), retrying after #{delay}ms")
-        Process.sleep(delay)
-        call_api_with_retry(url, headers, body, retries_left - 1)
-
-      {:ok, %{status: 429, body: resp_body}} ->
-        Logger.error("[Kyber.Plugin.LLM] rate limited (429), no retries left: #{inspect(resp_body)}")
-        error_msg = get_in(resp_body, ["error", "message"]) || inspect(resp_body)
-        {:error, %{error: error_msg, status: 429}}
-
-      {:ok, %{status: status}} when status >= 500 and retries_left > 0 ->
-        backoff = backoff_ms(@max_retries - retries_left)
-        Logger.warning("[Kyber.Plugin.LLM] API error #{status}, retrying in #{backoff}ms (#{retries_left} left)")
-        Process.sleep(backoff)
-        call_api_with_retry(url, headers, body, retries_left - 1)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        Logger.error("[Kyber.Plugin.LLM] API error #{status}: #{inspect(resp_body)}")
-        error_msg = get_in(resp_body, ["error", "message"]) || inspect(resp_body)
-        {:error, %{error: error_msg, status: status}}
-
-      {:error, reason} when retries_left > 0 ->
-        backoff = backoff_ms(@max_retries - retries_left)
-        Logger.warning("[Kyber.Plugin.LLM] network error #{inspect(reason)}, retrying in #{backoff}ms (#{retries_left} left)")
-        Process.sleep(backoff)
-        call_api_with_retry(url, headers, body, retries_left - 1)
-
-      {:error, reason} ->
-        {:error, %{error: inspect(reason), status: 0}}
-    end
-  end
-
-  # Exponential backoff: attempt 0 → 1s, 1 → 2s, 2 → 4s
-  defp backoff_ms(attempt) do
-    :math.pow(2, attempt) |> round() |> Kernel.*(1_000)
-  end
-
-  # Parse Retry-After header value (seconds integer or HTTP date).
-  # Returns delay in milliseconds; falls back to `default_ms` if unparseable.
-  defp parse_retry_after(headers, default_ms) when is_list(headers) do
-    case find_header(headers, "retry-after") do
-      nil -> default_ms
-      val -> parse_retry_after_value(val, default_ms)
-    end
-  end
-
-  defp parse_retry_after(headers, default_ms) when is_map(headers) do
-    val = Map.get(headers, "retry-after") || Map.get(headers, "Retry-After")
-    parse_retry_after_value(val, default_ms)
-  end
-
-  defp parse_retry_after(_, default_ms), do: default_ms
-
-  defp parse_retry_after_value(nil, default_ms), do: default_ms
-
-  defp parse_retry_after_value(val, default_ms) when is_binary(val) do
-    case Integer.parse(val) do
-      {secs, _} when secs > 0 -> secs * 1_000
-      _ -> default_ms
-    end
-  end
-
-  defp parse_retry_after_value(val, _default_ms) when is_integer(val) and val > 0,
-    do: val * 1_000
-
-  defp parse_retry_after_value(_, default_ms), do: default_ms
-
-  defp find_header(headers, name) when is_list(headers) do
-    Enum.find_value(headers, fn
-      {k, v} when is_binary(k) ->
-        if String.downcase(k) == name, do: to_string(v)
-
-      _ ->
-        nil
-    end)
   end
 end
