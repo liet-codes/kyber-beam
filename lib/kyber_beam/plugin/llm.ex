@@ -590,7 +590,7 @@ defmodule Kyber.Plugin.LLM do
       "tools" => tool_defs
     }
 
-    case call_api(auth_config, params) do
+    case call_api_maybe_stream(auth_config, params, core, origin, parent_id) do
       {:ok, %{"stop_reason" => "tool_use", "content" => content_blocks} = _response} ->
         # Extract all tool_use blocks from the response
         tool_uses = Enum.filter(content_blocks, &(&1["type"] == "tool_use"))
@@ -750,6 +750,118 @@ defmodule Kyber.Plugin.LLM do
       e -> Logger.error("[Kyber.Plugin.LLM] failed to emit error delta: #{inspect(e)}")
     end
   end
+
+  # ── Streaming API path ────────────────────────────────────────────────────
+
+  # Calls the API with streaming if enabled, falling back to sync on failure.
+  # Returns same format as `call_api/2`: `{:ok, response}` or `{:error, ...}`.
+  defp call_api_maybe_stream(auth_config, params, core, origin, parent_id) do
+    if Application.get_env(:kyber_beam, :llm_streaming, true) do
+      do_streaming_call(auth_config, params, core, origin, parent_id)
+    else
+      call_api(auth_config, params)
+    end
+  end
+
+  defp do_streaming_call(auth_config, params, core, origin, parent_id) do
+    headers = build_headers(auth_config)
+
+    body = %{
+      "model" => params["model"] || @default_model,
+      "max_tokens" => params["max_tokens"] || @default_max_tokens,
+      "messages" => params["messages"] || []
+    }
+
+    body =
+      case params["tools"] do
+        tools when is_list(tools) and length(tools) > 0 -> Map.put(body, "tools", tools)
+        _ -> body
+      end
+
+    body =
+      case {auth_config.type, params["system"]} do
+        {:oauth, system} when is_binary(system) ->
+          Map.put(body, "system", [
+            %{"type" => "text", "text" => "You are Claude Code, Anthropic's official CLI for Claude."},
+            %{"type" => "text", "text" => system}
+          ])
+        {:oauth, nil} ->
+          Map.put(body, "system", [
+            %{"type" => "text", "text" => "You are Claude Code, Anthropic's official CLI for Claude."}
+          ])
+        {_, system} when is_binary(system) ->
+          Map.put(body, "system", system)
+        _ ->
+          body
+      end
+
+    # Accumulate text for stream_chunk emissions
+    chunk_acc_ref = make_ref()
+    Process.put(chunk_acc_ref, "")
+
+    chat_id =
+      case origin do
+        {:channel, _ch, cid, _sender} -> cid
+        {:human, user_id} -> user_id
+        _ -> nil
+      end
+
+    callback = fn
+      {:text_chunk, text} ->
+        new_text = Process.get(chunk_acc_ref, "") <> text
+        Process.put(chunk_acc_ref, new_text)
+
+        # Emit every ~100 chars of accumulated text
+        if rem(String.length(new_text), 100) < String.length(text) do
+          stream_delta =
+            Kyber.Delta.new(
+              "llm.stream_chunk",
+              %{"text" => new_text, "chat_id" => chat_id},
+              origin,
+              parent_id
+            )
+
+          safe_emit(core, stream_delta)
+        end
+
+      {:thinking_chunk, _text} ->
+        :ok
+
+      {:done, _stop_reason} ->
+        :ok
+
+      _ ->
+        :ok
+    end
+
+    case Kyber.Plugin.LLM.Streamer.stream_request(@anthropic_url, body, headers, callback) do
+      {:ok, response} ->
+        Logger.info("[LLM] streaming complete, stop_reason=#{response["stop_reason"]}")
+        {:ok, response}
+
+      {:error, reason} ->
+        Logger.warning("[LLM] streaming failed: #{inspect(reason)}, falling back to sync")
+        call_api(auth_config, params)
+    end
+  end
+
+  # ── Reasoning trace formatting ────────────────────────────────────────────
+
+  @doc "Format response text with a collapsible thinking/reasoning spoiler block."
+  def format_with_reasoning(text, nil), do: text
+  def format_with_reasoning(text, ""), do: text
+
+  def format_with_reasoning(text, thinking) do
+    thinking_block =
+      thinking
+      |> String.split("\n")
+      |> Enum.map(&("> " <> &1))
+      |> Enum.join("\n")
+
+    "||🧠 **Reasoning**\n#{thinking_block}||\n\n#{text}"
+  end
+
+  # ── Content extraction ────────────────────────────────────────────────────
 
   defp extract_content(%{"content" => [%{"text" => text} | _]}), do: text
 
