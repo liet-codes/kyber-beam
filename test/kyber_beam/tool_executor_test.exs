@@ -518,6 +518,119 @@ defmodule Kyber.ToolExecutorTest do
     end
   end
 
+  # ── spawn_task / list_tasks ─────────────────────────────────────────────
+
+  describe "spawn_task" do
+    setup do
+      # Start the required processes with registered names (skip if already running from app)
+      started = []
+
+      {_, started} =
+        case Task.Supervisor.start_link(name: Kyber.Effect.TaskSupervisor) do
+          {:ok, _pid} -> {:ok, [:task_sup | started]}
+          {:error, {:already_started, _}} -> {:ok, started}
+        end
+
+      {_, started} =
+        case Kyber.TaskRegistry.start_link(name: Kyber.TaskRegistry) do
+          {:ok, _pid} -> {:ok, [:registry | started]}
+          {:error, {:already_started, _}} -> {:ok, started}
+        end
+
+      dir = System.tmp_dir!() |> Path.join("kyber_tool_spawn_test_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+
+      {_, started} =
+        case Kyber.Delta.Store.start_link(data_dir: dir, name: Kyber.Delta.Store) do
+          {:ok, _pid} -> {:ok, [:store | started]}
+          {:error, {:already_started, _}} -> {:ok, started}
+        end
+
+      on_exit(fn ->
+        # Only stop processes we started
+        names = %{task_sup: Kyber.Effect.TaskSupervisor, registry: Kyber.TaskRegistry, store: Kyber.Delta.Store}
+        for key <- started do
+          name = names[key]
+          pid = Process.whereis(name)
+          if pid && Process.alive?(pid) do
+            try do
+              GenServer.stop(pid, :normal, 500)
+            catch
+              :exit, _ -> :ok
+            end
+          end
+        end
+        File.rm_rf(dir)
+      end)
+
+      :ok
+    end
+
+    test "spawns echo task and returns result" do
+      assert {:ok, result} = ToolExecutor.execute("spawn_task", %{
+        "task_name" => "echo",
+        "task_params" => %{"hello" => "world"}
+      })
+      assert String.contains?(result, "echo")
+      assert String.contains?(result, "completed")
+      assert String.contains?(result, "hello")
+    end
+
+    test "returns error for unknown task" do
+      assert {:error, msg} = ToolExecutor.execute("spawn_task", %{
+        "task_name" => "nonexistent_task"
+      })
+      assert String.contains?(msg, "Unknown task")
+    end
+
+    test "handles task failure" do
+      assert {:error, msg} = ToolExecutor.execute("spawn_task", %{
+        "task_name" => "fail",
+        "task_params" => %{}
+      })
+      assert String.contains?(msg, "fail")
+    end
+
+    test "uses default params when task_params omitted" do
+      assert {:ok, result} = ToolExecutor.execute("spawn_task", %{
+        "task_name" => "echo"
+      })
+      assert String.contains?(result, "completed")
+    end
+  end
+
+  describe "list_tasks" do
+    setup do
+      started =
+        case Kyber.TaskRegistry.start_link(name: Kyber.TaskRegistry) do
+          {:ok, _pid} -> true
+          {:error, {:already_started, _}} -> false
+        end
+
+      on_exit(fn ->
+        if started do
+          pid = Process.whereis(Kyber.TaskRegistry)
+          if pid && Process.alive?(pid) do
+            try do
+              GenServer.stop(pid, :normal, 500)
+            catch
+              :exit, _ -> :ok
+            end
+          end
+        end
+      end)
+
+      :ok
+    end
+
+    test "lists built-in tasks" do
+      assert {:ok, result} = ToolExecutor.execute("list_tasks", %{})
+      assert String.contains?(result, "echo")
+      assert String.contains?(result, "sleep")
+      assert String.contains?(result, "fail")
+    end
+  end
+
   # ── unknown tool ──────────────────────────────────────────────────────────
 
   describe "unknown tool" do

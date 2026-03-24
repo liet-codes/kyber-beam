@@ -270,4 +270,25 @@ defmodule Kyber.TaskSpawnerTest do
       GenServer.stop(executor, :normal, 500)
     end
   end
+
+  describe "TaskRegistry.list/1" do
+    test "lists built-in task names", ctx do
+      tasks = TaskRegistry.list(ctx.registry)
+      assert "echo" in tasks
+      assert "sleep" in tasks
+      assert "fail" in tasks
+    end
+
+    test "includes dynamically registered tasks", ctx do
+      TaskRegistry.register(ctx.registry, "custom_task", fn _params -> :ok end)
+      tasks = TaskRegistry.list(ctx.registry)
+      assert "custom_task" in tasks
+      assert "echo" in tasks
+    end
+
+    test "returns sorted list", ctx do
+      tasks = TaskRegistry.list(ctx.registry)
+      assert tasks == Enum.sort(tasks)
+    end
+  end
 end

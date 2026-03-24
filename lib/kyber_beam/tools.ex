@@ -464,6 +464,68 @@ defmodule Kyber.Tools do
       }
     },
 
+    # ── Phase 12: Sub-agent Orchestration ────────────────────────────────────
+
+    %{
+      "name" => "spawn_task",
+      "description" =>
+        "Spawn a background task and get the result. Available tasks can be listed " <>
+        "with the list_tasks tool. The task runs asynchronously and the result is " <>
+        "returned when complete (or an error if it fails/times out).",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "task_name" => %{
+            "type" => "string",
+            "description" => "Name of the task to spawn (e.g. 'echo', 'sleep')"
+          },
+          "task_params" => %{
+            "type" => "object",
+            "description" => "Parameters to pass to the task function (optional)"
+          },
+          "timeout_ms" => %{
+            "type" => "integer",
+            "description" => "Timeout in milliseconds (default 30000)"
+          }
+        },
+        "required" => ["task_name"]
+      }
+    },
+    %{
+      "name" => "list_tasks",
+      "description" => "List available tasks that can be spawned with the spawn_task tool.",
+      "input_schema" => %{"type" => "object", "properties" => %{}}
+    },
+
+    # ── Phase 12: Research Pipeline ──────────────────────────────────────────
+
+    %{
+      "name" => "research",
+      "description" =>
+        "Research a topic by searching the web and fetching the top results. " <>
+        "Chains web_search → web_fetch on top results → returns combined content. " <>
+        "Use this for in-depth research that needs more than just search snippets. " <>
+        "Returns search results plus full extracted text from each source.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "query" => %{
+            "type" => "string",
+            "description" => "Research query string"
+          },
+          "max_results" => %{
+            "type" => "integer",
+            "description" => "Number of top results to fetch (default 3, max 5)"
+          },
+          "max_chars_per_page" => %{
+            "type" => "integer",
+            "description" => "Maximum characters to extract per page (default 5000)"
+          }
+        },
+        "required" => ["query"]
+      }
+    },
+
     %{
       "name" => "cleanup_tmp",
       "description" =>

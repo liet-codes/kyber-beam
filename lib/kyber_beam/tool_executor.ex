@@ -494,8 +494,8 @@ defmodule Kyber.ToolExecutor do
     raw_path = Map.get(input, "output_path", "/tmp/stilgar_snap_#{timestamp}.jpg")
     output_path = Path.expand(raw_path)
 
-    req_path = Application.get_env(:kyber_beam, :snap_request_path, "/tmp/snap_request")
-    res_path = Application.get_env(:kyber_beam, :snap_result_path, "/tmp/snap_result")
+    req_path = Kyber.Config.get(:snap_request_path, "/tmp/snap_request")
+    res_path = Kyber.Config.get(:snap_result_path, "/tmp/snap_result")
 
     Logger.info("[Kyber.ToolExecutor] camera_snap: #{output_path}")
 
@@ -529,7 +529,7 @@ defmodule Kyber.ToolExecutor do
         channel_id = Map.get(input, "channel_id")
 
         # Get the Discord token from the plugin's config
-        token = Application.get_env(:kyber_beam, :discord_token) ||
+        token = Kyber.Config.get(:discord_token) ||
                 System.get_env("DISCORD_BOT_TOKEN")
 
         if is_nil(token) do
@@ -653,6 +653,146 @@ defmodule Kyber.ToolExecutor do
     e -> {:error, "web_search error: #{inspect(e)}"}
   end
 
+  # ── Phase 12: Sub-agent Orchestration ──────────────────────────────────────
+
+  def execute("spawn_task", %{"task_name" => task_name} = input) do
+    task_params = Map.get(input, "task_params", %{})
+    timeout_ms = Map.get(input, "timeout_ms", 30_000)
+
+    registry = Process.whereis(Kyber.TaskRegistry)
+    store = Process.whereis(Kyber.Delta.Store)
+    task_sup = Process.whereis(Kyber.Effect.TaskSupervisor)
+
+    cond do
+      is_nil(registry) ->
+        {:error, "TaskRegistry not running"}
+
+      is_nil(store) ->
+        {:error, "Delta.Store not running"}
+
+      is_nil(task_sup) ->
+        {:error, "TaskSupervisor not running"}
+
+      true ->
+        effect = %{
+          type: :spawn_task,
+          payload: %{
+            "task_name" => task_name,
+            "task_params" => task_params,
+            "timeout_ms" => timeout_ms
+          }
+        }
+
+        # Subscribe to delta store to capture the result
+        caller = self()
+        ref = make_ref()
+
+        Kyber.Delta.Store.subscribe(store, fn delta ->
+          kind = Map.get(delta, :kind)
+          payload = Map.get(delta, :payload, %{})
+          task_id_in_delta = Map.get(payload, "task_id")
+
+          if kind in ["task.result", "task.error"] do
+            send(caller, {:task_delta, ref, kind, task_id_in_delta, payload})
+          end
+        end)
+
+        case Kyber.TaskSpawner.spawn_task(effect, registry, store, task_sup) do
+          {:ok, task_id} ->
+            # Wait for the result delta
+            wait_for_task_result(ref, task_id, task_name, timeout_ms + 5_000)
+
+          {:error, :unknown_task} ->
+            {:error, "Unknown task: #{task_name}. Use list_tasks to see available tasks."}
+
+          {:error, reason} ->
+            {:error, "Failed to spawn task: #{inspect(reason)}"}
+        end
+    end
+  rescue
+    e -> {:error, "spawn_task failed: #{inspect(e)}"}
+  end
+
+  def execute("list_tasks", _input) do
+    registry = Process.whereis(Kyber.TaskRegistry)
+
+    if is_nil(registry) do
+      {:error, "TaskRegistry not running"}
+    else
+      tasks = Kyber.TaskRegistry.list(registry)
+
+      if tasks == [] do
+        {:ok, "No tasks registered."}
+      else
+        {:ok, "Available tasks:\n" <> Enum.map_join(tasks, "\n", &("• #{&1}"))}
+      end
+    end
+  rescue
+    e -> {:error, "list_tasks failed: #{inspect(e)}"}
+  end
+
+  # ── Phase 12: Research Pipeline ────────────────────────────────────────────
+
+  def execute("research", %{"query" => query} = input) do
+    max_results = Map.get(input, "max_results", 3) |> min(5) |> max(1)
+    max_chars_per_page = Map.get(input, "max_chars_per_page", 5_000)
+
+    Logger.info("[Kyber.ToolExecutor] research: #{query} (top #{max_results} results)")
+
+    # Step 1: Search
+    search_result =
+      case execute("web_search", %{"query" => query, "max_results" => max_results}) do
+        {:ok, _} = ok -> ok
+        {:error, reason} -> {:error, "Search step failed: #{reason}"}
+      end
+
+    case search_result do
+      {:error, reason} ->
+        {:error, reason}
+
+      {:ok, search_text} ->
+        # Step 2: Extract URLs from search results
+        urls =
+          search_text
+          |> String.split("\n")
+          |> Enum.filter(&String.contains?(&1, "URL: "))
+          |> Enum.map(fn line ->
+            line |> String.trim() |> String.replace_prefix("URL: ", "")
+          end)
+          |> Enum.filter(&String.starts_with?(&1, "http"))
+          |> Enum.take(max_results)
+
+        # Step 3: Fetch each URL
+        fetched =
+          urls
+          |> Enum.with_index(1)
+          |> Enum.map(fn {url, i} ->
+            case Kyber.Tools.WebFetch.fetch(url, max_chars: max_chars_per_page) do
+              {:ok, %{title: title, content: content, word_count: wc}} ->
+                title_str = title || "Untitled"
+                "── Source #{i}: #{title_str} ──\nURL: #{url}\nWords: #{wc}\n\n#{content}"
+
+              {:error, reason} ->
+                "── Source #{i}: FETCH FAILED ──\nURL: #{url}\nError: #{reason}"
+            end
+          end)
+
+        combined =
+          "Research results for: #{query}\n" <>
+            "Searched and fetched #{length(urls)} source(s).\n\n" <>
+            Enum.join(fetched, "\n\n")
+
+        # Truncate combined output to 50KB
+        if byte_size(combined) > 50_000 do
+          {:ok, String.slice(combined, 0, 50_000) <> "\n\n[research output truncated to 50KB]"}
+        else
+          {:ok, combined}
+        end
+    end
+  rescue
+    e -> {:error, "research failed: #{inspect(e)}"}
+  end
+
   # ── Catch-all ─────────────────────────────────────────────────────────────
 
   def execute(name, _input) do
@@ -660,6 +800,26 @@ defmodule Kyber.ToolExecutor do
   end
 
   # ── Private helpers ────────────────────────────────────────────────────────
+
+  # Wait for a task result delta matching the given task_id.
+  defp wait_for_task_result(ref, task_id, task_name, timeout_ms) do
+    receive do
+      {:task_delta, ^ref, "task.result", ^task_id, data} ->
+        result = Map.get(data, "result", "")
+        {:ok, "Task '#{task_name}' completed.\nResult: #{inspect(result)}"}
+
+      {:task_delta, ^ref, "task.error", ^task_id, data} ->
+        reason = Map.get(data, "reason", "unknown")
+        {:error, "Task '#{task_name}' failed: #{reason}"}
+
+      # Handle deltas for other tasks — keep waiting
+      {:task_delta, ^ref, _kind, _other_id, _data} ->
+        wait_for_task_result(ref, task_id, task_name, timeout_ms)
+    after
+      timeout_ms ->
+        {:error, "Timed out waiting for task '#{task_name}' result"}
+    end
+  end
 
   # Execute a command via Port with OS process group cleanup on timeout.
   # Starts `sh -c '<cmd>'` and tracks its OS PID. On timeout, sends SIGKILL
@@ -789,7 +949,7 @@ defmodule Kyber.ToolExecutor do
   end
 
   defp vault_path do
-    Application.get_env(:kyber_beam, :vault_path, Path.expand("~/.kyber/vault"))
+    Kyber.Config.get(:vault_path, Path.expand("~/.kyber/vault"))
   end
 
   # Returns true if the expanded path is under one of the allowed write roots.

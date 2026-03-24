@@ -39,6 +39,12 @@ defmodule Kyber.TaskRegistry do
     GenServer.call(pid, {:lookup, name})
   end
 
+  @doc "List all registered task names."
+  @spec list(GenServer.server()) :: [String.t()]
+  def list(pid) do
+    GenServer.call(pid, :list)
+  end
+
   # ── GenServer callbacks ───────────────────────────────────────────────────
 
   @impl true
@@ -56,6 +62,10 @@ defmodule Kyber.TaskRegistry do
       {:ok, fun} -> {:reply, {:ok, fun}, tasks}
       :error -> {:reply, {:error, :not_found}, tasks}
     end
+  end
+
+  def handle_call(:list, _from, tasks) do
+    {:reply, Map.keys(tasks) |> Enum.sort(), tasks}
   end
 
   # ── Built-in tasks ────────────────────────────────────────────────────────
