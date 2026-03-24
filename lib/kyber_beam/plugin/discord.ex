@@ -21,6 +21,8 @@ defmodule Kyber.Plugin.Discord do
   Bot token from `DISCORD_BOT_TOKEN` environment variable or `:discord_bot_token` app config.
   """
 
+  @behaviour Kyber.Plugin.Behaviour
+
   use GenServer
   require Logger
 
@@ -53,11 +55,13 @@ defmodule Kyber.Plugin.Discord do
   # Matches the TypeScript kyber build. Do NOT include GUILD_MEMBERS (2) — it's privileged.
   @gateway_intents 37377
 
+  @impl Kyber.Plugin.Behaviour
   def name, do: "discord"
 
   # ── Public API ────────────────────────────────────────────────────────────
 
   @doc "Start the Discord plugin."
+  @impl Kyber.Plugin.Behaviour
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)

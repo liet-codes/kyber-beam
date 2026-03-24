@@ -195,7 +195,57 @@ defmodule Kyber.ToolExecutorTest do
       assert String.contains?(output, "[exit 1]")
     end
 
-    test "runs allowed command in specified working directory" do
+    test "blocks shell injection via semicolons in allowed commands" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "mix; rm -rf /"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+    test "blocks shell injection via && in allowed commands" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "mix && malicious"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+    test "blocks shell injection via || in allowed commands" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "git || malicious"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+    test "blocks shell injection via pipe in allowed commands" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "mix | malicious"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+    test "blocks shell injection via $() in allowed commands" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "mix$(malicious)"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+    test "blocks shell injection via backticks in allowed commands" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "mix `malicious`"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+    test "blocks shell injection via newline in allowed commands" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "mix\nrm -rf /"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+    test "blocks shell injection via file redirection" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "ls > /tmp/leak"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+    test "blocks shell injection via input redirection" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "cat < /etc/passwd"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+    test "blocks shell injection via brace expansion" do
+      assert {:error, msg} = ToolExecutor.execute("exec", %{"command" => "ls {/etc,/tmp}"})
+      assert String.contains?(msg, "shell operators")
+    end
+
+        test "runs allowed command in specified working directory" do
       workdir = @tmp_dir
       # `ls` respects the working directory
       assert {:ok, _output} = ToolExecutor.execute("exec", %{
@@ -205,8 +255,8 @@ defmodule Kyber.ToolExecutorTest do
     end
 
     test "captures stderr via stderr_to_stdout for allowed commands" do
-      # cat on a non-existent file prints to stderr
-      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "cat /nonexistent_file_xyz 2>&1"})
+      # cat on a non-existent file prints to stderr; Port's :stderr_to_stdout captures it
+      assert {:ok, output} = ToolExecutor.execute("exec", %{"command" => "cat /nonexistent_file_xyz"})
       assert is_binary(output)
     end
 

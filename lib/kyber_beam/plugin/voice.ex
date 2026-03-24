@@ -30,6 +30,8 @@ defmodule Kyber.Plugin.Voice do
       }
   """
 
+  @behaviour Kyber.Plugin.Behaviour
+
   use GenServer
   require Logger
 
@@ -46,10 +48,12 @@ defmodule Kyber.Plugin.Voice do
 
   # ── Plugin behaviour ──────────────────────────────────────────────────────
 
+  @impl Kyber.Plugin.Behaviour
   def name, do: "voice"
 
   # ── Public API ────────────────────────────────────────────────────────────
 
+  @impl Kyber.Plugin.Behaviour
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)

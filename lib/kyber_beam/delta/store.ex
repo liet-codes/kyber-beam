@@ -354,27 +354,25 @@ defmodule Kyber.Delta.Store do
   defp apply_limit(deltas, nil), do: deltas
   defp apply_limit(deltas, limit), do: Enum.take(deltas, limit)
 
-  # Broadcast to all subscribers via supervised Tasks so that:
-  # 1. A crashing callback cannot crash the store
-  # 2. Callbacks don't block the store GenServer
-  # 3. Crashes are logged rather than silently swallowed
-  defp broadcast(%{subs: subs, task_sup: task_sup}, delta) do
+  # Broadcast to all subscribers sequentially to preserve delta ordering.
+  #
+  # Previously used Task.Supervisor/Task.start per subscriber, but independent
+  # Tasks can be scheduled out-of-order under load, causing subscribers to
+  # observe deltas in wrong order. Sequential dispatch guarantees FIFO ordering
+  # for all subscribers. Crash isolation is preserved via try/rescue per callback.
+  #
+  # This briefly blocks the GenServer during broadcast, but subscriber callbacks
+  # should be lightweight (GenServer.cast, send, etc.). If a callback is slow,
+  # it should offload work internally rather than blocking here.
+  defp broadcast(%{subs: subs}, delta) do
     Enum.each(subs, fn {_id, callback_fn} ->
-      wrapped = fn ->
-        try do
-          callback_fn.(delta)
-        rescue
-          e ->
-            Logger.error(
-              "[Kyber.Delta.Store] subscriber callback raised: #{inspect(e)}"
-            )
-        end
-      end
-
-      if task_sup do
-        Task.Supervisor.start_child(task_sup, wrapped)
-      else
-        Task.start(wrapped)
+      try do
+        callback_fn.(delta)
+      rescue
+        e ->
+          Logger.error(
+            "[Kyber.Delta.Store] subscriber callback raised: #{inspect(e)}"
+          )
       end
     end)
   end

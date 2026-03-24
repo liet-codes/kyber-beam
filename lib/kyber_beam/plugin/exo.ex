@@ -33,6 +33,8 @@ defmodule Kyber.Plugin.Exo do
       end
   """
 
+  @behaviour Kyber.Plugin.Behaviour
+
   use GenServer
   require Logger
 
@@ -49,11 +51,13 @@ defmodule Kyber.Plugin.Exo do
 
   # ── Plugin behaviour ──────────────────────────────────────────────────────
 
+  @impl Kyber.Plugin.Behaviour
   def name, do: "exo"
 
   # ── Public API ────────────────────────────────────────────────────────────
 
   @doc "Start the Exo bridge plugin."
+  @impl Kyber.Plugin.Behaviour
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
