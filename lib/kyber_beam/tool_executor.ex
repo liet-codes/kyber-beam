@@ -211,20 +211,37 @@ defmodule Kyber.ToolExecutor do
 
   # ── memory_write ─────────────────────────────────────────────────────────
 
-  def execute("memory_write", %{"path" => path, "content" => content}) do
+  def execute("memory_write", %{"path" => path, "content" => content} = input) do
     # Reject paths with ".." components or absolute paths to prevent traversal
     if String.contains?(path, "..") or String.starts_with?(path, "/") do
       {:error, "invalid vault path: must be relative with no '..' components"}
     else
-      normalized = path
-      abs_path = Path.join(vault_path(), normalized)
+      reason = Map.get(input, "reason", "tool: memory_write")
 
-      with :ok <- File.mkdir_p(Path.dirname(abs_path)),
-           :ok <- File.write(abs_path, content) do
-        # Trigger async vault reload by touching the file
-        {:ok, "Written #{byte_size(content)} bytes to vault/#{normalized}"}
+      # Emit a memory.add delta instead of writing directly.
+      # The delta flows through: reducer → vault_write effect → Knowledge.put_note
+      delta = Kyber.Delta.new("memory.add", %{
+        "path" => path,
+        "content" => content,
+        "reason" => reason
+      })
+
+      store = Process.whereis(:"Elixir.Kyber.Core.Store")
+
+      if store do
+        Kyber.Delta.Store.append(store, delta)
+        {:ok, "Queued write of #{byte_size(content)} bytes to vault/#{path} (via delta pipeline)"}
       else
-        {:error, reason} -> {:error, "memory_write failed: #{inspect(reason)}"}
+        # Fallback: if delta store isn't running (e.g., in isolated test),
+        # write directly to maintain backwards compatibility
+        abs_path = Path.join(vault_path(), path)
+
+        with :ok <- File.mkdir_p(Path.dirname(abs_path)),
+             :ok <- File.write(abs_path, content) do
+          {:ok, "Written #{byte_size(content)} bytes to vault/#{path}"}
+        else
+          {:error, reason} -> {:error, "memory_write failed: #{inspect(reason)}"}
+        end
       end
     end
   end

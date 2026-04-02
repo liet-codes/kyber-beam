@@ -135,6 +135,8 @@ defmodule Kyber.Effect.Executor do
     message_received
     spawn_task
     web_search
+    vault_write
+    vault_delete
   )a
 
   defp safe_to_atom(t) when t in @known_effect_types, do: String.to_existing_atom(t)

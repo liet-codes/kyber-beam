@@ -63,6 +63,10 @@ defmodule KyberBeam.Application do
         # Phase 3: Knowledge graph
         {Kyber.Knowledge, name: Kyber.Knowledge, vault_path: vault_path},
 
+        # Phase 3: Vault effect handlers (delta-routed memory writes)
+        # Must start after Core and Knowledge — registers :vault_write/:vault_delete handlers
+        {Task, fn -> Kyber.Memory.VaultEffects.register(Kyber.Core, Kyber.Knowledge) end},
+
         # Phase 3: Cron scheduler
         {Kyber.Cron,
          name: Kyber.Cron,
@@ -85,7 +89,19 @@ defmodule KyberBeam.Application do
   defp web_children do
     if Application.get_env(:kyber_beam, :start_web, false) do
       port = Application.get_env(:kyber_beam, :port, 4000)
-      [{Kyber.Web.Server, port: port}]
+
+      # Try to bind — if port is in use, log warning and skip (non-fatal).
+      # This prevents the entire app from crashing just because the API port
+      # is occupied (e.g., stale BEAM process, race condition on restart).
+      case :gen_tcp.listen(port, [:binary, active: false, reuseaddr: true]) do
+        {:ok, socket} ->
+          :gen_tcp.close(socket)
+          [{Kyber.Web.Server, port: port}]
+
+        {:error, :eaddrinuse} ->
+          Logger.warning("[KyberBeam] API port #{port} in use — skipping Bandit API server (non-fatal)")
+          []
+      end
     else
       []
     end

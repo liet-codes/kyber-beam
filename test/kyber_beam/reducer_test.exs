@@ -222,4 +222,72 @@ defmodule Kyber.ReducerTest do
     assert new_state == state
     assert effects == []
   end
+
+  # ── Delta-routed memory writes ─────────────────────────────────────────
+
+  test "memory.add emits vault_write effect with correct path/content" do
+    state = empty_state()
+    delta = Delta.new("memory.add", %{
+      "path" => "people/myk.md",
+      "content" => "# Myk\nSoftware engineer.",
+      "reason" => "Extracted from conversation"
+    })
+    {new_state, effects} = Reducer.reduce(state, delta)
+
+    assert new_state == state
+    assert length(effects) == 1
+    effect = hd(effects)
+    assert effect.type == :vault_write
+    assert effect.path == "people/myk.md"
+    assert effect.content == "# Myk\nSoftware engineer."
+    assert effect.reason == "Extracted from conversation"
+  end
+
+  test "memory.update emits vault_write effect" do
+    state = empty_state()
+    delta = Delta.new("memory.update", %{
+      "path" => "people/myk.md",
+      "content" => "# Myk\nUpdated info.",
+      "reason" => "Updated preference"
+    })
+    {new_state, effects} = Reducer.reduce(state, delta)
+
+    assert new_state == state
+    assert length(effects) == 1
+    effect = hd(effects)
+    assert effect.type == :vault_write
+    assert effect.path == "people/myk.md"
+    assert effect.content == "# Myk\nUpdated info."
+    assert effect.reason == "Updated preference"
+  end
+
+  test "memory.delete emits vault_delete effect" do
+    state = empty_state()
+    delta = Delta.new("memory.delete", %{
+      "path" => "people/old-contact.md",
+      "reason" => "No longer relevant"
+    })
+    {new_state, effects} = Reducer.reduce(state, delta)
+
+    assert new_state == state
+    assert length(effects) == 1
+    effect = hd(effects)
+    assert effect.type == :vault_delete
+    assert effect.path == "people/old-contact.md"
+    assert effect.reason == "No longer relevant"
+  end
+
+  test "vault.written and vault.deleted are informational (no effects)" do
+    state = empty_state()
+
+    d1 = Delta.new("vault.written", %{"path" => "people/myk.md", "ts" => 123})
+    {s1, e1} = Reducer.reduce(state, d1)
+    assert s1 == state
+    assert e1 == []
+
+    d2 = Delta.new("vault.deleted", %{"path" => "people/old.md", "ts" => 456})
+    {s2, e2} = Reducer.reduce(state, d2)
+    assert s2 == state
+    assert e2 == []
+  end
 end

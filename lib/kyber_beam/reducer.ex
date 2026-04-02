@@ -108,11 +108,22 @@ defmodule Kyber.Reducer do
 
     reply_to = Map.get(delta.payload, "reply_to_message_id")
 
+    # If streaming or tool preview created a preview message, edit it instead of posting new.
+    # Priority: streaming preview > tool preview (tool preview is set via persistent_term)
+    streaming_msg_id =
+      Map.get(delta.payload, "streaming_message_id") ||
+        get_and_clear_tool_preview(channel_id)
+
     effects =
       if channel_id && content != "" do
         send_payload =
           %{"channel_id" => channel_id, "content" => content}
           |> then(fn p -> if reply_to, do: Map.put(p, "reply_to", reply_to), else: p end)
+          |> then(fn p ->
+            if streaming_msg_id,
+              do: Map.put(p, "edit_message_id", streaming_msg_id),
+              else: p
+          end)
 
         [%{
           type: :send_message,
@@ -136,7 +147,43 @@ defmodule Kyber.Reducer do
     }
 
     new_state = Kyber.State.add_error(state, error)
-    {new_state, []}
+
+    # Send error to Discord so the user sees what went wrong
+    channel_id =
+      case delta.origin do
+        {:channel, "discord", cid, _} -> cid
+        _ -> Map.get(delta.payload, "channel_id")
+      end
+
+    error_msg = Map.get(delta.payload, "error", "Unknown error")
+    status = Map.get(delta.payload, "status", 0)
+
+    effects =
+      if channel_id do
+        content = "⚠️ **Error** (#{status}): #{String.slice(error_msg, 0, 500)}"
+
+        # Check for tool preview to edit instead of posting new
+        preview_msg_id = get_and_clear_tool_preview(channel_id)
+
+        send_payload =
+          %{"channel_id" => channel_id, "content" => content}
+          |> then(fn p ->
+            if preview_msg_id,
+              do: Map.put(p, "edit_message_id", preview_msg_id),
+              else: p
+          end)
+
+        [%{
+          type: :send_message,
+          delta_id: delta.id,
+          origin: delta.origin,
+          payload: send_payload
+        }]
+      else
+        []
+      end
+
+    {new_state, effects}
   end
 
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "plugin.loaded"} = delta) do
@@ -223,7 +270,69 @@ defmodule Kyber.Reducer do
     {state, []}
   end
 
+  # ── Delta-routed memory writes ───────────────────────────────────────────
+  # memory.add and memory.update both emit :vault_write effects.
+  # memory.delete emits a :vault_delete effect.
+  # The reducer is pure — actual I/O happens in the effect handlers.
+
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: kind} = delta)
+      when kind in ["memory.add", "memory.update"] do
+    path = Map.get(delta.payload, "path", "")
+    content = Map.get(delta.payload, "content", "")
+    reason = Map.get(delta.payload, "reason", "")
+
+    effects = [
+      %{
+        type: :vault_write,
+        delta_id: delta.id,
+        path: path,
+        content: content,
+        reason: reason
+      }
+    ]
+
+    {state, effects}
+  end
+
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "memory.delete"} = delta) do
+    path = Map.get(delta.payload, "path", "")
+    reason = Map.get(delta.payload, "reason", "")
+
+    effects = [
+      %{
+        type: :vault_delete,
+        delta_id: delta.id,
+        path: path,
+        reason: reason
+      }
+    ]
+
+    {state, effects}
+  end
+
+  # Confirmation deltas — informational only, no effects.
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: kind})
+      when kind in ["vault.written", "vault.deleted"] do
+    {state, []}
+  end
+
   def reduce(%Kyber.State{} = state, %Kyber.Delta{}) do
     {state, []}
+  end
+
+  # Retrieve and clear tool preview message ID stored by the tool loop.
+  # Returns nil if no preview exists for this channel.
+  defp get_and_clear_tool_preview(nil), do: nil
+
+  defp get_and_clear_tool_preview(channel_id) do
+    key = {:tool_preview_msg, channel_id}
+
+    try do
+      msg_id = :persistent_term.get(key)
+      :persistent_term.erase(key)
+      msg_id
+    rescue
+      ArgumentError -> nil
+    end
   end
 end
