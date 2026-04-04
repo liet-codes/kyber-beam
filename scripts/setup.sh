@@ -216,7 +216,7 @@ if [[ -f "${AGENT_SDK_DIR}/package.json" ]]; then
   npm install
   success "Agent SDK bridge dependencies installed"
 else
-  warn "Agent SDK bridge not found at ${AGENT_SDK_DIR} — skipping"
+  warn "Agent SDK bridge not found at ${AGENT_SDK_DIR} -- skipping"
 fi
 
 # ── 8. Default config ─────────────────────────────────────────────────────
@@ -251,58 +251,114 @@ fi
 if [[ -n "$IMPORT_OPENCLAW" ]]; then
   step "Importing OpenClaw vault"
 
-  IDENTITY_DIR="${VAULT_DIR}/identity"
-  MEMORY_DIR="${VAULT_DIR}/memory"
-  mkdir -p "$IDENTITY_DIR" "$MEMORY_DIR"
-
   TMPDIR_IMPORT=$(mktemp -d)
   trap 'rm -rf "$TMPDIR_IMPORT"' EXIT
 
   info "Extracting $IMPORT_OPENCLAW..."
   unzip -o -q "$IMPORT_OPENCLAW" -d "$TMPDIR_IMPORT"
 
-  # Find and copy identity files (may be nested in subdirectories)
-  for f in SOUL.md MEMORY.md USER.md TOOLS.md IDENTITY.md; do
-    found=$(find "$TMPDIR_IMPORT" -name "$f" -type f | head -1)
-    if [[ -n "$found" ]]; then
-      cp "$found" "$IDENTITY_DIR/$f"
-      success "  Imported $f → identity/$f"
-    else
-      warn "  $f not found in archive"
-    fi
-  done
+  # Detect vault layout: multi-agent if agents/ or shared/ exists
+  if [[ -d "${VAULT_DIR}/agents" || -d "${VAULT_DIR}/shared" ]]; then
+    AGENT_NAME="${OPENCLAW_AGENT_NAME:-liet}"
+    AGENT_DIR="${VAULT_DIR}/agents/${AGENT_NAME}"
+    SHARED_DIR="${VAULT_DIR}/shared"
+    mkdir -p "$AGENT_DIR/memory" "$SHARED_DIR"/{concepts,people,projects}
 
-  # Find and copy memory files
-  memory_src=$(find "$TMPDIR_IMPORT" -type d -name "memory" | head -1)
-  if [[ -n "$memory_src" ]]; then
-    find "$memory_src" -name "*.md" -type f | while read -r mf; do
-      basename_f=$(basename "$mf")
-      cp "$mf" "$MEMORY_DIR/$basename_f"
-      success "  Imported memory/$basename_f"
+    info "Multi-agent layout detected (agent: ${AGENT_NAME})"
+
+    # Identity files to agent dir
+    for f in SOUL.md MEMORY.md TOOLS.md IDENTITY.md AGENTS.md; do
+      found=$(find "$TMPDIR_IMPORT" -name "$f" -type f | head -1)
+      if [[ -n "$found" ]]; then
+        cp "$found" "$AGENT_DIR/$f"
+        success "  Imported $f -> agents/${AGENT_NAME}/$f"
+      fi
     done
-  else
-    warn "  No memory/ directory found in archive"
-  fi
 
-  success "OpenClaw import complete → ${VAULT_DIR}"
+    # USER.md to shared (same human for both agents)
+    found_user=$(find "$TMPDIR_IMPORT" -name "USER.md" -type f | head -1)
+    if [[ -n "$found_user" ]]; then
+      cp "$found_user" "$SHARED_DIR/USER.md"
+      success "  Imported USER.md -> shared/USER.md"
+    fi
+
+    # Memory files to agent memory dir
+    memory_src=$(find "$TMPDIR_IMPORT" -type d -name "memory" | head -1)
+    if [[ -n "$memory_src" ]]; then
+      find "$memory_src" -name "*.md" -type f | while read -r mf; do
+        basename_f=$(basename "$mf")
+        cp "$mf" "$AGENT_DIR/memory/$basename_f"
+        success "  Imported memory/$basename_f -> agents/${AGENT_NAME}/memory/$basename_f"
+      done
+    fi
+
+    # Shared dirs: concepts, people, projects
+    for dir_name in concepts people projects; do
+      dir_src=$(find "$TMPDIR_IMPORT" -type d -name "$dir_name" | head -1)
+      if [[ -n "$dir_src" ]]; then
+        find "$dir_src" -name "*.md" -type f | while read -r sf; do
+          basename_f=$(basename "$sf")
+          cp "$sf" "$SHARED_DIR/$dir_name/$basename_f"
+          success "  Imported $dir_name/$basename_f -> shared/$dir_name/$basename_f"
+        done
+      fi
+    done
+
+    success "OpenClaw import complete -> ${VAULT_DIR} (agent: ${AGENT_NAME})"
+  else
+    # Legacy layout
+    IDENTITY_DIR="${VAULT_DIR}/identity"
+    MEMORY_DIR="${VAULT_DIR}/memory"
+    mkdir -p "$IDENTITY_DIR" "$MEMORY_DIR"
+
+    for f in SOUL.md MEMORY.md USER.md TOOLS.md IDENTITY.md; do
+      found=$(find "$TMPDIR_IMPORT" -name "$f" -type f | head -1)
+      if [[ -n "$found" ]]; then
+        cp "$found" "$IDENTITY_DIR/$f"
+        success "  Imported $f -> identity/$f"
+      else
+        warn "  $f not found in archive"
+      fi
+    done
+
+    memory_src=$(find "$TMPDIR_IMPORT" -type d -name "memory" | head -1)
+    if [[ -n "$memory_src" ]]; then
+      find "$memory_src" -name "*.md" -type f | while read -r mf; do
+        basename_f=$(basename "$mf")
+        cp "$mf" "$MEMORY_DIR/$basename_f"
+        success "  Imported memory/$basename_f"
+      done
+    else
+      warn "  No memory/ directory found in archive"
+    fi
+
+    success "OpenClaw import complete -> ${VAULT_DIR}"
+  fi
 fi
 
 # ── 10. Import: Kyber vault ───────────────────────────────────────────────
 if [[ -n "$IMPORT_KYBER" ]]; then
   step "Importing Kyber vault"
 
-  info "Extracting $IMPORT_KYBER → ${VAULT_DIR}..."
-  mkdir -p "$VAULT_DIR"
-  unzip -o -q "$IMPORT_KYBER" -d "$VAULT_DIR"
+  if [[ -d "${VAULT_DIR}/agents" || -d "${VAULT_DIR}/shared" ]]; then
+    AGENT_NAME="${KYBER_AGENT_NAME:-stilgar}"
+    info "Multi-agent layout detected -- importing via mix task (agent: ${AGENT_NAME})"
+    cd "$REPO_DIR"
+    mix kyber.import.kyber "$IMPORT_KYBER" --agent-name "$AGENT_NAME"
+  else
+    info "Extracting $IMPORT_KYBER -> ${VAULT_DIR}..."
+    mkdir -p "$VAULT_DIR"
+    unzip -o -q "$IMPORT_KYBER" -d "$VAULT_DIR"
+  fi
 
-  success "Kyber vault import complete → ${VAULT_DIR}"
+  success "Kyber vault import complete -> ${VAULT_DIR}"
 fi
 
 # ── Done ───────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}${BOLD}║          kyber-beam setup complete!                  ║${NC}"
-echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
+echo -e "${GREEN}${BOLD}+======================================================+${NC}"
+echo -e "${GREEN}${BOLD}|          kyber-beam setup complete!                   |${NC}"
+echo -e "${GREEN}${BOLD}+======================================================+${NC}"
 echo ""
 echo -e "  ${BOLD}To start kyber-beam:${NC}"
 echo ""

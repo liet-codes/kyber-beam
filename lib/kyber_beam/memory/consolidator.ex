@@ -70,7 +70,7 @@ defmodule Kyber.Memory.Consolidator do
   }
 
   @pool_path "~/.kyber/memory_pool.jsonl"
-  @memory_md_path "~/.kyber/vault/identity/MEMORY.md"
+  @legacy_memory_md_path "~/.kyber/vault/identity/MEMORY.md"
   @anthropic_url "https://api.anthropic.com/v1/messages"
   @max_memory_chars 8_000
 
@@ -141,7 +141,7 @@ defmodule Kyber.Memory.Consolidator do
   def init(opts) do
     config = build_config(opts)
     pool_path = Keyword.get(opts, :pool_path, @pool_path) |> Path.expand()
-    memory_md_path = Keyword.get(opts, :memory_md_path, @memory_md_path) |> Path.expand()
+    memory_md_path = Keyword.get(opts, :memory_md_path, default_memory_md_path()) |> Path.expand()
     core = Keyword.get(opts, :core, Kyber.Core)
     knowledge = Keyword.get(opts, :knowledge, Kyber.Knowledge)
 
@@ -997,4 +997,21 @@ defmodule Kyber.Memory.Consolidator do
   end
 
   defp tag_summary(tags), do: inspect(tags)
+
+  defp default_memory_md_path do
+    vault_dir = Path.expand("~/.kyber/vault")
+    agent_name = try do
+      Kyber.Config.get(:agent_name, "stilgar")
+    rescue
+      _ -> "stilgar"
+    end
+
+    case Kyber.Knowledge.detect_vault_layout(vault_dir) do
+      :multi_agent ->
+        Path.join([vault_dir, "agents", agent_name, "MEMORY.md"])
+
+      :legacy ->
+        @legacy_memory_md_path
+    end
+  end
 end

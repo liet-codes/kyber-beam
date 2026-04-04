@@ -123,6 +123,18 @@ defmodule Kyber.Knowledge do
     GenServer.call(server, :vault_path)
   end
 
+  @doc "Return the agent name this server is configured for."
+  @spec agent_name(GenServer.server()) :: String.t()
+  def agent_name(server \\ __MODULE__) do
+    GenServer.call(server, :agent_name)
+  end
+
+  @doc "Return :multi_agent or :legacy layout."
+  @spec vault_layout(GenServer.server()) :: :multi_agent | :legacy
+  def vault_layout(server \\ __MODULE__) do
+    GenServer.call(server, :vault_layout)
+  end
+
   @doc "Return the number of notes currently loaded."
   @spec note_count(GenServer.server()) :: non_neg_integer()
   def note_count(server \\ __MODULE__) do
@@ -153,10 +165,14 @@ defmodule Kyber.Knowledge do
   def init(opts) do
     vault_dir = Keyword.get(opts, :vault_path, default_vault_path())
     poll_interval = Keyword.get(opts, :poll_interval, @poll_interval_ms)
+    agent_name = Keyword.get(opts, :agent_name) || default_agent_name()
+    layout = detect_vault_layout(vault_dir)
 
     state = %{
       vault_path: vault_dir,
       poll_interval: poll_interval,
+      agent_name: agent_name,
+      vault_layout: layout,
       notes: %{},          # path → note map
       link_graph: %{},     # path → [linked paths]
       file_mtimes: %{},    # rel_path → mtime (for incremental reloads)
@@ -184,7 +200,11 @@ defmodule Kyber.Knowledge do
 
   @impl true
   def handle_call({:get_note, path}, _from, state) do
-    case Map.get(state.notes, normalize_path(path)) do
+    normalized = normalize_path(path)
+
+    note = resolve_note(normalized, state)
+
+    case note do
       nil -> {:reply, {:error, :not_found}, state}
       note -> {:reply, {:ok, note}, state}
     end
@@ -192,20 +212,21 @@ defmodule Kyber.Knowledge do
 
   def handle_call({:put_note, path, frontmatter, body}, _from, state) do
     normalized = normalize_path(path)
-    abs_path = Path.join(state.vault_path, normalized)
+    storage_path = resolve_put_path(normalized, state)
+    abs_path = Path.join(state.vault_path, storage_path)
 
     with :ok <- File.mkdir_p(Path.dirname(abs_path)),
          content = serialize_note(frontmatter, body),
          :ok <- File.write(abs_path, content) do
-      note = build_note(normalized, frontmatter, body)
+      note = build_note(storage_path, frontmatter, body)
       wikilinks = extract_wikilinks(body)
       note = Map.put(note, :wikilinks, wikilinks)
 
-      new_notes = Map.put(state.notes, normalized, note)
-      new_graph = Map.put(state.link_graph, normalized, wikilinks)
+      new_notes = Map.put(state.notes, storage_path, note)
+      new_graph = Map.put(state.link_graph, storage_path, wikilinks)
 
       # Update mtime so next poll skips this file
-      new_mtimes = Map.put(state.file_mtimes, normalized, get_mtime(abs_path))
+      new_mtimes = Map.put(state.file_mtimes, storage_path, get_mtime(abs_path))
 
       {:reply, :ok, %{state | notes: new_notes, link_graph: new_graph, file_mtimes: new_mtimes}}
     else
@@ -272,7 +293,9 @@ defmodule Kyber.Knowledge do
   end
 
   def handle_call({:get_tiered, path, tier}, _from, state) do
-    case Map.get(state.notes, normalize_path(path)) do
+    normalized = normalize_path(path)
+
+    case resolve_note(normalized, state) do
       nil ->
         {:reply, {:error, :not_found}, state}
 
@@ -284,6 +307,14 @@ defmodule Kyber.Knowledge do
 
   def handle_call(:vault_path, _from, state) do
     {:reply, state.vault_path, state}
+  end
+
+  def handle_call(:agent_name, _from, state) do
+    {:reply, state.agent_name, state}
+  end
+
+  def handle_call(:vault_layout, _from, state) do
+    {:reply, state.vault_layout, state}
   end
 
   def handle_call(:note_count, _from, state) do
@@ -325,10 +356,12 @@ defmodule Kyber.Knowledge do
     server = self()
     vault_dir = state.vault_path
     old_mtimes = state.file_mtimes
+    layout = state.vault_layout
+    agent_name = state.agent_name
 
     {_pid, ref} = spawn_monitor(fn ->
       if File.dir?(vault_dir) do
-        result = read_changed_notes(vault_dir, old_mtimes)
+        result = read_changed_notes(vault_dir, old_mtimes, layout: layout, agent_name: agent_name)
         send(server, {:reload_complete, result})
       end
     end)
@@ -389,6 +422,76 @@ defmodule Kyber.Knowledge do
     Path.expand("~/.kyber/vault")
   end
 
+  defp default_agent_name do
+    try do
+      Kyber.Config.get(:agent_name, "stilgar")
+    rescue
+      _ -> "stilgar"
+    end
+  end
+
+  @doc false
+  def detect_vault_layout(vault_dir) do
+    cond do
+      File.dir?(Path.join(vault_dir, "agents")) -> :multi_agent
+      File.dir?(Path.join(vault_dir, "shared")) -> :multi_agent
+      true -> :legacy
+    end
+  end
+
+  # Resolve a note lookup path to the actual stored path.
+  # In legacy layout, paths are used as-is.
+  # In multi-agent layout:
+  #   - "SOUL.md" → "agents/<agent>/SOUL.md" (agent-relative)
+  #   - "memory/2026-03-20.md" → "agents/<agent>/memory/2026-03-20.md"
+  #   - "concepts/foo.md" → "shared/concepts/foo.md"
+  #   - "agents/liet/SOUL.md" → used as-is (explicit cross-agent)
+  #   - "shared/concepts/foo.md" → used as-is (explicit shared)
+  defp resolve_note(normalized, %{vault_layout: :legacy} = state) do
+    Map.get(state.notes, normalized)
+  end
+
+  defp resolve_note(normalized, state) do
+    # 1. Direct match (works for full paths like "shared/concepts/foo.md" or "agents/liet/SOUL.md")
+    case Map.get(state.notes, normalized) do
+      nil ->
+        # 2. Try as agent-relative path: "SOUL.md" → "agents/<agent>/SOUL.md"
+        agent_path = Path.join(["agents", state.agent_name, normalized])
+        case Map.get(state.notes, agent_path) do
+          nil ->
+            # 3. Try as shared path: "concepts/foo.md" → "shared/concepts/foo.md"
+            shared_path = Path.join("shared", normalized)
+            Map.get(state.notes, shared_path)
+          note -> note
+        end
+      note -> note
+    end
+  end
+
+  # Resolve where to store a note on put.
+  # In legacy layout, paths are used as-is.
+  # In multi-agent layout, route based on content type:
+  #   - Already prefixed with "shared/" or "agents/" → use as-is
+  #   - Identity/memory-like paths → agents/<agent>/<path>
+  #   - Shared types (concepts/, people/, projects/) → shared/<path>
+  defp resolve_put_path(normalized, %{vault_layout: :legacy}), do: normalized
+
+  defp resolve_put_path(normalized, state) do
+    cond do
+      # Already has explicit prefix
+      String.starts_with?(normalized, "shared/") -> normalized
+      String.starts_with?(normalized, "agents/") -> normalized
+
+      # Shared note types
+      String.starts_with?(normalized, "concepts/") -> Path.join("shared", normalized)
+      String.starts_with?(normalized, "people/") -> Path.join("shared", normalized)
+      String.starts_with?(normalized, "projects/") -> Path.join("shared", normalized)
+
+      # Everything else goes under the agent dir
+      true -> Path.join(["agents", state.agent_name, normalized])
+    end
+  end
+
   defp schedule_poll(0), do: :ok
 
   defp schedule_poll(interval) do
@@ -398,7 +501,7 @@ defmodule Kyber.Knowledge do
   # Synchronous full load — used only at startup
   defp load_vault_sync(%{vault_path: vault_dir} = state) do
     if File.dir?(vault_dir) do
-      {notes, graph, mtimes} = read_all_notes(vault_dir)
+      {notes, graph, mtimes} = read_all_notes(vault_dir, state)
       %{state | notes: notes, link_graph: graph, file_mtimes: mtimes}
     else
       state
@@ -406,8 +509,24 @@ defmodule Kyber.Knowledge do
   end
 
   # Read ALL notes (used at startup); returns {notes, graph, mtimes}
-  defp read_all_notes(vault_dir) do
-    md_files = Path.wildcard(Path.join([vault_dir, "**", "*.md"]))
+  defp read_all_notes(vault_dir, %{vault_layout: :legacy}) do
+    scan_md_files(vault_dir, vault_dir)
+  end
+
+  defp read_all_notes(vault_dir, %{vault_layout: :multi_agent, agent_name: agent_name}) do
+    shared_dir = Path.join(vault_dir, "shared")
+    agent_dir = Path.join([vault_dir, "agents", agent_name])
+
+    # Scan shared/ and agents/<agent_name>/
+    dirs = [shared_dir, agent_dir] |> Enum.filter(&File.dir?/1)
+
+    Enum.reduce(dirs, {%{}, %{}, %{}}, fn dir, acc ->
+      merge_scan(acc, scan_md_files(dir, vault_dir))
+    end)
+  end
+
+  defp scan_md_files(dir, vault_dir) do
+    md_files = Path.wildcard(Path.join([dir, "**", "*.md"]))
 
     Enum.reduce(md_files, {%{}, %{}, %{}}, fn abs_path, {notes, graph, mtimes} ->
       rel_path = Path.relative_to(abs_path, vault_dir)
@@ -427,10 +546,30 @@ defmodule Kyber.Knowledge do
     end)
   end
 
+  defp merge_scan({n1, g1, m1}, {n2, g2, m2}) do
+    {Map.merge(n1, n2), Map.merge(g1, g2), Map.merge(m1, m2)}
+  end
+
+  defp scan_dirs_for_md(vault_dir, :legacy, _agent_name) do
+    Path.wildcard(Path.join([vault_dir, "**", "*.md"]))
+  end
+
+  defp scan_dirs_for_md(vault_dir, :multi_agent, agent_name) do
+    shared_dir = Path.join(vault_dir, "shared")
+    agent_dir = Path.join([vault_dir, "agents", agent_name])
+
+    [shared_dir, agent_dir]
+    |> Enum.filter(&File.dir?/1)
+    |> Enum.flat_map(fn dir -> Path.wildcard(Path.join([dir, "**", "*.md"])) end)
+  end
+
   # Incremental reload — only re-reads files whose mtime changed.
   # Returns {changed_notes, changed_graph, new_full_mtimes, deleted_paths}
-  defp read_changed_notes(vault_dir, old_mtimes) do
-    md_files = Path.wildcard(Path.join([vault_dir, "**", "*.md"]))
+  defp read_changed_notes(vault_dir, old_mtimes, opts) do
+    layout = Keyword.get(opts, :layout, :legacy)
+    agent_name = Keyword.get(opts, :agent_name, "stilgar")
+
+    md_files = scan_dirs_for_md(vault_dir, layout, agent_name)
 
     # Build updated mtime map and collect changed files
     {new_mtimes, changed_files} =
