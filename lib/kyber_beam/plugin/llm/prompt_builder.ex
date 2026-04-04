@@ -125,6 +125,19 @@ defmodule Kyber.Plugin.LLM.PromptBuilder do
           ""
       end
 
+    # Step 4: Current date/time — LLMs have no clock
+    now = DateTime.utc_now()
+    # Shift to ET manually (-4 EDT, -5 EST). Good enough — add tzdata dep later for precision.
+    offset_hours = if now.month in 3..10, do: -4, else: -5
+    eastern = DateTime.add(now, offset_hours * 3600, :second)
+    tz_label = if offset_hours == -4, do: "EDT", else: "EST"
+    date_context = """
+
+## Current Date & Time
+#{Calendar.strftime(eastern, "%A, %B %-d, %Y — %-I:%M %p")} #{tz_label}
+UTC: #{Calendar.strftime(now, "%Y-%m-%d %H:%M")}
+"""
+
     capabilities_note = """
 
 ## Your Capabilities
@@ -151,7 +164,7 @@ Confabulating a plausible-sounding answer when you have files you didn't check i
 """
 
     (soul_content || "") <>
-      long_term_memory <> memory_context <> capabilities_note <> vault_instruction
+      date_context <> long_term_memory <> memory_context <> capabilities_note <> vault_instruction
   end
 
   # ── Public: Memory reinforcement ──────────────────────────────────────────
