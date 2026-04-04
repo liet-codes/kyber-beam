@@ -220,6 +220,16 @@ defmodule Kyber.Plugin.LLM.ApiClient do
 
   # ── Private: Streaming ────────────────────────────────────────────────────
 
+  # Overall hard timeout for a streaming call (covers the entire stream, not per-chunk)
+  @streaming_overall_timeout_ms 90_000
+
+  # Throttle Discord streaming preview edits to at most once per 2 seconds
+  @streaming_preview_throttle_ms 2_000
+
+  # Process-dict keys used inside the streaming Task
+  @streaming_discord_msg_key :__kyber_streaming_discord_msg__
+  @streaming_discord_last_edit_key :__kyber_streaming_discord_last_edit__
+
   defp do_streaming_call(auth_config, params, core, origin, parent_id) do
     alias Kyber.Plugin.LLM.ToolLoop
 
@@ -231,10 +241,17 @@ defmodule Kyber.Plugin.LLM.ApiClient do
     model = body["model"] || @default_model
     headers = maybe_add_computer_use_header(headers, tools, model)
 
-    # Enable extended thinking if configured
+    # Enable extended thinking if configured.
+    # IMPORTANT: Disable thinking when computer_use tools are present —
+    # Anthropic's API returns stop_reason=tool_use but with empty tool blocks
+    # when thinking is enabled alongside computer_use, causing silent failures.
+    has_computer_use = Enum.any?(tools, fn t ->
+      (t["name"] || "") in ["computer", "computer_use"]
+    end)
+
     body =
-      case Kyber.Config.get(:llm_thinking, true) do
-        true ->
+      case {Kyber.Config.get(:llm_thinking, true), has_computer_use} do
+        {true, false} ->
           budget = Kyber.Config.get(:thinking_budget_tokens, 10_000)
           current_max = body["max_tokens"]
           new_max = max(current_max, budget + @default_max_tokens)
@@ -244,24 +261,34 @@ defmodule Kyber.Plugin.LLM.ApiClient do
           |> Map.put("max_tokens", new_max)
           |> Map.delete("temperature")
 
+        {true, true} ->
+          Logger.info("[LLM] computer_use tools detected — disabling thinking for compatibility")
+          body
+
         _ ->
           body
       end
 
-    # Accumulate text for stream_chunk emissions
+    # Refs used as keys in the task's process dict (defined outside so callback closure captures them)
     chunk_acc_ref = make_ref()
-    Process.put(chunk_acc_ref, "")
-
-    # Accumulate thinking text for reasoning trace
     thinking_acc_ref = make_ref()
-    Process.put(thinking_acc_ref, "")
 
+    # Discord channel ID — only set for Discord origins (used for streaming preview)
+    discord_channel_id =
+      case origin do
+        {:channel, "discord", cid, _} -> cid
+        _ -> nil
+      end
+
+    # chat_id for stream_chunk delta payload (broader: includes human origins)
     chat_id =
       case origin do
         {:channel, _ch, cid, _sender} -> cid
         {:human, user_id} -> user_id
         _ -> nil
       end
+
+    discord_token = get_discord_token()
 
     callback = fn
       {:text_chunk, text} ->
@@ -278,6 +305,11 @@ defmodule Kyber.Plugin.LLM.ApiClient do
             )
 
           ToolLoop.safe_emit(core, stream_delta)
+
+          # Progressive Discord update (throttled)
+          if discord_channel_id && discord_token do
+            update_streaming_preview(discord_token, discord_channel_id, new_text)
+          end
         end
 
       {:thinking_chunk, text} ->
@@ -291,24 +323,133 @@ defmodule Kyber.Plugin.LLM.ApiClient do
         :ok
     end
 
-    case Kyber.Plugin.LLM.Streamer.stream_request(@anthropic_url, body, headers, callback) do
-      {:ok, response} ->
+    # Wrap in Task.async so we can enforce a hard overall timeout (Issue 2).
+    # The callback runs inside the task; streaming message ID is returned via
+    # the task's return value so the parent can thread it through to the final
+    # send_message effect (Issue 1).
+    task =
+      Task.async(fn ->
+        # Initialize accumulators in the task's process dict
+        Process.put(chunk_acc_ref, "")
+        Process.put(thinking_acc_ref, "")
+
+        result = Kyber.Plugin.LLM.Streamer.stream_request(@anthropic_url, body, headers, callback)
+
+        # Capture streaming Discord message ID (if any) before task exits
+        streaming_msg_id = Process.get(@streaming_discord_msg_key)
+        {result, streaming_msg_id}
+      end)
+
+    Logger.info("[LLM] waiting for streaming task (timeout=#{@streaming_overall_timeout_ms}ms)")
+
+    yield_result = Task.yield(task, @streaming_overall_timeout_ms)
+
+    result =
+      case yield_result do
+        nil ->
+          Logger.warning("[LLM] Task.yield returned nil, shutting down task")
+          Task.shutdown(task)
+
+        other ->
+          other
+      end
+
+    Logger.info("[LLM] streaming task result type: #{inspect(elem_safe(result))}")
+
+    case result do
+      {:ok, {{:ok, response}, streaming_msg_id}} ->
+        stop_reason = response["stop_reason"]
+        Logger.info("[LLM] streaming complete, stop_reason=#{stop_reason}")
+
+        # For tool_use intermediate calls, the streaming preview is a dead-end
+        # (the final send comes from a later LLM call). Delete the orphaned
+        # preview so users don't see a dangling ⏳ message.
+        response_with_id =
+          cond do
+            streaming_msg_id && stop_reason == "tool_use" && discord_channel_id && discord_token ->
+              Task.start(fn ->
+                Kyber.Plugin.Discord.delete_message(discord_token, discord_channel_id, streaming_msg_id)
+              end)
+              response
+
+            is_binary(streaming_msg_id) ->
+              # end_turn with a preview → pass ID so final send edits it
+              Map.put(response, "_streaming_message_id", streaming_msg_id)
+
+            true ->
+              response
+          end
+
         thinking = Kyber.Plugin.LLM.Streamer.extract_thinking(response)
-        Logger.info("[LLM] streaming complete, stop_reason=#{response["stop_reason"]}")
 
         if thinking do
           text_content = extract_content(response)
           formatted = format_with_reasoning(text_content, thinking)
           new_content = [%{"type" => "text", "text" => formatted}]
-          {:ok, Map.put(response, "content", new_content)}
+          {:ok, Map.put(response_with_id, "content", new_content)}
         else
-          {:ok, response}
+          {:ok, response_with_id}
         end
 
-      {:error, reason} ->
+      {:ok, {{:error, reason}, _streaming_msg_id}} ->
         Logger.warning("[LLM] streaming failed: #{inspect(reason)}, falling back to sync")
         call_api(auth_config, params)
+
+      {:exit, reason} ->
+        # Task crashed — log it clearly
+        Logger.error("[LLM] streaming task crashed: #{inspect(reason)}")
+        {:error, "streaming task crashed: #{inspect(reason)}"}
+
+      nil ->
+        # Hard timeout — do NOT fall back to sync (it would also hang)
+        Logger.warning("[LLM] streaming timed out after #{@streaming_overall_timeout_ms}ms — aborting")
+        {:error, :timeout}
     end
+  end
+
+  defp elem_safe(nil), do: :timeout
+  defp elem_safe({:ok, _}), do: :ok
+  defp elem_safe({:exit, _}), do: :exit
+  defp elem_safe(other), do: other
+
+  # Send or edit the Discord streaming preview message.
+  # Called from within the streaming Task — uses the task's process dict.
+  defp update_streaming_preview(discord_token, channel_id, text) do
+    preview = String.slice(text, 0, 1900) <> " ⏳"
+    now_ms = System.monotonic_time(:millisecond)
+
+    case Process.get(@streaming_discord_msg_key) do
+      nil ->
+        # First chunk — create an initial preview message
+        case Kyber.Plugin.Discord.post_message_with_id(discord_token, channel_id, preview) do
+          {:ok, msg_id} ->
+            Process.put(@streaming_discord_msg_key, msg_id)
+            Process.put(@streaming_discord_last_edit_key, now_ms)
+
+          {:error, reason} ->
+            Logger.debug("[LLM] streaming preview create failed: #{inspect(reason)}")
+        end
+
+      msg_id ->
+        # Subsequent chunks — throttle edits to once per 2 seconds
+        last_edit = Process.get(@streaming_discord_last_edit_key, 0)
+
+        if now_ms - last_edit >= @streaming_preview_throttle_ms do
+          case Kyber.Plugin.Discord.edit_message(discord_token, channel_id, msg_id, preview) do
+            :ok ->
+              Process.put(@streaming_discord_last_edit_key, now_ms)
+
+            {:error, reason} ->
+              Logger.debug("[LLM] streaming preview edit failed: #{inspect(reason)}")
+          end
+        end
+    end
+  end
+
+  # Look up the Discord bot token the same way the Discord plugin does.
+  defp get_discord_token do
+    System.get_env("DISCORD_BOT_TOKEN") ||
+      Application.get_env(:kyber_beam, :discord_bot_token)
   end
 
   # ── Private: Body building (shared between sync and streaming) ────────────

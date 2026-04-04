@@ -20,7 +20,8 @@ defmodule Kyber.Config do
     {:snap_request_path, "/tmp/snap_request"},
     {:snap_result_path, "/tmp/snap_result"},
     {:discord_token, nil},
-    {:vault_path, Path.expand("~/.kyber/vault")}
+    {:vault_path, Path.expand("~/.kyber/vault")},
+    {:agent_name, "stilgar"}
   ]
 
   @doc "Load all known config keys from Application env into :persistent_term."

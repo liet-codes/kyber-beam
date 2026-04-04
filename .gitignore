@@ -22,3 +22,7 @@ erl_crash.dump
 .vscode/
 priv/vault.old/
 .env
+
+# Essence bundles (personal data)
+essences/
+*.zip

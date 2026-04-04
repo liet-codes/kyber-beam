@@ -155,6 +155,14 @@ defmodule Kyber.Plugin.LLM.ToolLoop do
                   mid -> Map.put(p, "reply_to_message_id", mid)
                 end
               end)
+              |> then(fn p ->
+                # Propagate streaming preview message ID so the final send_message
+                # effect can edit it rather than posting a new message (Issue 1).
+                case Map.get(response, "_streaming_message_id") do
+                  nil -> p
+                  msg_id -> Map.put(p, "streaming_message_id", msg_id)
+                end
+              end)
 
             delta =
               Kyber.Delta.new(
@@ -177,8 +185,14 @@ defmodule Kyber.Plugin.LLM.ToolLoop do
           {:error, %{error: error_msg, status: status}} ->
             emit_error(core, error_msg, status, origin, parent_id)
 
+          {:error, :timeout} ->
+            emit_error(core, "LLM call timed out after 90 seconds", 0, origin, parent_id)
+
           {:error, reason} when is_binary(reason) ->
             emit_error(core, reason, 0, origin, parent_id)
+
+          {:error, reason} ->
+            emit_error(core, inspect(reason), 0, origin, parent_id)
         end
     end
   end
@@ -221,32 +235,42 @@ defmodule Kyber.Plugin.LLM.ToolLoop do
     }
 
     case ApiClient.call_api_maybe_stream(auth_config, params, core, origin, parent_id) do
-      {:ok, %{"stop_reason" => "tool_use", "content" => content_blocks} = _response} ->
+      {:ok, %{"stop_reason" => "tool_use", "content" => content_blocks} = response} ->
         tool_uses = Enum.filter(content_blocks, &(&1["type"] == "tool_use"))
+        tool_names = Enum.map_join(tool_uses, ", ", & &1["name"])
 
         Logger.info(
-          "[Kyber.Plugin.LLM] tool_use: #{length(tool_uses)} call(s): " <>
-            Enum.map_join(tool_uses, ", ", & &1["name"])
+          "[Kyber.Plugin.LLM] tool_use: #{length(tool_uses)} call(s): #{tool_names}"
         )
 
-        assistant_msg = %{"role" => "assistant", "content" => content_blocks}
+        # Edge case: model returned stop_reason=tool_use but no actual tool_use
+        # blocks (happens with extended thinking). Treat as end_turn.
+        if tool_uses == [] do
+          Logger.warning("[LLM] tool_use stop_reason with 0 tool blocks — treating as end_turn")
+          {:ok, Map.put(response, "stop_reason", "end_turn")}
+        else
+          # Send a "working on it" preview to Discord so the user sees activity
+          send_tool_preview(origin, content_blocks, tool_names)
 
-        tool_results =
-          Enum.map(tool_uses, fn tu ->
-            execute_tool(tu, core, origin, parent_id)
-          end)
+          assistant_msg = %{"role" => "assistant", "content" => content_blocks}
 
-        user_result_msg = %{"role" => "user", "content" => tool_results}
+          tool_results =
+            Enum.map(tool_uses, fn tu ->
+              execute_tool(tu, core, origin, parent_id)
+            end)
 
-        run_tool_loop(
-          messages ++ [assistant_msg, user_result_msg],
-          system_prompt,
-          auth_config,
-          core,
-          origin,
-          parent_id,
-          remaining - 1
-        )
+          user_result_msg = %{"role" => "user", "content" => tool_results}
+
+          run_tool_loop(
+            messages ++ [assistant_msg, user_result_msg],
+            system_prompt,
+            auth_config,
+            core,
+            origin,
+            parent_id,
+            remaining - 1
+          )
+        end
 
       {:ok, response} ->
         {:ok, response}
@@ -262,6 +286,55 @@ defmodule Kyber.Plugin.LLM.ToolLoop do
       Kyber.Core.emit(core, delta)
     rescue
       e -> Logger.error("[Kyber.Plugin.LLM] failed to emit delta: #{inspect(e)}")
+    end
+  end
+
+  # Send a tool-use preview to Discord so the user sees what's happening.
+  # Extracts any partial text the model produced before the tool calls,
+  # appends a tool summary line, and posts it with a ⏳ indicator.
+  defp send_tool_preview(origin, content_blocks, tool_names) do
+    channel_id =
+      case origin do
+        {:channel, "discord", cid, _} -> cid
+        _ -> nil
+      end
+
+    if channel_id do
+      token =
+        System.get_env("DISCORD_BOT_TOKEN") ||
+          Application.get_env(:kyber_beam, :discord_bot_token)
+
+      if token do
+        # Extract any text the model said before calling tools
+        text_parts =
+          content_blocks
+          |> Enum.filter(&(&1["type"] == "text"))
+          |> Enum.map(&(&1["text"] || ""))
+          |> Enum.reject(&(&1 == ""))
+
+        tool_line = "🔧 *Using: #{tool_names}…*"
+
+        preview =
+          case text_parts do
+            [] -> tool_line <> " ⏳"
+            parts -> Enum.join(parts, "\n") <> "\n\n" <> tool_line <> " ⏳"
+          end
+          |> String.slice(0, 1900)
+
+        # Fire and forget — don't block the tool loop
+        Task.start(fn ->
+          case Kyber.Plugin.Discord.post_message_with_id(token, channel_id, preview) do
+            {:ok, msg_id} ->
+              # Store the preview message ID so the final response can edit it
+              # We use the process dictionary of the tool loop's process
+              # This is picked up by the reducer's send_message effect
+              :persistent_term.put({:tool_preview_msg, channel_id}, msg_id)
+
+            _ ->
+              :ok
+          end
+        end)
+      end
     end
   end
 

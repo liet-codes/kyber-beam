@@ -195,6 +195,35 @@ defmodule Kyber.Plugin.Discord do
     "#{@discord_api_base}/channels/#{channel_id}/messages?#{query}"
   end
 
+  @doc """
+  Post a message and return its Discord message ID.
+
+  Used by the streaming preview feature to create an initial "typing" message
+  before the full LLM response arrives. Returns `{:ok, message_id}` on
+  success so the caller can later edit the same message.
+  """
+  @spec post_message_with_id(String.t(), String.t(), String.t()) ::
+          {:ok, String.t()} | {:error, term()}
+  def post_message_with_id(token, channel_id, content) do
+    url = "#{@discord_api_base}/channels/#{channel_id}/messages"
+    headers = [{"Authorization", "Bot #{token}"}, {"Content-Type", "application/json"}]
+    body = %{"content" => String.slice(content, 0, @max_message_length)}
+
+    case Req.post(url, headers: headers, json: body) do
+      {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
+        {:ok, resp_body["id"]}
+
+      {:ok, %{status: status, body: resp_body}} ->
+        Logger.warning(
+          "[Kyber.Plugin.Discord] post_message_with_id failed: status=#{status} body=#{inspect(resp_body)}"
+        )
+        {:error, %{status: status, body: resp_body}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @doc "Edit an existing Discord message."
   @spec edit_message(String.t(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
   def edit_message(token, channel_id, message_id, new_content) do
@@ -599,6 +628,9 @@ defmodule Kyber.Plugin.Discord do
       # File/image sending: list of file paths in the effect payload
       files = get_in(effect, [:payload, "files"]) || []
 
+      # Streaming preview message ID: if present, edit that message instead of creating new
+      edit_msg_id = get_in(effect, [:payload, "edit_message_id"])
+
       opts = []
       opts = if reply_to, do: Keyword.put(opts, :reply_to, reply_to), else: opts
       opts = if embeds, do: Keyword.put(opts, :embeds, embeds), else: opts
@@ -614,6 +646,15 @@ defmodule Kyber.Plugin.Discord do
           result = send_file(token, channel_id, first_file, content: if(content != "", do: content, else: nil))
           Enum.each(rest_files, fn f -> send_file(token, channel_id, f) end)
           result
+
+        # Streaming preview: edit existing message instead of sending new one
+        is_binary(edit_msg_id) && is_binary(channel_id) && content != "" ->
+          # Truncate to Discord's limit if needed (edit doesn't chunk)
+          final_content =
+            if String.length(content) > @max_message_length,
+              do: String.slice(content, 0, @max_message_length - 1) <> "…",
+              else: content
+          edit_message(token, channel_id, edit_msg_id, final_content)
 
         # Regular channel message
         is_binary(channel_id) && (content != "" || embeds) ->
