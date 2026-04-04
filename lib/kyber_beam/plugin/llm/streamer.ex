@@ -79,7 +79,13 @@ defmodule Kyber.Plugin.LLM.Streamer do
         end
 
       {:ok, %{status: status, body: body}} ->
-        error_msg = get_in(body, ["error", "message"]) || inspect(body)
+        error_msg =
+          cond do
+            is_map(body) -> get_in(body, ["error", "message"]) || inspect(body)
+            is_binary(body) and body != "" -> body
+            true -> "HTTP #{status}"
+          end
+
         {:error, %{error: error_msg, status: status}}
 
       {:error, reason} ->
