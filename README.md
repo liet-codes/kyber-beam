@@ -18,14 +18,57 @@ Kyber-BEAM uses a **unidirectional dataflow architecture**: every state change f
 
 ## Quick Start
 
+### One-line setup (macOS)
+
 ```bash
-mix deps.get
-mix test
-# Configure auth and Discord in config/config.exs (or config/runtime.exs)
-mix run --no-halt
+./scripts/setup.sh
 ```
 
-Configure in `config/config.exs`:
+This installs Homebrew, Erlang, Elixir, Node.js, and all dependencies. On other OSes, follow the manual steps printed by the script.
+
+### Import from OpenClaw
+
+If you have an OpenClaw vault export (zip with SOUL.md, MEMORY.md, etc.):
+
+```bash
+./scripts/setup.sh --import-openclaw /path/to/openclaw-export.zip
+# or after setup:
+mix kyber.import.openclaw /path/to/openclaw-export.zip
+```
+
+### Import from existing Kyber vault
+
+```bash
+./scripts/setup.sh --import-kyber /path/to/kyber-vault.zip
+# or after setup:
+mix kyber.import.kyber /path/to/kyber-vault.zip
+```
+
+### Configure and run
+
+```bash
+cp .env.example .env        # add DISCORD_BOT_TOKEN
+mix run --no-halt            # or: ./scripts/start.sh
+```
+
+Dashboard: http://localhost:4001
+
+### LLM Backend
+
+Kyber-BEAM supports two LLM backends:
+
+- **`:api`** (default) — Direct Anthropic Messages API. Uses OAuth token from `~/.openclaw/` or an API key.
+- **`:agent_sdk`** — Claude Agent SDK via a Node.js bridge process. Authenticates using Claude CLI credentials from `~/.claude/`.
+
+Switch backends by setting `KYBER_LLM_BACKEND=agent_sdk` in your `.env` file, or in config:
+
+```elixir
+config :kyber_beam, :llm_backend, :agent_sdk
+```
+
+The Agent SDK bridge requires Node.js 18+ and `npm install` in `priv/agent-sdk/`. The setup script handles this automatically. If the Agent SDK is unavailable at runtime, kyber-beam falls back to the direct API.
+
+### Configuration
 
 ```elixir
 config :kyber_beam, :model, "claude-sonnet-4-20250514"
