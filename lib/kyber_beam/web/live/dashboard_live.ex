@@ -41,6 +41,7 @@ defmodule Kyber.Web.DashboardLive do
       |> assign(:started_at, System.system_time(:millisecond))
       |> assign(:node_name, node())
       |> assign(:expanded, MapSet.new())
+      |> assign(:raw_visible, MapSet.new())
       |> assign(:image_modal, nil)
       |> load_state()
 
@@ -109,6 +110,17 @@ defmodule Kyber.Web.DashboardLive do
 
   def handle_event("noop", _params, socket), do: {:noreply, socket}
 
+  def handle_event("toggle_raw", %{"id" => id}, socket) do
+    raw_visible = socket.assigns.raw_visible
+
+    raw_visible =
+      if MapSet.member?(raw_visible, id),
+        do: MapSet.delete(raw_visible, id),
+        else: MapSet.put(raw_visible, id)
+
+    {:noreply, assign(socket, :raw_visible, raw_visible)}
+  end
+
   def handle_event("show_image", %{"delta-id" => delta_id, "index" => idx_str}, socket) do
     idx = String.to_integer(idx_str)
     # Find the delta and extract its images
@@ -148,107 +160,181 @@ defmodule Kyber.Web.DashboardLive do
 
   @impl true
   def render(%{live_action: :traces} = assigns) do
+    trace_groups = group_trace_entries(assigns.trace_entries)
+    assigns = assign(assigns, :trace_groups, trace_groups)
+
     ~H"""
     <div style="padding: 16px 0;">
       <h1 style="color:#63b3ed;margin-bottom:16px;">Traces</h1>
       <p style="color:#718096;margin-bottom:16px;">Nested delta trace view — click to expand/collapse</p>
       <div style="display:flex;flex-direction:column;gap:12px;">
-        <%= if @trace_entries == [] do %>
+        <%= if @trace_groups == [] do %>
           <div style="color:#4a5568;text-align:center;padding:32px;">No traces yet…</div>
         <% end %>
-        <%= for {delta, depth, has_children, expanded} <- @trace_entries do %>
-          <%!-- Waterfall + token summary for root traces --%>
-          <%= if depth == 0 and expanded do %>
-            <% waterfall = build_waterfall(@all_deltas, delta.id, delta.ts) %>
-            <% token_summary = trace_token_summary(@all_deltas, delta.id) %>
-            <div class="trace-card">
-              <%= if token_summary do %>
-                <div class="trace-token-summary"><%= token_summary %></div>
+        <%= for {root, children} <- @trace_groups do %>
+          <% {root_delta, _depth, root_has_children, root_expanded} = root %>
+          <% root_images = ImageDetector.extract_images(root_delta.payload) %>
+          <%!-- Outer card wraps root + waterfall + all children --%>
+          <div class="trace-root" style="background:#1a1d2e;border:1px solid #2d3748;border-radius:8px;overflow:hidden;">
+            <%!-- Root header (clickable) --%>
+            <div
+              role="button"
+              tabindex="0"
+              style="padding:12px;cursor:pointer;-webkit-tap-highlight-color:rgba(99,179,237,0.3);"
+              phx-click="toggle_trace"
+              phx-value-id={root_delta.id}
+            >
+              <div class="trace-header">
+                <%= if root_has_children do %>
+                  <span class="trace-toggle"><%= if root_expanded, do: "▼", else: "▶" %></span>
+                <% else %>
+                  <span class="trace-toggle-spacer"></span>
+                <% end %>
+                <span class="trace-kind" style={"color:#{delta_kind_color(root_delta.kind)};"}><%= root_delta.kind %></span>
+                <%= if root_images != [] do %>
+                  <span title={"#{length(root_images)} image(s)"} style="margin-left:4px;">🖼️</span>
+                <% end %>
+                <span class="trace-ts"><%= format_ts(root_delta.ts) %></span>
+              </div>
+              <div class="trace-summary">
+                <%= Phoenix.HTML.raw(delta_summary_html(root_delta)) %>
+              </div>
+              <%= if token_badge(root_delta) do %>
+                <div class="trace-tokens"><%= token_badge(root_delta) %></div>
               <% end %>
-              <div class="wf-legend">
-                <div class="wf-legend-item">
-                  <div class="wf-legend-swatch" style="background:#68d391;"></div>
-                  External input
+            </div>
+
+            <%!-- Expanded content: waterfall + children, all inside the card --%>
+            <%= if root_expanded do %>
+              <%!-- Waterfall + token summary --%>
+              <% waterfall = build_waterfall(@all_deltas, root_delta.id, root_delta.ts) %>
+              <% token_summary = trace_token_summary(@all_deltas, root_delta.id) %>
+              <div style="padding:0 12px 8px;border-top:1px solid #2d3748;">
+                <%= if token_summary do %>
+                  <div class="trace-token-summary" style="margin-top:8px;"><%= token_summary %></div>
+                <% end %>
+                <div class="wf-legend" style="margin-top:8px;">
+                  <div class="wf-legend-item">
+                    <div class="wf-legend-swatch" style="background:#68d391;"></div>
+                    External input
+                  </div>
+                  <div class="wf-legend-item">
+                    <div class="wf-legend-swatch" style="background:#63b3ed;"></div>
+                    Remote service
+                  </div>
+                  <div class="wf-legend-item">
+                    <div class="wf-legend-swatch" style="background:#fbd38d;"></div>
+                    Internal operation
+                  </div>
                 </div>
-                <div class="wf-legend-item">
-                  <div class="wf-legend-swatch" style="background:#63b3ed;"></div>
-                  Remote service
-                </div>
-                <div class="wf-legend-item">
-                  <div class="wf-legend-swatch" style="background:#fbd38d;"></div>
-                  Internal operation
+                <div class="waterfall-container">
+                  <%= for bar <- waterfall do %>
+                    <div class="wf-row">
+                      <div class="wf-label" title={bar.label}><%= bar.label %></div>
+                      <div class="wf-track">
+                        <div
+                          class="wf-bar"
+                          style={"left:#{bar.offset_pct}%;width:#{bar.width_pct}%;background:#{waterfall_color(bar.category)};"}
+                        >
+                          <span class="wf-ms"><%= bar.duration_ms %>ms</span>
+                        </div>
+                      </div>
+                    </div>
+                  <% end %>
                 </div>
               </div>
-              <div class="waterfall-container">
-                <%= for bar <- waterfall do %>
-                  <div class="wf-row">
-                    <div class="wf-label" title={bar.label}><%= bar.label %></div>
-                    <div class="wf-track">
+
+              <%!-- Root images --%>
+              <%= if root_images != [] do %>
+                <div style="padding:0 12px 8px;display:flex;flex-wrap:wrap;gap:8px;" phx-click="noop">
+                  <%= for {{label, media_type, base64}, idx} <- Enum.with_index(root_images) do %>
+                    <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
                       <div
-                        class="wf-bar"
-                        style={"left:#{bar.offset_pct}%;width:#{bar.width_pct}%;background:#{waterfall_color(bar.category)};"}
+                        phx-click="show_image"
+                        phx-value-delta-id={root_delta.id}
+                        phx-value-index={idx}
+                        style="cursor:zoom-in;border:1px solid #4a5568;border-radius:6px;overflow:hidden;background:#0d1117;"
                       >
-                        <span class="wf-ms"><%= bar.duration_ms %>ms</span>
+                        <img
+                          src={"data:#{media_type};base64,#{base64}"}
+                          style="max-width:300px;max-height:200px;display:block;"
+                          loading="lazy"
+                          onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"
+                        />
+                        <div style="display:none;width:300px;height:100px;align-items:center;justify-content:center;color:#fc8181;font-size:0.8rem;">
+                          ⚠️ Broken image
+                        </div>
                       </div>
+                      <span style="color:#a0aec0;font-size:0.7rem;"><%= label %></span>
                     </div>
+                  <% end %>
+                </div>
+              <% end %>
+
+              <%!-- Child deltas (inside the card) --%>
+              <%= for {child_delta, child_depth, child_has_children, child_expanded} <- children do %>
+                <% child_images = ImageDetector.extract_images(child_delta.payload) %>
+                <div
+                  role="button"
+                  tabindex="0"
+                  class="trace-child"
+                  style={"padding:8px 12px;padding-left:#{12 + child_depth * 20}px;cursor:pointer;border-top:1px solid #1e2435;-webkit-tap-highlight-color:rgba(99,179,237,0.3);"}
+                  phx-click="toggle_trace"
+                  phx-value-id={child_delta.id}
+                >
+                  <div class="trace-header">
+                    <%= if child_has_children do %>
+                      <span class="trace-toggle"><%= if child_expanded, do: "▼", else: "▶" %></span>
+                    <% else %>
+                      <span class="trace-toggle-spacer"></span>
+                    <% end %>
+                    <span class="trace-kind" style={"color:#{delta_kind_color(child_delta.kind)};"}><%= child_delta.kind %></span>
+                    <%= if child_images != [] do %>
+                      <span title={"#{length(child_images)} image(s)"} style="margin-left:4px;">🖼️</span>
+                    <% end %>
+                    <span class="trace-ts"><%= format_ts(child_delta.ts) %></span>
                   </div>
-                <% end %>
-              </div>
-            </div>
-          <% end %>
-          <%!-- Tree node — uses <button> for native iOS touch support --%>
-          <% delta_images = ImageDetector.extract_images(delta.payload) %>
-          <div
-            role="button"
-            tabindex="0"
-            class={"trace-node #{if depth == 0, do: "trace-root", else: "trace-child"}"}
-            style={"padding-left:#{12 + depth * 20}px;cursor:pointer;-webkit-tap-highlight-color:rgba(99,179,237,0.3);"}
-            phx-click="toggle_trace"
-            phx-value-id={delta.id}
-          >
-            <div class="trace-header">
-              <%= if has_children do %>
-                <span class="trace-toggle"><%= if expanded, do: "▼", else: "▶" %></span>
-              <% else %>
-                <span class="trace-toggle-spacer"></span>
-              <% end %>
-              <span class="trace-kind" style={"color:#{delta_kind_color(delta.kind)};"}><%= delta.kind %></span>
-              <%= if delta_images != [] do %>
-                <span title={"#{length(delta_images)} image(s)"} style="margin-left:4px;">🖼️</span>
-              <% end %>
-              <span class="trace-ts"><%= format_ts(delta.ts) %></span>
-            </div>
-            <div class="trace-summary">
-              <%= Phoenix.HTML.raw(delta_summary_html(delta)) %>
-            </div>
-            <%= if token_badge(delta) do %>
-              <div class="trace-tokens"><%= token_badge(delta) %></div>
-            <% end %>
-            <%!-- Inline image thumbnails (only rendered when expanded) --%>
-            <%= if expanded and delta_images != [] do %>
-              <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;" phx-click="noop" phx-value-id={delta.id}>
-                <%= for {{label, media_type, base64}, idx} <- Enum.with_index(delta_images) do %>
-                  <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
-                    <div
-                      phx-click="show_image"
-                      phx-value-delta-id={delta.id}
-                      phx-value-index={idx}
-                      style="cursor:zoom-in;border:1px solid #4a5568;border-radius:6px;overflow:hidden;background:#0d1117;"
-                    >
-                      <img
-                        src={"data:#{media_type};base64,#{base64}"}
-                        style="max-width:300px;max-height:200px;display:block;"
-                        loading="lazy"
-                        onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"
-                      />
-                      <div style="display:none;width:300px;height:100px;align-items:center;justify-content:center;color:#fc8181;font-size:0.8rem;">
-                        ⚠️ Broken image
+                  <div class="trace-summary">
+                    <%= Phoenix.HTML.raw(delta_summary_html(child_delta)) %>
+                  </div>
+                  <%= if token_badge(child_delta) do %>
+                    <div class="trace-tokens"><%= token_badge(child_delta) %></div>
+                  <% end %>
+                  <%= if child_expanded and child_delta.kind == "llm.stream_chunk" do %>
+                    <% stream_text = child_delta.payload["text"] || "" %>
+                    <%= if stream_text != "" do %>
+                      <div style="margin-top:8px;padding:8px;background:#0d1117;border-radius:4px;max-height:300px;overflow-y:auto;font-size:0.8rem;color:#e2e8f0;white-space:pre-wrap;word-break:break-word;">
+                        <%= stream_text %>
                       </div>
+                    <% end %>
+                  <% end %>
+                  <%= if child_expanded and child_images != [] do %>
+                    <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;" phx-click="noop">
+                      <%= for {{label, media_type, base64}, idx} <- Enum.with_index(child_images) do %>
+                        <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
+                          <div
+                            phx-click="show_image"
+                            phx-value-delta-id={child_delta.id}
+                            phx-value-index={idx}
+                            style="cursor:zoom-in;border:1px solid #4a5568;border-radius:6px;overflow:hidden;background:#0d1117;"
+                          >
+                            <img
+                              src={"data:#{media_type};base64,#{base64}"}
+                              style="max-width:300px;max-height:200px;display:block;"
+                              loading="lazy"
+                              onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"
+                            />
+                            <div style="display:none;width:300px;height:100px;align-items:center;justify-content:center;color:#fc8181;font-size:0.8rem;">
+                              ⚠️ Broken image
+                            </div>
+                          </div>
+                          <span style="color:#a0aec0;font-size:0.7rem;"><%= label %></span>
+                        </div>
+                      <% end %>
                     </div>
-                    <span style="color:#a0aec0;font-size:0.7rem;"><%= label %></span>
-                  </div>
-                <% end %>
-              </div>
+                  <% end %>
+                </div>
+              <% end %>
             <% end %>
           </div>
         <% end %>
@@ -309,8 +395,8 @@ defmodule Kyber.Web.DashboardLive do
                     <% end %>
                   </div>
                 <% end %>
-                <%!-- JSON payload (with base64 truncated for readability) --%>
-                <pre style="color:#e2e8f0;font-size:0.8rem;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;"><%= Jason.encode!(truncate_base64_in_payload(delta.payload), pretty: true) %></pre>
+                <%!-- Structured payload card --%>
+                <.render_payload_card delta={delta} raw_visible={@raw_visible} />
                 <%= if delta.parent_id do %>
                   <div style="color:#718096;font-size:0.75rem;margin-top:8px;">parent: <span style="color:#b794f4;"><%= delta.parent_id %></span></div>
                 <% end %>
@@ -446,7 +532,7 @@ defmodule Kyber.Web.DashboardLive do
                     <% end %>
                   </div>
                 <% end %>
-                <pre style="color:#e2e8f0;font-size:0.75rem;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow-y:auto;"><%= Jason.encode!(truncate_base64_in_payload(delta.payload), pretty: true) %></pre>
+                <.render_payload_card delta={delta} raw_visible={@raw_visible} />
               </div>
             <% end %>
           <% end %>
@@ -585,12 +671,15 @@ defmodule Kyber.Web.DashboardLive do
     case kind do
       "message.received" -> "💬"
       "llm.response" -> "🧠"
+      "llm.stream_chunk" -> "💬"
       "llm.call" -> "🤖"
       "tool.call" -> "🔧"
       "tool.result" -> "📋"
       "tool_use" -> "🔧"
       "cron.fired" -> "⏰"
       "send_message" -> "📤"
+      "plugin.loaded" -> "🔌"
+      "plugin.unloaded" -> "🔌"
       "session." <> _ -> "📋"
       "error" <> _ -> "❌"
       _ -> "◆"
@@ -601,12 +690,15 @@ defmodule Kyber.Web.DashboardLive do
     case kind do
       "message.received" -> "#68d391"
       "llm.response" -> "#63b3ed"
+      "llm.stream_chunk" -> "#76e4f7"
       "llm.call" -> "#9ae6b4"
       "tool.call" -> "#fbd38d"
       "tool.result" -> "#f6e05e"
       "tool_use" -> "#fbd38d"
       "cron.fired" -> "#b794f4"
       "send_message" -> "#4fd1c5"
+      "plugin.loaded" -> "#68d391"
+      "plugin.unloaded" -> "#718096"
       "error" <> _ -> "#fc8181"
       _ -> "#a0aec0"
     end
@@ -661,6 +753,33 @@ defmodule Kyber.Web.DashboardLive do
       |> Enum.sort_by(& &1.ts, :desc)
 
     flatten_trace(roots, by_parent, expanded_ids, 0)
+  end
+
+  # Groups flat trace entries into [{root_entry, [child_entries]}, ...]
+  defp group_trace_entries(entries) do
+    entries
+    |> Enum.chunk_while(
+      [],
+      fn
+        {_, 0, _, _} = entry, [] ->
+          {:cont, [entry]}
+
+        {_, 0, _, _} = entry, acc ->
+          {:cont, Enum.reverse(acc), [entry]}
+
+        entry, acc ->
+          {:cont, [entry | acc]}
+      end,
+      fn
+        [] -> {:cont, []}
+        acc -> {:cont, Enum.reverse(acc), []}
+      end
+    )
+    |> Enum.map(fn
+      [root | children] -> {root, children}
+      [] -> nil
+    end)
+    |> Enum.reject(&is_nil/1)
   end
 
   defp flatten_trace(nodes, by_parent, expanded_ids, depth) do
@@ -772,15 +891,60 @@ defmodule Kyber.Web.DashboardLive do
     end
   end
 
+  defp delta_summary(%{kind: "llm.stream_chunk", payload: p}) do
+    text = p["text"] || ""
+    len = String.length(text)
+    preview = if len > 80, do: String.slice(text, 0, 80) <> "…", else: text
+    "💬 Stream chunk (#{len} chars): #{preview}"
+  end
+
   defp delta_summary(%{kind: "familiard.escalation", payload: p}) do
     level = p["level"] || "info"
     msg = p["message"] || ""
     "⚠️ Escalation [#{level}]: #{String.slice(msg, 0, 120)}"
   end
 
+  defp delta_summary(%{kind: "cron.fired", payload: p}) do
+    job = p["job_name"] || "unknown"
+    count = p["fired_count"]
+    label = p["label"]
+    name = label || job
+    count_str = if count, do: " (##{count})", else: ""
+    "⏰ Cron job **#{name}**#{count_str} fired"
+  end
+
+  defp delta_summary(%{kind: "plugin.loaded", payload: p}) do
+    name = p["name"] || "unknown"
+    "🔌 Plugin loaded: **#{name}**"
+  end
+
+  defp delta_summary(%{kind: "plugin.unloaded", payload: p}) do
+    name = p["name"] || "unknown"
+    "🔌 Plugin unloaded: **#{name}**"
+  end
+
+  defp delta_summary(%{kind: "send_message", payload: p}) do
+    channel = resolve_channel(p["channel_id"] || "?")
+    text = p["text"] || p["content"] || ""
+    truncated = if String.length(text) > 80, do: String.slice(text, 0, 80) <> "…", else: text
+    "📤 Sent to #{channel}: \"#{truncated}\""
+  end
+
+  defp delta_summary(%{kind: "error" <> _, payload: p}) do
+    msg = p["message"] || p["error"] || p["reason"] || ""
+    truncated = if String.length(msg) > 120, do: String.slice(msg, 0, 120) <> "…", else: msg
+    "❌ #{truncated}"
+  end
+
+  defp delta_summary(%{kind: "session." <> action, payload: p}) do
+    chat_id = p["chat_id"] || ""
+    "📋 Session #{action}" <> if(chat_id != "", do: " (#{chat_id})", else: "")
+  end
+
   defp delta_summary(%{kind: kind, payload: p}) do
-    preview = payload_preview(p)
-    "#{kind_emoji(kind)} #{kind}" <> if(preview != "", do: ": #{preview}", else: "")
+    # Readable fallback: show key=value pairs instead of Elixir inspect
+    summary = readable_payload_summary(p)
+    "#{kind_emoji(kind)} #{kind}" <> if(summary != "", do: ": #{summary}", else: "")
   end
 
   # Convert delta_summary markdown to safe HTML
@@ -793,6 +957,18 @@ defmodule Kyber.Web.DashboardLive do
     |> Phoenix.HTML.safe_to_string()
     |> then(fn s -> Regex.replace(bold_re, s, "<strong>\\1</strong>") end)
     |> String.replace("\n", "<br/>")
+  end
+
+  defp readable_payload_summary(p) when map_size(p) == 0, do: ""
+
+  defp readable_payload_summary(p) do
+    p
+    |> Enum.reject(fn {_k, v} -> is_nil(v) or v == "" or v == [] or v == %{} end)
+    |> Enum.map(fn {k, v} -> "#{k}=#{inspect_short(v)}" end)
+    |> Enum.join(", ")
+    |> then(fn s ->
+      if String.length(s) > 140, do: String.slice(s, 0, 140) <> "…", else: s
+    end)
   end
 
   defp inspect_short(v) when is_binary(v) do
@@ -966,6 +1142,161 @@ defmodule Kyber.Web.DashboardLive do
 
   defp error_count_style(_) do
     "color:#68d391;font-size:1.4rem;font-weight:bold;margin-top:4px;"
+  end
+
+  # ── Payload card component ─────────────────────────────────────────────
+
+  @doc false
+  def render_payload_card(assigns) do
+    ~H"""
+    <div phx-click="noop" style="font-size:0.85rem;">
+      <% fields = payload_card_fields(@delta) %>
+      <div style="display:grid;grid-template-columns:min-content 1fr;gap:3px 12px;align-items:start;">
+        <%= for {label, value, wrap} <- fields do %>
+          <div style="color:#718096;font-size:0.78rem;white-space:nowrap;padding-top:2px;"><%= label %></div>
+          <%= if wrap do %>
+            <div style="color:#e2e8f0;font-size:0.82rem;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto;background:#0d1117;padding:4px 6px;border-radius:3px;"><%= value %></div>
+          <% else %>
+            <div style="color:#e2e8f0;font-size:0.82rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"><%= value %></div>
+          <% end %>
+        <% end %>
+      </div>
+      <div style="margin-top:6px;text-align:right;">
+        <span
+          phx-click="toggle_raw"
+          phx-value-id={@delta.id}
+          style="color:#4a5568;font-size:0.72rem;cursor:pointer;text-decoration:underline;user-select:none;"
+        >
+          <%= if MapSet.member?(@raw_visible, @delta.id), do: "▲ hide raw", else: "▼ raw json" %>
+        </span>
+      </div>
+      <%= if MapSet.member?(@raw_visible, @delta.id) do %>
+        <pre style="color:#718096;font-size:0.75rem;white-space:pre-wrap;word-break:break-all;max-height:280px;overflow-y:auto;margin-top:4px;background:#0d1117;padding:8px;border-radius:4px;border:1px solid #2d3748;"><%= Jason.encode!(truncate_base64_in_payload(@delta.payload), pretty: true) %></pre>
+      <% end %>
+    </div>
+    """
+  end
+
+  # Returns [{label, value, wrap?}] tuples for the payload card
+  defp payload_card_fields(%{kind: "message.received", payload: p}) do
+    user = resolve_user(p["author_id"] || p["username"] || "?")
+    channel = resolve_channel(p["channel_id"] || "?")
+    text = p["text"] || ""
+
+    guild_rows =
+      if p["guild_id"], do: [{"Guild", resolve_guild(p["guild_id"]), false}], else: []
+
+    attach_count = if is_list(p["attachments"]), do: length(p["attachments"]), else: 0
+
+    attach_rows =
+      if attach_count > 0, do: [{"Attachments", "#{attach_count} file(s)", false}], else: []
+
+    [{"From", user, false}, {"Channel", channel, false}] ++
+      guild_rows ++
+      [{"Message", text, String.length(text) > 60}] ++
+      attach_rows
+  end
+
+  defp payload_card_fields(%{kind: "llm.response", payload: p}) do
+    usage = p["usage"] || %{}
+    input = usage["input_tokens"] || 0
+    output = usage["output_tokens"] || 0
+    cached = usage["cache_read_input_tokens"] || 0
+    content = p["content"] || ""
+
+    tokens_str =
+      "#{format_number(input)} in / #{format_number(output)} out" <>
+        if(cached > 0, do: " / #{format_number(cached)} cached", else: "")
+
+    model_rows = if p["model"], do: [{"Model", p["model"], false}], else: []
+    content_rows = if content != "", do: [{"Response", content, true}], else: []
+
+    model_rows ++ [{"Tokens", tokens_str, false}] ++ content_rows
+  end
+
+  defp payload_card_fields(%{kind: "llm.call", payload: p}) do
+    tools = p["tools"] || []
+    tool_count = if is_list(tools), do: length(tools), else: 0
+
+    tool_names =
+      if is_list(tools) and tool_count > 0 do
+        tools
+        |> Enum.map(fn t -> if is_map(t), do: t["name"] || "?", else: inspect(t) end)
+        |> Enum.join(", ")
+      else
+        "none"
+      end
+
+    msg_count =
+      p["message_count"] ||
+        (if is_list(p["messages"]), do: length(p["messages"]), else: "?")
+
+    tools_str = if tool_count > 0, do: "#{tool_count} (#{tool_names})", else: "none"
+    model_rows = if p["model"], do: [{"Model", p["model"], false}], else: []
+
+    model_rows ++ [{"Messages", "#{msg_count}", false}, {"Tools", tools_str, false}]
+  end
+
+  defp payload_card_fields(%{kind: "tool.call", payload: p}) do
+    name = p["name"] || "unknown"
+    input = p["input"] || %{}
+
+    param_rows =
+      Enum.map(input, fn {k, v} ->
+        str_v =
+          if is_binary(v) and String.length(v) > 100,
+            do: String.slice(v, 0, 100) <> "…",
+            else: inspect_short(v)
+
+        {"  #{k}", str_v, false}
+      end)
+
+    [{"Tool", name, false}] ++ param_rows
+  end
+
+  defp payload_card_fields(%{kind: "tool.result", payload: p}) do
+    name = p["name"] || "unknown"
+    status = p["status"] || "unknown"
+    output = p["output"] || ""
+
+    status_display =
+      case to_string(status) do
+        s when s in ["ok", "success", "true"] -> "✅ #{s}"
+        s -> "❌ #{s}"
+      end
+
+    output_str =
+      if is_binary(output) do
+        if String.length(output) > 200, do: String.slice(output, 0, 200) <> "…", else: output
+      else
+        inspect(output, limit: 5, printable_limit: 200)
+      end
+
+    wrap = is_binary(output_str) and String.length(output_str) > 60
+
+    [{"Tool", name, false}, {"Status", status_display, false}, {"Output", output_str, wrap}]
+  end
+
+  defp payload_card_fields(%{payload: p}) when map_size(p) == 0, do: []
+
+  defp payload_card_fields(%{payload: p}) do
+    p
+    |> Enum.reject(fn {_, v} -> is_nil(v) or v == "" or v == [] end)
+    |> Enum.map(fn {k, v} ->
+      {str_v, wrap} =
+        case v do
+          s when is_binary(s) ->
+            truncated =
+              if String.length(s) > 120, do: String.slice(s, 0, 120) <> "…", else: s
+
+            {truncated, String.length(s) > 60}
+
+          _ ->
+            {inspect_short(v), false}
+        end
+
+      {to_string(k), str_v, wrap}
+    end)
   end
 
   # ── Image helpers ──────────────────────────────────────────────────────

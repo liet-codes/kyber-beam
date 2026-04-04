@@ -11,7 +11,7 @@ export MIX_ENV=dev
 ERLANG_ROOT="/usr/local/Cellar/erlang/28.4.1/lib/erlang"
 ELIXIR_ROOT="/Users/liet/.asdf/installs/elixir/1.19.5"
 
-export PATH="${ELIXIR_ROOT}/bin:${ERLANG_ROOT}/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="${ELIXIR_ROOT}/bin:${ERLANG_ROOT}/bin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
 export MIX_HOME="${ELIXIR_ROOT}/.mix"
 
 cd /Users/liet/kyber-beam

@@ -58,8 +58,10 @@ defmodule Kyber.Tools.ComputerUse.Screenshot do
     File.rm(Keyword.get(opts, :tmp_path, @tmp_path))
   end
 
+  @screencapture_cmd (if File.exists?("/usr/sbin/screencapture"), do: "/usr/sbin/screencapture", else: "screencapture")
+
   defp take_screenshot(nil, tmp_path, cmd_runner) do
-    case cmd_runner.("screencapture", ["-x", "-t", "png", tmp_path], stderr_to_stdout: true) do
+    case cmd_runner.(@screencapture_cmd, ["-x", "-t", "png", tmp_path], stderr_to_stdout: true) do
       {_, 0} -> :ok
       {output, code} -> {:error, "screencapture failed (exit #{code}): #{output}"}
     end
@@ -68,7 +70,7 @@ defmodule Kyber.Tools.ComputerUse.Screenshot do
   defp take_screenshot({x, y, w, h}, tmp_path, cmd_runner) do
     region_str = "#{x},#{y},#{w},#{h}"
 
-    case cmd_runner.("screencapture", ["-x", "-R", region_str, "-t", "png", tmp_path],
+    case cmd_runner.(@screencapture_cmd, ["-x", "-R", region_str, "-t", "png", tmp_path],
            stderr_to_stdout: true
          ) do
       {_, 0} -> :ok
