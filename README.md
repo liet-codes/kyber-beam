@@ -16,64 +16,123 @@ Kyber-BEAM uses a **unidirectional dataflow architecture**: every state change f
 - **OAuth token support** — works with Anthropic Max plan OAuth tokens (not just API keys)
 - **LiveView dashboard** — real-time delta stream and process tree *(in progress)*
 
-## Quick Start
+## Installation
 
-### One-line setup (macOS)
+### Fresh Mac (zero to running)
 
 ```bash
+git clone https://github.com/liet-codes/kyber-beam.git
+cd kyber-beam
 ./scripts/setup.sh
 ```
 
-This installs Homebrew, Erlang, Elixir, Node.js, and all dependencies. On other OSes, follow the manual steps printed by the script.
+This installs Homebrew, asdf, Erlang, Elixir, Node.js, and all dependencies. On other OSes, follow the manual steps printed by the script.
 
-### Import from OpenClaw
+### Importing an agent
 
-If you have an OpenClaw vault export (zip with SOUL.md, MEMORY.md, etc.):
+Kyber-BEAM uses essence zips — portable bundles containing an agent's identity, memories, and knowledge.
 
+**Import during setup:**
 ```bash
-./scripts/setup.sh --import-openclaw /path/to/openclaw-export.zip
-# or after setup:
-mix kyber.import.openclaw /path/to/openclaw-export.zip
+# Import an OpenClaw agent (e.g. Liet)
+./scripts/setup.sh --import-openclaw /path/to/liet-essence.zip
+
+# Import an existing Kyber agent (e.g. Stilgar)
+./scripts/setup.sh --import-kyber /path/to/stilgar-essence.zip
 ```
 
-### Import from existing Kyber vault
-
+**Import after setup:**
 ```bash
-./scripts/setup.sh --import-kyber /path/to/kyber-vault.zip
-# or after setup:
-mix kyber.import.kyber /path/to/kyber-vault.zip
+mix kyber.import.openclaw /path/to/liet-essence.zip --agent-name liet
+mix kyber.import.kyber /path/to/stilgar-essence.zip --agent-name stilgar
 ```
 
-### Configure and run
+### Configure
 
 ```bash
-cp .env.example .env        # add DISCORD_BOT_TOKEN
-mix run --no-halt            # or: ./scripts/start.sh
+cp .env.example .env
 ```
 
-Dashboard: http://localhost:4001
+Edit `.env` with your tokens:
+```bash
+DISCORD_BOT_TOKEN=your_discord_bot_token
+# Optional: ANTHROPIC_API_KEY=sk-ant-api03-...
+# Optional: KYBER_LLM_BACKEND=agent_sdk
+```
 
-### LLM Backend
+Or in `config/runtime.exs`:
+```elixir
+config :kyber_beam,
+  model: "claude-sonnet-4-20250514",
+  agent_name: "stilgar",
+  vault_path: Path.expand("~/.kyber/vault")
+```
 
-Kyber-BEAM supports two LLM backends:
+### Run
+
+```bash
+mix run --no-halt
+```
+
+Dashboard: http://localhost:4000 | API: http://localhost:4001
+
+### Run as a background service (macOS)
+
+```bash
+cp com.liet.kyber-beam.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.liet.kyber-beam.plist
+```
+
+Logs: `~/.kyber/logs/kyber-beam.log`
+
+## Multi-Agent Vault
+
+Kyber-BEAM supports multiple agents sharing a single vault. Each agent has its own identity and memory, while knowledge (concepts, people, projects) is shared.
+
+```
+~/.kyber/vault/
+  shared/                    # All agents read/write
+    concepts/                # Groovy commutator, wet math, etc.
+    people/                  # Contacts and relationships
+    projects/                # Project tracking
+    USER.md                  # Same human for all agents
+  agents/
+    stilgar/                 # Agent-specific
+      SOUL.md                # Identity and personality
+      MEMORY.md              # Curated long-term memory
+      TOOLS.md               # Environment notes
+      AGENTS.md              # Workspace conventions
+      memory/                # Daily notes (YYYY-MM-DD.md)
+    liet/                    # Another agent
+      SOUL.md
+      MEMORY.md
+      ...
+```
+
+Set which agent to run via config:
+```elixir
+config :kyber_beam, :agent_name, "stilgar"
+```
+
+The Knowledge module auto-detects the vault layout. Agent-specific paths (`SOUL.md`, `memory/2026-04-04.md`) resolve to `agents/<name>/...` automatically. Shared paths (`concepts/foo.md`) resolve to `shared/...`.
+
+## LLM Backend
+
+Two backends available:
 
 - **`:api`** (default) — Direct Anthropic Messages API. Uses OAuth token from `~/.openclaw/` or an API key.
-- **`:agent_sdk`** — Claude Agent SDK via a Node.js bridge process. Authenticates using Claude CLI credentials from `~/.claude/`.
+- **`:agent_sdk`** — Claude Agent SDK via a Node.js bridge. Authenticates using Claude CLI credentials from `~/.claude/`.
 
-Switch backends by setting `KYBER_LLM_BACKEND=agent_sdk` in your `.env` file, or in config:
+Switch backends:
+```bash
+# In .env
+KYBER_LLM_BACKEND=agent_sdk
 
-```elixir
+# Or in config
 config :kyber_beam, :llm_backend, :agent_sdk
 ```
 
-The Agent SDK bridge requires Node.js 18+ and `npm install` in `priv/agent-sdk/`. The setup script handles this automatically. If the Agent SDK is unavailable at runtime, kyber-beam falls back to the direct API.
-
-### Configuration
-
-```elixir
-config :kyber_beam, :model, "claude-sonnet-4-20250514"
-config :kyber_beam, :vault_path, Path.expand("~/.kyber/vault")
-```
+The Agent SDK bridge requires Node.js 18+ and runs `npm install` in `priv/agent-sdk/` automatically during setup. If the Agent SDK is unavailable at runtime, kyber-beam falls back to the direct API.
 
 ## Architecture
 
