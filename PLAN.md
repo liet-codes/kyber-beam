@@ -1,19 +1,15 @@
      1|     1|     1|     1|# Kyber-BEAM Work Tracker
 
-## 0. Next Ralph Loop: The Memory Condenser (Write path)
-**Objective:** Build the background process that reads conversational deltas (`message.received` + `llm.response`) and condenses them into the Obsidian vault via ADD/UPDATE/DELETE operations. 
+## 0. Next Ralph Loop: Semantic Vault Search / Semantic Annotation (Read path)
+**Objective:** Upgrade the `Kyber.Tools.PromptAnnotator` (or `Kyber.Memory.Condenser` if RAG logic is consolidated) to retrieve L0/L1 contextual definitions from the Obsidian vault, traversing `[[wikilinks]]`. 
 
 **Requirements:**
-1. Create `Kyber.Memory.Condenser` (a GenServer or Task).
-2. It should subscribe to the `Delta.Store` (or poll it) looking for new `llm.response` deltas.
-3. Upon detecting a completed interaction loop, it evaluates the conversation context and performs necessary file system edits against `priv/vault` (using `Kyber.Knowledge` functions or direct file writes).
-4. Emits a `memory.condensed` delta reflecting what was changed (for provenance).
-5. Update tests to verify that writing conversational deltas successfully triggers a vault file creation/update, without using `Process.sleep`.
+1. The system must replace simple keyword-matching with a system that can follow basic semantic links defined in the vault markdown files.
+2. Intercept `prompt.submitted` (or modify `message.received` to emit it first), then gather the definitions, before emitting a fully saturated `prompt.annotated`.
+3. Tests must be updated with an isolated vault mapping a fake human to a fake concept. No `Process.sleep`. 
 
 **Success Criteria:**
-- ExUnit tests pass demonstrating the `Condenser` reads a mocked conversation.
-- ExUnit tests prove a `.md` file is created or updated in the test vault.
-- A `memory.condensed` delta is verified via `assert_receive`.
+- ExUnit tests pass demonstrating the Annotation pipeline successfully retrieves a linked concept from a mocked vault and embeds it in the `prompt.annotated` delta. 
 
 ---
 
@@ -41,7 +37,7 @@
     37|    21|- [ ] **The Annotator (Input Assembly):** Build a handler that intercepts `prompt.submitted`, performs the L0/L1 Obsidian RAG (retrieving memory), and emits a `prompt.annotated` delta containing the fully saturated context.
     38|    22|- [ ] **The Inference Trigger:** Update the Reducer so the LLM handler only wakes up when it sees a `prompt.annotated` delta.
     39|    23|- [ ] **Memory Daemon:** Build the background process that reads the `delta` log, extracts facts, and performs ADD/UPDATE/DELETE operations on the Obsidian vault.
-    40|    24|- [ ] **Semantic Vault Search:** Upgrade from keyword matching to traversing `[[wikilinks]]`.
+    40|    24|- [ ] **Semantic Vault Search:** Upgrade from keyword matching to traversing `[[wikilinks]]` in the knowledge graph.
     41|    25|
     42|    26|### Priority 2: Multiplicity (Agentic Capabilities)
     43|    27|    27|    22|- [ ] **Sub-agent Orchestration:** Implement `delegate_task` equivalent to spawn and manage parallel OTP processes for independent, simultaneous agent workflows (escaping the single-threaded thought loop).
