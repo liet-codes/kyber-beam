@@ -46,8 +46,9 @@ defmodule Kyber.Plugin.LLMRestartTest do
     {:ok, _pid, core_name, _path} = start_core()
     register_test_handler(core_name)
 
-    # Emit a delta that triggers an llm_call effect
-    Core.emit(core_name, Kyber.Delta.new("message.received", %{"text" => "hello"}))
+    # prompt.annotated is the delta that the reducer translates into :llm_call
+    # under Event-Driven Input Saturation.
+    Core.emit(core_name, Kyber.Delta.new("prompt.annotated", %{"text" => "hello"}))
     assert_receive {:handler_called, _effect}, 2_000
   end
 
@@ -84,8 +85,9 @@ defmodule Kyber.Plugin.LLMRestartTest do
     # Register a simple test handler (not LLM — we don't want real API calls)
     register_test_handler(core_name)
 
-    # Confirm handler works initially
-    Core.emit(core_name, Kyber.Delta.new("message.received", %{"text" => "before restart"}))
+    # Confirm handler works initially. Use prompt.annotated since it is the
+    # delta that the reducer maps directly to :llm_call (input saturation).
+    Core.emit(core_name, Kyber.Delta.new("prompt.annotated", %{"text" => "before restart"}))
     assert_receive {:handler_called, _effect}, 2_000
 
     # Find and kill the Effect.Executor (simulates Core child crash)

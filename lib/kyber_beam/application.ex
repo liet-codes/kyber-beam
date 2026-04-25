@@ -67,6 +67,10 @@ defmodule KyberBeam.Application do
         # Must start after Core and Knowledge — registers :vault_write/:vault_delete handlers
         {Task, fn -> Kyber.Memory.VaultEffects.register(Kyber.Core, Kyber.Knowledge) end},
 
+        # Event-Driven Input Saturation: registers the :annotate_prompt handler
+        # that turns message.received → prompt.annotated → :llm_call.
+        {Task, fn -> Kyber.Tools.PromptAnnotator.register(Kyber.Core) end},
+
         # Phase 3: Cron scheduler
         {Kyber.Cron,
          name: Kyber.Cron,

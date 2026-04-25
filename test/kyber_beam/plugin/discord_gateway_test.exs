@@ -167,14 +167,17 @@ defmodule Kyber.Plugin.Discord.GatewayTest do
       assert delta.payload["text"] == "hello kyber"
       assert {:channel, "discord", "ch_discord", "author_001"} = delta.origin
 
-      # Step 3: Reduce → effects
+      # Step 3: Reduce → effects (Event-Driven Input Saturation: prompt is
+      # routed through :annotate_prompt before the reducer turns the resulting
+      # prompt.annotated delta into :llm_call.)
       state = %Kyber.State{}
       {_new_state, effects} = Kyber.Reducer.reduce(state, delta)
       assert length(effects) == 3
       effect_types = Enum.map(effects, & &1.type)
       assert :send_typing in effect_types
       assert :add_reaction in effect_types
-      assert :llm_call in effect_types
+      assert :annotate_prompt in effect_types
+      refute :llm_call in effect_types
     end
 
     test "bot messages are filtered before delta creation" do

@@ -258,7 +258,7 @@ defmodule Kyber.FamiliardTest do
 
       {_new_state, effects} = Kyber.Reducer.reduce(state, critical_delta)
       assert length(effects) == 1
-      assert hd(effects).type == :llm_call
+      assert hd(effects).type == :annotate_prompt
 
       warning_delta = Kyber.Delta.new(
         "familiard.escalation",
