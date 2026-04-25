@@ -65,7 +65,11 @@ defmodule KyberBeam.Application do
 
         # Phase 3: Vault effect handlers (delta-routed memory writes)
         # Must start after Core and Knowledge — registers :vault_write/:vault_delete handlers
-        {Task, fn -> Kyber.Memory.VaultEffects.register(Kyber.Core, Kyber.Knowledge) end},
+        Supervisor.child_spec({Task, fn -> Kyber.Memory.VaultEffects.register(Kyber.Core, Kyber.Knowledge) end}, id: :vault_effects_register),
+
+        # Event-Driven Input Saturation: registers the :annotate_prompt handler
+        # that turns message.received → prompt.annotated → :llm_call.
+        Supervisor.child_spec({Task, fn -> Kyber.Tools.PromptAnnotator.register(Kyber.Core) end}, id: :prompt_annotator_register),
 
         # Phase 3: Cron scheduler
         {Kyber.Cron,

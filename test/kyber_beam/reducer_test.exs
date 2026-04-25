@@ -5,14 +5,49 @@ defmodule Kyber.ReducerTest do
 
   defp empty_state, do: %State{}
 
-  test "message.received emits :llm_call effect" do
+  test "message.received emits :annotate_prompt effect (input saturation)" do
     delta = Delta.new("message.received", %{"text" => "hi"})
+    {_state, effects} = Reducer.reduce(empty_state(), delta)
+
+    assert length(effects) == 1
+    effect = hd(effects)
+    assert effect.type == :annotate_prompt
+    assert effect.delta_id == delta.id
+    assert effect.payload["text"] == "hi"
+  end
+
+  test "message.received does NOT emit :llm_call directly (old chain broken)" do
+    delta = Delta.new("message.received", %{"text" => "hi"})
+    {_state, effects} = Reducer.reduce(empty_state(), delta)
+
+    types = Enum.map(effects, & &1.type)
+    refute :llm_call in types, "expected the LLM call to be deferred to prompt.annotated"
+  end
+
+  test "prompt.annotated emits :llm_call effect" do
+    delta =
+      Delta.new(
+        "prompt.annotated",
+        %{"text" => "hi", "annotations" => %{}},
+        {:channel, "discord", "ch_1", "u_1"},
+        "parent-msg-id"
+      )
+
     {_state, effects} = Reducer.reduce(empty_state(), delta)
 
     assert length(effects) == 1
     effect = hd(effects)
     assert effect.type == :llm_call
     assert effect.delta_id == delta.id
+    assert effect.payload["text"] == "hi"
+    assert effect.origin == {:channel, "discord", "ch_1", "u_1"}
+  end
+
+  test "prompt.annotated does not change state" do
+    state = empty_state()
+    delta = Delta.new("prompt.annotated", %{"text" => "hi"})
+    {new_state, _effects} = Reducer.reduce(state, delta)
+    assert new_state == state
   end
 
   test "message.received does not change state" do
@@ -144,13 +179,14 @@ defmodule Kyber.ReducerTest do
 
   # Phase 3 reducer tests
 
-  test "cron.fired heartbeat emits :llm_call effect" do
+  test "cron.fired heartbeat emits :annotate_prompt effect" do
     state = empty_state()
     delta = Delta.new("cron.fired", %{"job_name" => "heartbeat"}, {:cron, "heartbeat"})
     {_state, effects} = Reducer.reduce(state, delta)
 
     assert length(effects) == 1
-    assert hd(effects).type == :llm_call
+    assert hd(effects).type == :annotate_prompt
+    refute Enum.any?(effects, &(&1.type == :llm_call))
   end
 
   test "cron.fired non-heartbeat emits no effects" do
@@ -161,23 +197,25 @@ defmodule Kyber.ReducerTest do
     assert effects == []
   end
 
-  test "familiard.escalation critical emits :llm_call effect" do
+  test "familiard.escalation critical emits :annotate_prompt effect" do
     state = empty_state()
     delta = Delta.new("familiard.escalation", %{"level" => "critical", "message" => "down"})
     {_state, effects} = Reducer.reduce(state, delta)
 
     assert length(effects) == 1
-    assert hd(effects).type == :llm_call
+    assert hd(effects).type == :annotate_prompt
     assert hd(effects).payload["text"] =~ "CRITICAL"
+    refute Enum.any?(effects, &(&1.type == :llm_call))
   end
 
-  test "familiard.escalation warning emits :llm_call effect" do
+  test "familiard.escalation warning emits :annotate_prompt effect" do
     state = empty_state()
     delta = Delta.new("familiard.escalation", %{"level" => "warning", "message" => "slow"})
     {_state, effects} = Reducer.reduce(state, delta)
 
     assert length(effects) == 1
-    assert hd(effects).type == :llm_call
+    assert hd(effects).type == :annotate_prompt
+    refute Enum.any?(effects, &(&1.type == :llm_call))
   end
 
   test "familiard.escalation info emits no effects" do

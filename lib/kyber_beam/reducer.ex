@@ -14,14 +14,27 @@ defmodule Kyber.Reducer do
 
   ## Pattern dispatch
 
-  | `delta.kind`         | State change               | Effects emitted          |
-  |----------------------|----------------------------|--------------------------|
-  | `"message.received"` | none                       | `[llm_call effect]`      |
-  | `"llm.response"`     | none                       | `[:send_message effect]` |
-  | `"llm.error"`        | append to `state.errors`   | `[]`                     |
-  | `"error.route"`      | append to `state.errors`   | `[]`                     |
-  | `"plugin.loaded"`    | prepend to `state.plugins` | `[]`                     |
-  | _(any other)_        | none                       | `[]`                     |
+  | `delta.kind`         | State change               | Effects emitted              |
+  |----------------------|----------------------------|------------------------------|
+  | `"message.received"` | none                       | `[:annotate_prompt effect]`  |
+  | `"prompt.annotated"` | none                       | `[:llm_call effect]`         |
+  | `"llm.response"`     | none                       | `[:send_message effect]`     |
+  | `"llm.error"`        | append to `state.errors`   | `[]`                         |
+  | `"error.route"`      | append to `state.errors`   | `[]`                         |
+  | `"plugin.loaded"`    | prepend to `state.plugins` | `[]`                         |
+  | _(any other)_        | none                       | `[]`                         |
+
+  ## Event-Driven Input Saturation
+
+  `message.received` no longer emits `:llm_call` directly. Instead it emits
+  `:annotate_prompt`, which is intercepted by `Kyber.Tools.PromptAnnotator`.
+  The annotator enriches the prompt (stub today; memory/RAG retrieval in
+  the future) and emits a `prompt.annotated` delta. Only that delta is
+  translated into the actual `:llm_call` effect.
+
+  All paths that need to invoke the LLM (`message.received`, `cron.fired`
+  heartbeat, `familiard.escalation`) flow through `:annotate_prompt`
+  → `prompt.annotated` → `:llm_call`.
   """
 
   @typedoc """
@@ -32,8 +45,9 @@ defmodule Kyber.Reducer do
 
   Example:
 
-      %{type: :llm_call,   delta_id: "...", payload: %{...}, origin: ...}
-      %{type: :send_message, delta_id: "...", payload: %{...}, origin: ...}
+      %{type: :annotate_prompt, delta_id: "...", payload: %{...}, origin: ...}
+      %{type: :llm_call,        delta_id: "...", payload: %{...}, origin: ...}
+      %{type: :send_message,    delta_id: "...", payload: %{...}, origin: ...}
   """
   @type effect :: map()
   @type result :: {Kyber.State.t(), [effect()]}
@@ -66,21 +80,35 @@ defmodule Kyber.Reducer do
           payload: %{"channel_id" => channel_id, "message_id" => message_id, "emoji" => "👀"}}
       end
 
-    # Strip "system" from the payload before forwarding to LLM.
+    # Strip "system" from the payload before forwarding to the annotator.
     # An unauthenticated POST /api/deltas could inject a "message.received"
     # delta with "system" set to override the system prompt (M-3 Security Audit).
     safe_payload = Map.delete(delta.payload, "system")
 
-    llm_effect = %{
-      type: :llm_call,
+    # Event-Driven Input Saturation: the prompt is first handed to the
+    # annotator (RAG / memory enrichment lives there). The annotator emits
+    # a "prompt.annotated" delta which the reducer translates into :llm_call.
+    annotate_effect = %{
+      type: :annotate_prompt,
       delta_id: delta.id,
       payload: safe_payload,
       origin: delta.origin
     }
 
-    effects = Enum.reject([typing_effect, reaction_effect, llm_effect], &is_nil/1)
+    effects = Enum.reject([typing_effect, reaction_effect, annotate_effect], &is_nil/1)
 
     {state, effects}
+  end
+
+  def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "prompt.annotated"} = delta) do
+    llm_effect = %{
+      type: :llm_call,
+      delta_id: delta.id,
+      payload: delta.payload,
+      origin: delta.origin
+    }
+
+    {state, [llm_effect]}
   end
 
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "error.route"} = delta) do
@@ -196,14 +224,14 @@ defmodule Kyber.Reducer do
   end
 
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "cron.fired"} = delta) do
-    # When a cron job fires, optionally emit an :llm_call for heartbeat jobs,
-    # or let downstream subscribers handle it via pattern matching.
+    # Heartbeat cron jobs route through the annotator like any other prompt.
+    # Non-heartbeat jobs are left for downstream subscribers to handle.
     job_name = Map.get(delta.payload, "job_name", "")
 
     effects =
       if job_name == "heartbeat" do
         [%{
-          type: :llm_call,
+          type: :annotate_prompt,
           delta_id: delta.id,
           payload: %{"text" => "[heartbeat] check in"},
           origin: delta.origin
@@ -216,8 +244,8 @@ defmodule Kyber.Reducer do
   end
 
   def reduce(%Kyber.State{} = state, %Kyber.Delta{kind: "familiard.escalation"} = delta) do
-    # Escalation events may trigger an LLM call or a direct message,
-    # depending on severity level.
+    # Escalation events go through the annotator first; only critical/warning
+    # levels are routed onward to the LLM.
     level = Map.get(delta.payload, "level", "info")
     message = Map.get(delta.payload, "message", "")
 
@@ -225,7 +253,7 @@ defmodule Kyber.Reducer do
       case level do
         "critical" ->
           [%{
-            type: :llm_call,
+            type: :annotate_prompt,
             delta_id: delta.id,
             payload: %{"text" => "[CRITICAL escalation from familiard] #{message}"},
             origin: delta.origin
@@ -233,7 +261,7 @@ defmodule Kyber.Reducer do
 
         "warning" ->
           [%{
-            type: :llm_call,
+            type: :annotate_prompt,
             delta_id: delta.id,
             payload: %{"text" => "[warning from familiard] #{message}"},
             origin: delta.origin

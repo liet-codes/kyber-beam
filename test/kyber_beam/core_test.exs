@@ -102,7 +102,10 @@ defmodule Kyber.CoreTest do
       send(test_pid, {:llm_called, effect})
     end)
 
-    delta = Delta.new("message.received", %{"text" => "trigger"})
+    # prompt.annotated is the new direct trigger for :llm_call
+    # (message.received now emits :annotate_prompt; the annotator is what
+    # produces prompt.annotated, but we exercise the handler chain directly here).
+    delta = Delta.new("prompt.annotated", %{"text" => "trigger"})
     :ok = Core.emit(name, delta)
 
     assert_receive {:llm_called, effect}, 2000
@@ -148,7 +151,8 @@ defmodule Kyber.CoreTest do
       send(test_pid, {:instant_effect, effect})
     end)
 
-    delta = Delta.new("message.received", %{"text" => "no-sleep"})
+    # prompt.annotated is the delta the reducer turns into :llm_call now.
+    delta = Delta.new("prompt.annotated", %{"text" => "no-sleep"})
     :ok = Core.emit(name, delta)
 
     # Only Task dispatch latency; no 50ms sleep hack needed.

@@ -488,8 +488,14 @@ defmodule Kyber.ToolExecutor do
            connect_options: [timeout: 5_000],
            receive_timeout: 10_000
          ) do
-      {:ok, %{status: 200, body: body}} ->
+      {:ok, %{status: 200, body: body}} when is_map(body) ->
         parse_weather(body, location)
+
+      {:ok, %{status: 200, body: body}} when is_binary(body) ->
+        case Jason.decode(body) do
+          {:ok, decoded} -> parse_weather(decoded, location)
+          {:error, _} -> {:error, "Invalid weather response format"}
+        end
 
       {:ok, %{status: 404}} ->
         {:error, "Location not found: #{location}"}
