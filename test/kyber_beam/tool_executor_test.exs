@@ -1,9 +1,21 @@
 defmodule Kyber.ToolExecutorTest do
-  use ExUnit.Case, async: true
+  # Not async — vault path changes affect global Knowledge GenServer
+  use ExUnit.Case, async: false
 
   alias Kyber.ToolExecutor
 
   @tmp_dir System.tmp_dir!()
+
+  # Per-test vault isolation for memory_write tests
+  setup do
+    unique_vault = Path.join(System.tmp_dir!(), "kyber_vault_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(unique_vault)
+    Application.put_env(:kyber_beam, :vault_path, unique_vault)
+    Kyber.Config.reload!()
+
+    on_exit(fn -> File.rm_rf!(unique_vault) end)
+    :ok
+  end
 
   defp tmp_path(name) do
     Path.join(@tmp_dir, "tool_executor_test_#{name}_#{:rand.uniform(999_999)}")
@@ -331,25 +343,25 @@ defmodule Kyber.ToolExecutorTest do
   # ── memory_write / memory_list ────────────────────────────────────────────
 
   describe "memory_write" do
-    # Not async — vault writes are global and can conflict with other tests
-    # TODO: Fix test isolation — vault path is shared across tests
+    # TODO: Fix test isolation. Knowledge GenServer starts before test setup,
+    # so vault_path changes in setup don't affect it. Need to either restart
+    # Knowledge per-test or make vault_path dynamic.
     @tag :pending
     test "writes a file to the vault" do
-      path = "memory/test-#{:rand.uniform(999_999)}.md"
-      content = "# Test Note\n\nHello vault."
+      # Use a unique path to avoid conflicts with other tests
+      unique_id = System.unique_integer([:positive])
+      path = "memory/test-#{unique_id}.md"
+      content = "# Test Note #{unique_id}\n\nHello vault."
 
       assert {:ok, msg} = ToolExecutor.execute("memory_write", %{"path" => path, "content" => content})
       assert String.contains?(msg, "Queued write") or String.contains?(msg, "Written")
 
-      # Reload config to ensure we have the test vault path
-      Kyber.Config.reload!()
       vault_root = Kyber.Config.get(:vault_path)
 
       # Paths are resolved by Knowledge — non-prefixed paths go under agents/{agent_name}/
       agent_name = Kyber.Config.get(:agent_name, "stilgar")
       resolved_path = Path.join(["agents", agent_name, path])
       abs_path = Path.join(vault_root, resolved_path)
-      on_exit(fn -> File.rm(abs_path) end)
 
       # Poll for file creation (async via delta pipeline)
       assert wait_for_file(abs_path, content, 100)
