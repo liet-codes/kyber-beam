@@ -12,7 +12,7 @@ defmodule Kyber.Plugin.LLM.ToolLoop do
 
   require Logger
 
-  alias Kyber.Plugin.LLM.{ApiClient, PromptBuilder}
+  alias Kyber.Plugin.LLM.{ApiClient, OpenRouterClient, PromptBuilder}
 
   @default_max_tokens 16_384
 

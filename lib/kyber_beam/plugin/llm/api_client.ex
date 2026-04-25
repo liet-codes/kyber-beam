@@ -13,16 +13,42 @@ defmodule Kyber.Plugin.LLM.ApiClient do
   @default_max_tokens 16_384
   @max_retries 3
 
+  # OpenRouter models
+  @openrouter_models [
+    "nousresearch/hermes-3-llama-3.1-405b:free",
+    "nousresearch/hermes-3-llama-3.1-70b",
+    "nousresearch/hermes-4-llama-3.1-405b",
+    "nousresearch/hermes-4-llama-3.1-70b"
+  ]
+
   defp configured_model do
     Kyber.Config.get(:model, @default_model)
   end
 
+  # ── Provider Detection ────────────────────────────────────────────────────
+
+  @doc "Check if auth config is for OpenRouter."
+  @spec openrouter_config?(map()) :: boolean()
+  def openrouter_config?(%{type: :openrouter}), do: true
+  def openrouter_config?(%{token: token}) when is_binary(token) do
+    String.starts_with?(token, "sk-or-")
+  end
+  def openrouter_config?(_), do: false
+
+  @doc "Check if current model is an OpenRouter-hosted model."
+  @spec openrouter_model?(String.t()) :: boolean()
+  def openrouter_model?(model) do
+    model in @openrouter_models || String.starts_with?(model, "nousresearch/")
+  end
+
   # ── Auth ──────────────────────────────────────────────────────────────────
 
-  @doc "Detect whether a token is OAuth or API key based on prefix."
-  @spec detect_auth_type(String.t()) :: :oauth | :api_key
+  @doc "Detect whether a token is OAuth, API key, or OpenRouter based on prefix."
+  @spec detect_auth_type(String.t()) :: :oauth | :api_key | :openrouter
   def detect_auth_type("sk-ant-oat" <> _), do: :oauth
   def detect_auth_type("sk-ant-api" <> _), do: :api_key
+  def detect_auth_type("sk-or-v1-" <> _), do: :openrouter
+  def detect_auth_type("sk-or-" <> _), do: :openrouter
   def detect_auth_type(_), do: :api_key
 
   @doc "Load auth configuration from auth-profiles.json."
@@ -32,7 +58,16 @@ defmodule Kyber.Plugin.LLM.ApiClient do
 
     with {:ok, raw} <- File.read(expanded),
          {:ok, data} <- Jason.decode(raw) do
-      token = extract_token(data)
+      # Check if we need OpenRouter based on configured model
+      model = configured_model()
+
+      token =
+        if openrouter_model?(model) do
+          # Try to find OpenRouter token specifically
+          extract_openrouter_token(data) || extract_token(data)
+        else
+          extract_token(data)
+        end
 
       if token do
         auth_type = detect_auth_type(token)
@@ -44,6 +79,23 @@ defmodule Kyber.Plugin.LLM.ApiClient do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # Extract OpenRouter token specifically from profiles
+  defp extract_openrouter_token(%{"profiles" => profiles}) when is_map(profiles) do
+    Enum.find_value(profiles, fn
+      {name, profile} when is_binary(name) ->
+        if String.contains?(name, "openrouter") do
+          extract_token(profile)
+        else
+          nil
+        end
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp extract_openrouter_token(_), do: nil
 
   @doc "Build the HTTP request headers for a given auth config."
   @spec build_headers(map()) :: [{String.t(), String.t()}]
@@ -65,6 +117,19 @@ defmodule Kyber.Plugin.LLM.ApiClient do
       {"anthropic-version", "2023-06-01"},
       {"content-type", "application/json"}
     ]
+  end
+
+  def build_headers(%{type: :openrouter, token: token}) do
+    # OpenRouter uses OpenAI-compatible headers
+    Kyber.Plugin.LLM.OpenRouterClient.build_headers(token)
+  end
+
+  def build_headers(%{token: token}) when is_binary(token) do
+    # Auto-detect based on token prefix
+    case detect_auth_type(token) do
+      :openrouter -> Kyber.Plugin.LLM.OpenRouterClient.build_headers(token)
+      _ -> build_headers(%{type: :api_key, token: token})
+    end
   end
 
   # ── Computer Use Beta ───────────────────────────────────────────────────
@@ -139,12 +204,27 @@ defmodule Kyber.Plugin.LLM.ApiClient do
   # ── API calls ─────────────────────────────────────────────────────────────
 
   @doc """
-  Call the Anthropic Messages API (sync path).
+  Call the LLM API (sync path).
+  Automatically routes to Anthropic or OpenRouter based on auth config.
 
   Returns `{:ok, response_body}` or `{:error, %{error: msg, status: code}}`.
   """
   @spec call_api(map(), map()) :: {:ok, map()} | {:error, map()}
   def call_api(auth_config, params) do
+    # Route to OpenRouter if auth or model indicates it
+    if use_openrouter?(auth_config, params) do
+      call_openrouter_api(auth_config, params)
+    else
+      call_anthropic_api(auth_config, params)
+    end
+  end
+
+  defp use_openrouter?(auth_config, params) do
+    openrouter_config?(auth_config) ||
+      openrouter_model?(params["model"] || params[:model] || configured_model())
+  end
+
+  defp call_anthropic_api(auth_config, params) do
     headers = build_headers(auth_config)
     body = build_api_body(auth_config, params)
     tools = body["tools"] || []
@@ -165,23 +245,115 @@ defmodule Kyber.Plugin.LLM.ApiClient do
       end
 
     Logger.info(
-      "[Kyber.Plugin.LLM] calling API: model=#{body["model"]}, " <>
+      "[Kyber.Plugin.LLM] calling Anthropic API: model=#{body["model"]}, " <>
         "messages=#{length(body["messages"] || [])}, system=#{system_info}, tools=#{tools_info}"
     )
 
     call_api_with_retry(@anthropic_url, headers, body)
   end
 
+  defp call_openrouter_api(auth_config, params) do
+    token = auth_config.token
+
+    # Convert response from OpenAI format to Anthropic-like format for compatibility
+    case Kyber.Plugin.LLM.OpenRouterClient.call_api(token, params) do
+      {:ok, openai_response} ->
+        # Convert OpenAI response to Anthropic-compatible format
+        anthropic_response = convert_openai_to_anthropic(openai_response)
+        {:ok, anthropic_response}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Convert OpenAI response format to Anthropic-compatible format
+  defp convert_openai_to_anthropic(%{"choices" => choices} = response) when is_list(choices) do
+    choice = List.first(choices)
+    message = choice["message"] || %{}
+    content = message["content"] || ""
+    tool_calls = message["tool_calls"] || []
+
+    # Build content blocks
+    content_blocks =
+      if content && content != "" do
+        [%{"type" => "text", "text" => content}]
+      else
+        []
+      end
+
+    # Add tool_use blocks if present
+    content_blocks =
+      content_blocks ++
+        Enum.map(tool_calls, fn call ->
+          %{
+            "type" => "tool_use",
+            "id" => call["id"] || "call_#{System.unique_integer([:positive])}",
+            "name" => get_in(call, ["function", "name"]) || "unnamed",
+            "input" => parse_tool_args(get_in(call, ["function", "arguments"]))
+          }
+        end)
+
+    %{
+      "content" => content_blocks,
+      "model" => response["model"] || "unknown",
+      "stop_reason" => convert_finish_reason(choice["finish_reason"]),
+      "usage" => convert_usage(response["usage"])
+    }
+  end
+
+  defp convert_openai_to_anthropic(response), do: response
+
+  defp parse_tool_args(nil), do: %{}
+  defp parse_tool_args(""), do: %{}
+  defp parse_tool_args(json) when is_binary(json) do
+    case Jason.decode(json) do
+      {:ok, parsed} -> parsed
+      {:error, _} -> %{}
+    end
+  end
+  defp parse_tool_args(map) when is_map(map), do: map
+
+  defp convert_finish_reason("stop"), do: "end_turn"
+  defp convert_finish_reason("tool_calls"), do: "tool_use"
+  defp convert_finish_reason("length"), do: "max_tokens"
+  defp convert_finish_reason(other), do: other
+
+  defp convert_usage(nil), do: %{}
+  defp convert_usage(%{"prompt_tokens" => input, "completion_tokens" => output}) do
+    %{
+      "input_tokens" => input,
+      "output_tokens" => output
+    }
+  end
+  defp convert_usage(usage), do: usage
+
   @doc """
   Call the API with streaming if enabled, falling back to sync on failure.
+  Automatically routes to Anthropic or OpenRouter based on auth config.
 
   Returns same format as `call_api/2`: `{:ok, response}` or `{:error, ...}`.
   """
   def call_api_maybe_stream(auth_config, params, core, origin, parent_id) do
-    if Kyber.Config.get(:llm_streaming, true) do
-      do_streaming_call(auth_config, params, core, origin, parent_id)
+    if use_openrouter?(auth_config, params) do
+      # OpenRouter path
+      token = auth_config.token
+
+      if Kyber.Config.get(:llm_streaming, true) do
+        case Kyber.Plugin.LLM.OpenRouterClient.call_api_maybe_stream(token, params, core, origin, parent_id) do
+          {:ok, response} -> {:ok, convert_openai_to_anthropic(response)}
+          {:error, reason} -> {:error, reason}
+        end
+      else
+        call_openrouter_api(auth_config, params)
+      end
     else
-      call_api(auth_config, params)
+      # Anthropic path
+      if Kyber.Config.get(:llm_streaming, true) do
+        do_streaming_call(auth_config, params, core, origin, parent_id)
+      else
+        call_anthropic_api(auth_config, params)
+      end
     end
   end
 
@@ -598,6 +770,7 @@ defmodule Kyber.Plugin.LLM.ApiClient do
   defp extract_token(%{"oauthToken" => token}) when is_binary(token), do: token
   defp extract_token(%{"apiKey" => token}) when is_binary(token), do: token
   defp extract_token(%{"token" => token}) when is_binary(token), do: token
+  defp extract_token(%{"key" => token}) when is_binary(token), do: token
 
   defp extract_token(data) when is_map(data) do
     Enum.find_value(data, fn {_k, v} ->
@@ -606,7 +779,11 @@ defmodule Kyber.Plugin.LLM.ApiClient do
           extract_token(v)
 
         str when is_binary(str) and byte_size(str) > 20 ->
-          if String.starts_with?(str, "sk-ant-"), do: str, else: nil
+          cond do
+            String.starts_with?(str, "sk-ant-") -> str
+            String.starts_with?(str, "sk-or-") -> str
+            true -> nil
+          end
 
         _ ->
           nil

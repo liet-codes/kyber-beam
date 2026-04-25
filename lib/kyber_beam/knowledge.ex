@@ -142,6 +142,15 @@ defmodule Kyber.Knowledge do
   end
 
   @doc """
+  Change the vault path and reload all notes. Used primarily in tests
+  for test isolation. Returns {:ok, note_count} on success.
+  """
+  @spec set_vault_path(GenServer.server(), String.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def set_vault_path(server \\ __MODULE__, new_path) do
+    GenServer.call(server, {:set_vault_path, new_path})
+  end
+
+  @doc """
   Subscribe the calling process to vault change notifications.
 
   When vault polling detects changed or deleted files, the server sends
@@ -217,7 +226,8 @@ defmodule Kyber.Knowledge do
 
     with :ok <- File.mkdir_p(Path.dirname(abs_path)),
          content = serialize_note(frontmatter, body),
-         :ok <- File.write(abs_path, content) do
+         :ok <- File.write(abs_path, content)
+    do
       note = build_note(storage_path, frontmatter, body)
       wikilinks = extract_wikilinks(body)
       note = Map.put(note, :wikilinks, wikilinks)
@@ -321,6 +331,32 @@ defmodule Kyber.Knowledge do
     {:reply, map_size(state.notes), state}
   end
 
+  def handle_call({:set_vault_path, new_path}, _from, state) do
+    # Ensure directory exists
+    File.mkdir_p!(new_path)
+
+    # Cancel any pending reload
+    new_state = cancel_pending_reload(state)
+
+    # Update path and layout
+    layout = detect_vault_layout(new_path)
+
+    new_state = %{
+      new_state |
+      vault_path: new_path,
+      vault_layout: layout,
+      notes: %{},
+      link_graph: %{},
+      file_mtimes: %{}
+    }
+
+    # Load notes from new path (sync, like init)
+    final_state = load_vault_sync(new_state)
+
+    Logger.info("[Kyber.Knowledge] vault path changed to #{new_path} (#{map_size(final_state.notes)} notes)")
+    {:reply, {:ok, map_size(final_state.notes)}, final_state}
+  end
+
   def handle_call({:subscribe, pid}, _from, state) do
     subs =
       if pid in state.subscribers do
@@ -417,6 +453,14 @@ defmodule Kyber.Knowledge do
   def handle_info(_msg, state), do: {:noreply, state}
 
   # ── Private ─────────────────────────────────────────────────────────────────
+
+  # Cancel any pending reload task
+  defp cancel_pending_reload(%{reload_task_ref: nil} = state), do: state
+
+  defp cancel_pending_reload(%{reload_task_ref: ref} = state) do
+    Process.demonitor(ref, [:flush])
+    %{state | reload_task_ref: nil}
+  end
 
   defp default_vault_path do
     Path.expand("~/.kyber/vault")

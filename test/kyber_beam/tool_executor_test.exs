@@ -6,14 +6,21 @@ defmodule Kyber.ToolExecutorTest do
 
   @tmp_dir System.tmp_dir!()
 
-  # Per-test vault isolation for memory_write tests
-  setup do
-    unique_vault = Path.join(System.tmp_dir!(), "kyber_vault_#{System.unique_integer([:positive])}")
-    File.mkdir_p!(unique_vault)
-    Application.put_env(:kyber_beam, :vault_path, unique_vault)
-    Kyber.Config.reload!()
+  # Per-test vault isolation for tests that need it (tagged with :isolated_vault)
+  setup context do
+    if context[:isolated_vault] do
+      unique_vault = Path.join(System.tmp_dir!(), "kyber_vault_#{System.unique_integer([:positive])}")
+      # Create agents/stilgar directory so Knowledge detects multi_agent layout
+      File.mkdir_p!(Path.join([unique_vault, "agents", "stilgar"]))
 
-    on_exit(fn -> File.rm_rf!(unique_vault) end)
+      # Update both Config and the running Knowledge server
+      Application.put_env(:kyber_beam, :vault_path, unique_vault)
+      Kyber.Config.reload!()
+      {:ok, _} = Kyber.Knowledge.set_vault_path(unique_vault)
+
+      on_exit(fn -> File.rm_rf!(unique_vault) end)
+    end
+
     :ok
   end
 
@@ -343,10 +350,7 @@ defmodule Kyber.ToolExecutorTest do
   # ── memory_write / memory_list ────────────────────────────────────────────
 
   describe "memory_write" do
-    # TODO: Fix test isolation. Knowledge GenServer starts before test setup,
-    # so vault_path changes in setup don't affect it. Need to either restart
-    # Knowledge per-test or make vault_path dynamic.
-    @tag :pending
+    @tag :isolated_vault
     test "writes a file to the vault" do
       # Use a unique path to avoid conflicts with other tests
       unique_id = System.unique_integer([:positive])
@@ -364,7 +368,7 @@ defmodule Kyber.ToolExecutorTest do
       abs_path = Path.join(vault_root, resolved_path)
 
       # Poll for file creation (async via delta pipeline)
-      assert wait_for_file(abs_path, content, 100)
+      assert wait_for_file(abs_path, content, 200)
     end
 
     test "rejects paths that escape the vault" do

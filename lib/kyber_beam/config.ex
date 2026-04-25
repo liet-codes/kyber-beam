@@ -21,7 +21,14 @@ defmodule Kyber.Config do
     {:snap_result_path, "/tmp/snap_result"},
     {:discord_token, nil},
     {:vault_path, Path.expand("~/.kyber/vault")},
-    {:agent_name, "stilgar"}
+    {:agent_name, "stilgar"},
+    # OpenRouter / Hermes models
+    {:openrouter_models, [
+      "nousresearch/hermes-3-llama-3.1-405b:free",
+      "nousresearch/hermes-3-llama-3.1-70b",
+      "nousresearch/hermes-4-llama-3.1-405b",
+      "nousresearch/hermes-4-llama-3.1-70b"
+    ]}
   ]
 
   @doc "Load all known config keys from Application env into :persistent_term."
