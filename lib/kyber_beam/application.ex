@@ -80,7 +80,15 @@ defmodule KyberBeam.Application do
         # Memory consolidator — must start after Delta.Store and Knowledge
         {Kyber.Memory.Consolidator,
          name: Kyber.Memory.Consolidator,
-         core: Kyber.Core}
+         core: Kyber.Core},
+
+        # Memory condenser — write path: subscribes to Delta.Store, condenses
+        # llm.response deltas into vault files, emits memory.condensed for
+        # provenance. Must start after Core (Delta.Store) and Knowledge.
+        {Kyber.Memory.Condenser,
+         name: Kyber.Memory.Condenser,
+         core: Kyber.Core,
+         knowledge: Kyber.Knowledge}
       ]
       |> then(&(&1 ++ web_children()))
       |> then(&(&1 ++ phoenix_children()))
