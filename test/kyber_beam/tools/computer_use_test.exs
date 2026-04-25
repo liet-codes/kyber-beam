@@ -29,7 +29,7 @@ defmodule Kyber.Tools.ComputerUseTest do
 
       runner = fn executable, args, _opts ->
         case executable do
-          "screencapture" ->
+          "/usr/sbin/screencapture" ->
             # Write a minimal file so File.read works
             File.write!(List.last(args), "fake-png-data")
             {"", 0}
@@ -59,7 +59,7 @@ defmodule Kyber.Tools.ComputerUseTest do
 
       runner = fn executable, args, _opts ->
         case executable do
-          "screencapture" ->
+          "/usr/sbin/screencapture" ->
             File.write!(List.last(args), "fake-png")
             {"", 0}
 
@@ -91,7 +91,7 @@ defmodule Kyber.Tools.ComputerUseTest do
     end
 
     test "returns error when screencapture fails" do
-      runner = fn "screencapture", _args, _opts ->
+      runner = fn "/usr/sbin/screencapture", _args, _opts ->
         {"screencapture: no screen available", 1}
       end
 
