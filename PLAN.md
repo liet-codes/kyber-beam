@@ -1,15 +1,16 @@
      1|     1|     1|     1|# Kyber-BEAM Work Tracker
 
-## 0. Next Ralph Loop: Semantic Vault Search / Semantic Annotation (Read path)
-**Objective:** Upgrade the `Kyber.Tools.PromptAnnotator` (or `Kyber.Memory.Condenser` if RAG logic is consolidated) to retrieve L0/L1 contextual definitions from the Obsidian vault, traversing `[[wikilinks]]`. 
+## 0. Next Ralph Loop: Two-Stage RAG (L0 Surface + LLM Deep Retrieval)
+**Objective:** Upgrade `Kyber.Tools.PromptAnnotator` to perform lightweight L0 context surfacing, and empower the LLM with a memory search tool to autonomously dig into L1/L2 records if needed. 
 
 **Requirements:**
-1. The system must replace simple keyword-matching with a system that can follow basic semantic links defined in the vault markdown files.
-2. Intercept `prompt.submitted` (or modify `message.received` to emit it first), then gather the definitions, before emitting a fully saturated `prompt.annotated`.
-3. Tests must be updated with an isolated vault mapping a fake human to a fake concept. No `Process.sleep`. 
+1. **Stage 1 (Surface/Annotation):** The Annotator intercepts `prompt.submitted`, performs lightweight entity/keyword matching to gather relevant L0 records (foundational facts) from the vault, and embeds them into the `prompt.annotated` delta.
+2. **Stage 2 (Deep Retrieval):** Provide the LLM with a new tool (e.g., `vault_search` or `memory_read`) that allows it to query L1/L2 records dynamically during its execution cycle.
+3. Tests must be updated using an isolated vault. No `Process.sleep`.
 
 **Success Criteria:**
-- ExUnit tests pass demonstrating the Annotation pipeline successfully retrieves a linked concept from a mocked vault and embeds it in the `prompt.annotated` delta. 
+- ExUnit tests pass demonstrating the Annotation pipeline successfully retrieves an L0 concept and embeds it in `prompt.annotated`.
+- ExUnit tests demonstrate the core tool executor can successfully process a `vault_search` tool call emitted by the LLM to read deeper L1/L2 files.
 
 ---
 
@@ -37,7 +38,7 @@
     37|    21|- [ ] **The Annotator (Input Assembly):** Build a handler that intercepts `prompt.submitted`, performs the L0/L1 Obsidian RAG (retrieving memory), and emits a `prompt.annotated` delta containing the fully saturated context.
     38|    22|- [ ] **The Inference Trigger:** Update the Reducer so the LLM handler only wakes up when it sees a `prompt.annotated` delta.
     39|    23|- [ ] **Memory Daemon:** Build the background process that reads the `delta` log, extracts facts, and performs ADD/UPDATE/DELETE operations on the Obsidian vault.
-    40|    24|- [ ] **Semantic Vault Search:** Upgrade from keyword matching to traversing `[[wikilinks]]` in the knowledge graph.
+    40|    24|- [ ] **Two-Stage Retrieval:** Replace monolithic RAG with lightweight L0 surfacing injected by the `Annotator` and deep L1/L2 autonomous tool exploration (e.g. `vault_search`).
     41|    25|
     42|    26|### Priority 2: Multiplicity (Agentic Capabilities)
     43|    27|    27|    22|- [ ] **Sub-agent Orchestration:** Implement `delegate_task` equivalent to spawn and manage parallel OTP processes for independent, simultaneous agent workflows (escaping the single-threaded thought loop).
