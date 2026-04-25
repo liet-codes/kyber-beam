@@ -1,0 +1,13 @@
+
+FROM hexpm/elixir:1.16.2-erlang-26.2.2-debian-bullseye-20240130-slim
+WORKDIR /app
+COPY config/ config/
+COPY lib/ lib/
+COPY test/ test/
+COPY priv/ priv/
+COPY mix.exs mix.lock ./
+ENV MIX_ENV=test
+RUN mix local.hex --force && mix local.rebar --force
+RUN mix deps.get
+RUN mix compile
+CMD ["mix", "test"]

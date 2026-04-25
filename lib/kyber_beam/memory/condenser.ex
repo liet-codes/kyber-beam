@@ -67,8 +67,22 @@ defmodule Kyber.Memory.Condenser do
 
   @impl true
   def handle_info({:condense, %Kyber.Delta{kind: "llm.response"} = delta}, state) do
-    condense(delta, state)
-    {:noreply, state}
+    # AUDIT-HISTORY rule C2 — never perform blocking disk I/O inside a
+    # GenServer callback. Check mailbox depth for backpressure, then offload
+    # the actual condense (mkdir_p + write + emit) to a fire-and-forget
+    # Task so handle_info returns immediately.
+    {:message_queue_len, len} = Process.info(self(), :message_queue_len)
+
+    if len > 100 do
+      Logger.warning(
+        "[Kyber.Memory.Condenser] queue full (#{len}), dropping delta #{delta.id}"
+      )
+
+      {:noreply, state}
+    else
+      Task.start(fn -> condense(delta, state) end)
+      {:noreply, state}
+    end
   end
 
   def handle_info({:condense, _other}, state), do: {:noreply, state}
