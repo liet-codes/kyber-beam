@@ -1,7 +1,7 @@
 defmodule Kyber.Tools.PromptAnnotatorTest do
   use ExUnit.Case, async: false
 
-  alias Kyber.{Core, Delta}
+  alias Kyber.{Core, Delta, Knowledge}
   alias Kyber.Tools.PromptAnnotator
 
   defp unique_name, do: :"PromptAnnotatorTest_#{System.unique_integer([:positive])}"
@@ -141,6 +141,187 @@ defmodule Kyber.Tools.PromptAnnotatorTest do
       assert_receive {:annotated, %Delta{kind: "prompt.annotated"} = annotated}, 2_000
       assert annotated.parent_id == heartbeat.id
       assert annotated.payload["text"] =~ "heartbeat"
+    end
+  end
+
+  # ── Stage 1 of the Two-Stage RAG: lightweight L0 surfacing ──────────────────
+  #
+  # The annotator should consult an Obsidian-style vault, find concepts whose
+  # titles are mentioned in the prompt text, and embed L0 views of them
+  # (title / type / tags) into `payload["annotations"]["l0"]`. These tests
+  # describe that contract; today's `build_annotations/1` is a stub returning
+  # `%{}`, so they fail until the surfacing is implemented.
+  describe "annotate/1 with L0 vault surfacing" do
+    setup do
+      vault_dir =
+        System.tmp_dir!()
+        |> Path.join("annotator_vault_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(vault_dir)
+
+      {:ok, knowledge} =
+        Knowledge.start_link(
+          name: nil,
+          vault_path: vault_dir,
+          poll_interval: 0
+        )
+
+      on_exit(fn ->
+        if Process.alive?(knowledge) do
+          try do
+            GenServer.stop(knowledge, :normal, 1_000)
+          catch
+            :exit, _ -> :ok
+          end
+        end
+
+        File.rm_rf!(vault_dir)
+      end)
+
+      {:ok, knowledge: knowledge, vault_dir: vault_dir}
+    end
+
+    defp l0_title(entry), do: Map.get(entry, "title") || Map.get(entry, :title)
+    defp l0_type(entry), do: Map.get(entry, "type") || Map.get(entry, :type)
+
+    defp l0_entries(delta) do
+      case get_in(delta.payload, ["annotations", "l0"]) do
+        nil -> []
+        list when is_list(list) -> list
+      end
+    end
+
+    test "surfaces an L0 concept when the prompt mentions its title", %{knowledge: knowledge} do
+      :ok =
+        Knowledge.put_note(
+          knowledge,
+          "kyber.md",
+          %{"title" => "Kyber", "type" => "concepts", "tags" => ["architecture", "elixir"]},
+          "Kyber is the cognitive harness built on Elixir/OTP.\n"
+        )
+
+      effect = %{
+        delta_id: "p-surface",
+        payload: %{"text" => "tell me about Kyber"},
+        origin: {:human, "u1"},
+        knowledge: knowledge
+      }
+
+      delta = PromptAnnotator.annotate(effect)
+
+      assert %Delta{kind: "prompt.annotated"} = delta
+      assert delta.parent_id == "p-surface"
+
+      l0 = l0_entries(delta)
+      assert l0 != [], "expected at least one L0 entry surfaced for matching prompt, got []"
+
+      match = Enum.find(l0, fn entry -> l0_title(entry) == "Kyber" end)
+
+      assert match,
+             "expected an L0 entry with title \"Kyber\", got: #{inspect(l0)}"
+
+      assert l0_type(match) == "concepts"
+    end
+
+    test "matches the concept title case-insensitively", %{knowledge: knowledge} do
+      :ok =
+        Knowledge.put_note(
+          knowledge,
+          "kyber.md",
+          %{"title" => "Kyber", "type" => "concepts"},
+          "Body.\n"
+        )
+
+      effect = %{
+        delta_id: "p-case",
+        payload: %{"text" => "what is KYBER actually?"},
+        origin: {:human, "u1"},
+        knowledge: knowledge
+      }
+
+      delta = PromptAnnotator.annotate(effect)
+      l0 = l0_entries(delta)
+
+      assert Enum.any?(l0, fn entry -> l0_title(entry) == "Kyber" end),
+             "case-insensitive title match failed; got: #{inspect(l0)}"
+    end
+
+    test "produces no L0 entries when the prompt has no matches", %{knowledge: knowledge} do
+      :ok =
+        Knowledge.put_note(
+          knowledge,
+          "kyber.md",
+          %{"title" => "Kyber", "type" => "concepts"},
+          "Body.\n"
+        )
+
+      effect = %{
+        delta_id: "p-miss",
+        payload: %{"text" => "what is the weather today"},
+        origin: {:human, "u1"},
+        knowledge: knowledge
+      }
+
+      delta = PromptAnnotator.annotate(effect)
+      l0 = l0_entries(delta)
+
+      refute Enum.any?(l0, fn entry -> l0_title(entry) == "Kyber" end),
+             "should not surface unrelated concept; got: #{inspect(l0)}"
+    end
+
+    test "preserves the original payload alongside the annotations", %{knowledge: knowledge} do
+      :ok =
+        Knowledge.put_note(
+          knowledge,
+          "kyber.md",
+          %{"title" => "Kyber", "type" => "concepts"},
+          "Body.\n"
+        )
+
+      effect = %{
+        delta_id: "p-preserve",
+        payload: %{"text" => "Kyber stuff", "channel_id" => "c-1"},
+        origin: {:human, "u1"},
+        knowledge: knowledge
+      }
+
+      delta = PromptAnnotator.annotate(effect)
+
+      assert delta.payload["text"] == "Kyber stuff"
+      assert delta.payload["channel_id"] == "c-1"
+      assert is_map(delta.payload["annotations"])
+      assert is_integer(delta.payload["annotated_at"])
+    end
+
+    test "surfaces the matching concept and not the non-matching one", %{knowledge: knowledge} do
+      :ok =
+        Knowledge.put_note(
+          knowledge,
+          "kyber.md",
+          %{"title" => "Kyber", "type" => "concepts"},
+          "Kyber concept.\n"
+        )
+
+      :ok =
+        Knowledge.put_note(
+          knowledge,
+          "rhizome.md",
+          %{"title" => "Rhizome", "type" => "concepts"},
+          "Rhizome concept.\n"
+        )
+
+      effect = %{
+        delta_id: "p-discriminate",
+        payload: %{"text" => "explain Kyber to me"},
+        origin: {:human, "u1"},
+        knowledge: knowledge
+      }
+
+      delta = PromptAnnotator.annotate(effect)
+      titles = delta |> l0_entries() |> Enum.map(&l0_title/1)
+
+      assert "Kyber" in titles, "expected Kyber to be surfaced; got: #{inspect(titles)}"
+      refute "Rhizome" in titles, "Rhizome should not be surfaced; got: #{inspect(titles)}"
     end
   end
 end

@@ -35,10 +35,11 @@ defmodule Kyber.Tools.PromptAnnotator do
     payload = Map.get(effect, :payload, %{}) || %{}
     origin = Map.get(effect, :origin) || {:system, "annotator"}
     parent_id = Map.get(effect, :delta_id)
+    knowledge = Map.get(effect, :knowledge)
 
     annotated_payload =
       payload
-      |> Map.put("annotations", build_annotations(payload))
+      |> Map.put("annotations", build_annotations(payload, knowledge))
       |> Map.put("annotated_at", System.system_time(:millisecond))
 
     Kyber.Delta.new("prompt.annotated", annotated_payload, origin, parent_id)
@@ -72,7 +73,52 @@ defmodule Kyber.Tools.PromptAnnotator do
     :ok
   end
 
-  # Today: a stub. Tomorrow: vault lookups, recent-delta context,
-  # consolidated memories, retrieved tool docs — all merged here.
-  defp build_annotations(_payload), do: %{}
+  # Stage 1 of the Two-Stage RAG: lightweight L0 surfacing.
+  #
+  # When a `Kyber.Knowledge` server is wired into the effect, scan its
+  # vault for notes whose titles appear in the prompt text and embed
+  # an L0 view (title / type / tags) of each match into the annotations
+  # under `"l0"`. Stage 2 (deep L1/L2 retrieval via a `vault_search`
+  # tool) is the LLM's job and lives elsewhere.
+  defp build_annotations(_payload, nil), do: %{}
+
+  defp build_annotations(payload, knowledge) do
+    text = payload |> Map.get("text", "") |> to_string()
+    %{"l0" => surface_l0(knowledge, text)}
+  end
+
+  defp surface_l0(_knowledge, ""), do: []
+
+  defp surface_l0(knowledge, text) do
+    text_lower = String.downcase(text)
+
+    knowledge
+    |> Kyber.Knowledge.query_notes([])
+    |> Enum.filter(&title_matches?(&1, text_lower))
+    |> Enum.map(&note_to_l0/1)
+  rescue
+    e ->
+      Logger.warning("[Kyber.Tools.PromptAnnotator] L0 surfacing failed: #{inspect(e)}")
+      []
+  end
+
+  defp title_matches?(note, text_lower) do
+    case Map.get(note.frontmatter, "title") do
+      title when is_binary(title) and title != "" ->
+        String.contains?(text_lower, String.downcase(title))
+
+      _ ->
+        false
+    end
+  end
+
+  defp note_to_l0(note) do
+    fm = note.frontmatter
+
+    %{
+      "title" => Map.get(fm, "title"),
+      "type" => Map.get(fm, "type"),
+      "tags" => Map.get(fm, "tags", [])
+    }
+  end
 end
