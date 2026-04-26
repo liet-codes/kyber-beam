@@ -1,16 +1,15 @@
      1|     1|     1|     1|# Kyber-BEAM Work Tracker
 
-## 0. Next Ralph Loop: Two-Stage RAG (L0 Surface + LLM Deep Retrieval)
-**Objective:** Upgrade `Kyber.Tools.PromptAnnotator` to perform lightweight L0 context surfacing, and empower the LLM with a memory search tool to autonomously dig into L1/L2 records if needed. 
+## 0. Next Ralph Loop: Two-Stage RAG: Stage 2 (LLM Deep Retrieval Tool)
+**Objective:** Provide the LLM with a new tool (e.g., `vault_search` or `memory_read`) that allows it to query L1/L2 records dynamically during its execution cycle, leaning on the L0 annotations surfaced in Stage 1.
 
 **Requirements:**
-1. **Stage 1 (Surface/Annotation):** The Annotator intercepts `prompt.submitted`, performs lightweight entity/keyword matching to gather relevant L0 records (foundational facts) from the vault, and embeds them into the `prompt.annotated` delta.
-2. **Stage 2 (Deep Retrieval):** Provide the LLM with a new tool (e.g., `vault_search` or `memory_read`) that allows it to query L1/L2 records dynamically during its execution cycle.
-3. Tests must be updated using an isolated vault. No `Process.sleep`.
+1. Register a new tool in the `Kyber.Plugin.LLM` space corresponding to vault reads.
+2. The tool must invoke `Kyber.Knowledge` to retrieve the full markdown content of a specified vault path or entity name.
+3. Tests must be updated using an isolated vault and prove the core tool executor can successfully process a `vault_search` tool call emitted by the LLM. No `Process.sleep`.
 
 **Success Criteria:**
-- ExUnit tests pass demonstrating the Annotation pipeline successfully retrieves an L0 concept and embeds it in `prompt.annotated`.
-- ExUnit tests demonstrate the core tool executor can successfully process a `vault_search` tool call emitted by the LLM to read deeper L1/L2 files.
+- ExUnit tests pass demonstrating the core tool executor can successfully process a `vault_search` tool call emitted by the LLM to read deeper L1/L2 files, returning the correct markdown content.
 
 ---
 
