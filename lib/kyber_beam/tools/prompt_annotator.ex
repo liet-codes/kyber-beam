@@ -105,7 +105,13 @@ defmodule Kyber.Tools.PromptAnnotator do
   defp title_matches?(note, text_lower) do
     case Map.get(note.frontmatter, "title") do
       title when is_binary(title) and title != "" ->
-        String.contains?(text_lower, String.downcase(title))
+        title_lower = String.downcase(title)
+        escaped_title = Regex.escape(title_lower)
+        # Attempt to match word boundaries around the exact title to prevent substring false-positives
+        case Regex.compile("\\b#{escaped_title}\\b") do
+          {:ok, regex} -> Regex.match?(regex, text_lower)
+          _ -> String.contains?(text_lower, title_lower)
+        end
 
       _ ->
         false
